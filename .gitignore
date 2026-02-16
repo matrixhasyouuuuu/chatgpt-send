@@ -1,0 +1,9 @@
+# Local state: chats, browser profile, logs (may contain sensitive data)
+state/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs / temp
+*.log

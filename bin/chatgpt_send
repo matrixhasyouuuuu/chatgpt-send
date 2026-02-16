@@ -1,0 +1,1452 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Send prompt to ChatGPT via the already-open ChatGPT Web tab (visible Chrome),
+# using Chrome DevTools Protocol (CDP) to type/click and then scrape the final
+# assistant response back to the terminal.
+
+# Root folder for tool state.
+# Default is the repo root (relative to this script), but can be overridden.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DEFAULT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT="${CHATGPT_SEND_ROOT:-$ROOT_DEFAULT}"
+# This tool stores browser profile data and session metadata under ROOT/state/.
+# Default to private permissions for any newly created files/dirs (override if needed).
+umask "${CHATGPT_SEND_UMASK:-077}"
+
+PROMPT=""
+PROMPT_FILE=""
+MODEL="gpt-5.2-pro"         # only used to target a picker label; we keep current model by default.
+MODEL_STRATEGY="current"    # respect whatever model is selected in the open ChatGPT UI.
+KEEP_BROWSER=1
+MANUAL_LOGIN=1
+PROFILE_DIR="$ROOT/state/manual-login-profile"
+CHROME_PATH="$ROOT/bin/chrome_no_sandbox"
+CHATGPT_URL=""
+CHATGPT_URL_FILE="$ROOT/state/chatgpt_url.txt"
+CHATS_DB="$ROOT/state/chats.json"
+CHATS_MD="$ROOT/state/sessions.md"
+TIMEOUT="auto"
+DRY_RUN=0
+OPEN_BROWSER=0
+PRINT_URL=0
+SYNC_URL=0
+CDP_PORT="${CHATGPT_SEND_CDP_PORT:-9222}"
+LIST_CHATS=0
+INIT_SPECIALIST=0
+INIT_TOPIC=""
+INIT_SESSION_NAME=""
+INIT_SESSION_TITLE=""
+SET_ACTIVE_TITLE=""
+DOCTOR=0
+SAVE_CHAT_NAME=""
+USE_CHAT_NAME=""
+DELETE_CHAT_NAME=""
+LOOP_INIT=""
+LOOP_STATUS=0
+LOOP_INC=0
+LOOP_CLEAR=0
+
+ATTACH=()
+
+usage() {
+  cat <<'EOF'
+Usage:
+  chatgpt_send [options] (--prompt TEXT | --prompt-file PATH | < prompt.txt)
+  chatgpt_send --init-specialist
+  chatgpt_send --set-chatgpt-url URL
+  chatgpt_send --clear-chatgpt-url
+  chatgpt_send --show-chatgpt-url
+  chatgpt_send --open-browser [--chatgpt-url URL]
+  chatgpt_send --sync-chatgpt-url
+  chatgpt_send --list-chats
+  chatgpt_send --doctor
+  chatgpt_send --save-chat NAME [--chatgpt-url URL]
+  chatgpt_send --use-chat NAME
+  chatgpt_send --delete-chat NAME
+  chatgpt_send --set-active-title TEXT
+  chatgpt_send --loop-init N
+  chatgpt_send --loop-status
+  chatgpt_send --loop-inc
+  chatgpt_send --loop-clear
+
+Options:
+  --prompt TEXT
+  --prompt-file PATH
+  --model MODEL                 (default: gpt-5.2-pro)
+  --model-strategy MODE         select|current|ignore (default: current)
+  --keep-browser / --no-keep-browser
+  --manual-login / --no-manual-login (default: manual-login)
+  --chrome-path PATH            (default: bin/chrome_no_sandbox)
+  --chatgpt-url URL
+  --chat-id ID                  shortcut for https://chatgpt.com/c/ID
+  --init-specialist             open browser (if needed) and send bootstrap prompt to create/pin a new Specialist chat
+  --topic TEXT                  (with --init-specialist) short task/topic; used as first message and saved in sessions list
+  --set-chatgpt-url URL         persist default chat URL (same chat every run)
+  --clear-chatgpt-url           remove persisted default chat URL
+  --show-chatgpt-url            print persisted/default chat URL and exit
+  --open-browser                open the automation Chrome/profile and exit
+  --sync-chatgpt-url            detect current chat URL from open tabs and persist it
+  --print-chatgpt-url           print resolved URL to stderr on each run
+  --list-chats                  list saved Specialist chats (name -> url)
+  --doctor                      print a quick health report (CDP, pinned chat, sessions)
+  --save-chat NAME              save current/resolved chat as NAME
+  --use-chat NAME               switch active chat to NAME
+  --delete-chat NAME            remove saved chat NAME
+  --set-active-title TEXT       set the title for the active Specialist session (for easier session list browsing)
+  --loop-init N                 set loop max iterations for active Specialist session (done=0)
+  --loop-status                 show loop status for active session (done/max)
+  --loop-inc                    increment loop done for active session (caps at max)
+  --loop-clear                  clear loop state for active session
+  (writes session list to state/sessions.md automatically)
+  --cdp-port PORT               DevTools port for the shared Chrome (default: 9222)
+  --timeout SECONDS|auto
+  --attach PATH_OR_GLOB         (repeatable)
+  --dry-run                     (do not open browser; shows preview)
+EOF
+}
+
+resolve_timeout_seconds() {
+  # TIMEOUT is either "auto" or a number of seconds.
+  if [[ "${TIMEOUT:-auto}" == "auto" ]]; then
+    # Default: give the web UI enough time, but don't hang forever.
+    echo "900"
+    return 0
+  fi
+  # Best-effort numeric parse; fallback to 900.
+  if [[ "${TIMEOUT:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "$TIMEOUT"
+    return 0
+  fi
+  echo "900"
+}
+
+cdp_is_up() {
+  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1
+}
+
+is_chat_conversation_url() {
+  # ChatGPT chat URLs look like: https://chatgpt.com/c/<uuid-ish>
+  # We accept hex+hyphen IDs (what ChatGPT currently uses).
+  local u="${1:-}"
+  [[ "$u" =~ ^https://chatgpt\.com/c/[0-9a-fA-F-]{16,}$ ]]
+}
+
+wait_for_cdp() {
+  # Wait up to ~6s for Chrome DevTools to become reachable.
+  local i
+  for i in {1..12}; do
+    if cdp_is_up; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+chrome_pids_for_profile() {
+  # Print PIDs of Chrome processes that were launched with our user-data-dir.
+  # This avoids nuking the user's normal Chrome.
+  ps -eo pid=,args= | python3 -c '
+import sys
+profile = sys.argv[1]
+for line in sys.stdin:
+    line=line.rstrip("\n")
+    if not line.strip():
+        continue
+    try:
+        pid_str, args = line.strip().split(" ", 1)
+    except ValueError:
+        continue
+    if ("--user-data-dir=%s" % profile) in args:
+        print(pid_str)
+' "$PROFILE_DIR"
+}
+
+chats_db_read() {
+  if [[ -f "$CHATS_DB" ]]; then
+    cat "$CHATS_DB" 2>/dev/null || true
+  else
+    printf '%s\n' '{"active":"","chats":{}}'
+  fi
+}
+
+chats_db_write() {
+  mkdir -p "$(dirname "$CHATS_DB")" >/dev/null 2>&1 || true
+  cat >"$CHATS_DB"
+}
+
+chats_md_render() {
+  chats_db_read | python3 -c '
+import json,sys,datetime
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    db={"active":"","chats":{}}
+active=db.get("active") or ""
+chats=db.get("chats") or {}
+
+def fmt_ts(ts):
+    try:
+        return datetime.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "-"
+
+print("# Specialist Sessions")
+print("")
+print("Active:", ("`%s`" % active) if active else "(none)")
+print("")
+print("| Active | Name | Last used | Loop | URL | Title |")
+print("|---|---|---|---|---|---|")
+
+for name in sorted(chats.keys()):
+    c=chats.get(name) or {}
+    mark="*" if name==active else ""
+    url=c.get("url","")
+    title=(c.get("title","") or "").replace("|"," ")
+    ts=fmt_ts(c.get("last_used"))
+    lm=c.get("loop_max")
+    ld=c.get("loop_done")
+    loop="-" if lm is None else f"{ld or 0}/{lm}"
+    print(f"| {mark} | `{name}` | `{ts}` | `{loop}` | `{url}` | {title} |")
+' >"$CHATS_MD" 2>/dev/null || true
+}
+
+chats_db_upsert() {
+  # Usage: chats_db_upsert <name> <url> [title]
+  local name="$1"
+  local url="$2"
+  local title="${3:-}"
+  chats_db_read | python3 -c '
+import json,sys,time
+name, url, title = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    db={"active":"","chats":{}}
+db.setdefault("chats", {})
+db["chats"].setdefault(name, {})
+db["chats"][name]["url"]=url
+db["chats"][name]["last_used"]=int(time.time())
+if title:
+    db["chats"][name]["title"]=title
+print(json.dumps(db, ensure_ascii=False, sort_keys=True))
+' "$name" "$url" "$title" | chats_db_write
+  chats_md_render
+}
+
+chats_db_set_active() {
+  local name="$1"
+  chats_db_read | python3 -c '
+import json,sys
+name=sys.argv[1]
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    db={"active":"","chats":{}}
+db.setdefault("chats", {})
+db["active"]=name
+print(json.dumps(db, ensure_ascii=False, sort_keys=True))
+' "$name" | chats_db_write
+  chats_md_render
+}
+
+chats_db_delete() {
+  local name="$1"
+  chats_db_read | python3 -c '
+import json,sys
+name=sys.argv[1]
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    db={"active":"","chats":{}}
+db.setdefault("chats", {})
+db["chats"].pop(name, None)
+if db.get("active")==name:
+    db["active"]=""
+print(json.dumps(db, ensure_ascii=False, sort_keys=True))
+' "$name" | chats_db_write
+  chats_md_render
+}
+
+chats_db_get_active_url() {
+  chats_db_read | python3 -c '
+import json,sys
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+active=db.get("active") or ""
+chats=db.get("chats") or {}
+if active and active in chats and "url" in chats[active]:
+    print(chats[active]["url"])
+'
+}
+
+chats_db_list() {
+  chats_db_read | python3 -c '
+import json,sys,datetime
+import re
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    db={"active":"","chats":{}}
+active=db.get("active") or ""
+chats=db.get("chats") or {}
+
+def fmt_ts(ts):
+    try:
+        return datetime.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "-"
+
+names=sorted(chats.keys())
+if not names:
+    print("No saved Specialist sessions.")
+    sys.exit(0)
+
+for idx, n in enumerate(names, start=1):
+    c=chats[n] or {}
+    mark="*" if n==active else " "
+    url=c.get("url","")
+    title=c.get("title","")
+    ts=fmt_ts(c.get("last_used"))
+    suffix=("  " + title) if title else ""
+    if url and not re.match(r"^https://chatgpt\.com/c/[0-9a-fA-F-]{16,}$", url):
+        suffix = (suffix + " [INVALID_URL]").strip()
+    # Human-friendly: index + name. User can say "continue 2" without pasting URLs.
+    print("{} {}) {}  {}  {}{}".format(mark, idx, n, ts, url, suffix))
+'
+}
+
+chats_db_find_name_by_url() {
+  # Usage: chats_db_find_name_by_url <url>
+  local url="$1"
+  chats_db_read | python3 -c '
+import json,sys
+url=sys.argv[1]
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+chats=db.get("chats") or {}
+for name,c in chats.items():
+    if (c or {}).get("url")==url:
+        print(name)
+        break
+' "$url"
+}
+
+chats_db_get_active_name() {
+  chats_db_read | python3 -c '
+import json,sys
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+active=(db.get("active") or "").strip()
+if active:
+    print(active)
+'
+}
+
+chats_db_loop_init() {
+  local max="$1"
+  local active
+  active="$(chats_db_get_active_name | head -n 1 || true)"
+  if [[ -z "${active:-}" ]]; then
+    echo "No active Specialist session. Use --use-chat NAME first." >&2
+    exit 2
+  fi
+  chats_db_read | python3 -c '
+import json,sys
+active=sys.argv[1]
+maxv=int(sys.argv[2])
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    db={"active":active,"chats":{}}
+db.setdefault("chats", {})
+db["chats"].setdefault(active, {})
+db["chats"][active]["loop_max"]=maxv
+db["chats"][active]["loop_done"]=0
+print(json.dumps(db, ensure_ascii=False, sort_keys=True))
+' "$active" "$max" | chats_db_write
+  chats_md_render
+  echo "Loop set for $active: 0/$max" >&2
+}
+
+chats_db_loop_status() {
+  local active
+  active="$(chats_db_get_active_name | head -n 1 || true)"
+  if [[ -z "${active:-}" ]]; then
+    echo "No active Specialist session." >&2
+    exit 2
+  fi
+  chats_db_read | python3 -c '
+import json,sys
+active=sys.argv[1]
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+c=(db.get("chats") or {}).get(active) or {}
+lm=c.get("loop_max")
+ld=c.get("loop_done") or 0
+if lm is None:
+    print("Loop: (not set)")
+else:
+    print(f"Loop: {ld}/{lm}")
+' "$active"
+}
+
+chats_db_loop_inc() {
+  local active
+  active="$(chats_db_get_active_name | head -n 1 || true)"
+  if [[ -z "${active:-}" ]]; then
+    echo "No active Specialist session." >&2
+    exit 2
+  fi
+  out="$(chats_db_read | python3 -c '
+import json,sys
+active=sys.argv[1]
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    db={"active":active,"chats":{}}
+db.setdefault("chats", {})
+db["chats"].setdefault(active, {})
+c=db["chats"][active]
+lm=c.get("loop_max")
+ld=int(c.get("loop_done") or 0)
+if lm is None:
+    # no-op
+    print(json.dumps(db, ensure_ascii=False, sort_keys=True))
+    print("Loop: (not set)", file=sys.stderr)
+    sys.exit(0)
+lm=int(lm)
+ld=min(ld+1, lm)
+c["loop_done"]=ld
+print(json.dumps(db, ensure_ascii=False, sort_keys=True))
+print(f"Loop: {ld}/{lm}", file=sys.stderr)
+' "$active")" || true
+  # python printed JSON to stdout and status to stderr; here we only need JSON.
+  printf '%s\n' "$out" | head -n 1 | chats_db_write
+  chats_md_render
+}
+
+chats_db_loop_clear() {
+  local active
+  active="$(chats_db_get_active_name | head -n 1 || true)"
+  if [[ -z "${active:-}" ]]; then
+    echo "No active Specialist session." >&2
+    exit 2
+  fi
+  chats_db_read | python3 -c '
+import json,sys
+active=sys.argv[1]
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    db={"active":active,"chats":{}}
+chats=db.get("chats") or {}
+c=chats.get(active) or {}
+for k in ["loop_max","loop_done"]:
+    if k in c:
+        del c[k]
+if active in chats:
+    chats[active]=c
+db["chats"]=chats
+print(json.dumps(db, ensure_ascii=False, sort_keys=True))
+' "$active" | chats_db_write
+  chats_md_render
+  echo "Loop cleared for $active" >&2
+}
+
+autoname() {
+  # Timestamp-based, stable ASCII name for a new Specialist session.
+  date +"auto-%Y%m%d-%H%M%S"
+}
+
+slugify_ascii() {
+  # ASCII-only slug for filenames/session names. Russian text will be stripped.
+  # Usage: slugify_ascii "Some text" -> "some-text"
+  echo "${1:-}" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g; s/-+/-/g' \
+    | cut -c1-24
+}
+
+chats_db_has_name() {
+  local name="$1"
+  chats_db_read | python3 -c '
+import json,sys
+name=sys.argv[1]
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+chats=(db.get("chats") or {})
+sys.exit(0 if name in chats else 1)
+' "$name"
+}
+
+chats_db_unique_name() {
+  # Usage: chats_db_unique_name <base>
+  local base="$1"
+  local n="$base"
+  local i=2
+  if [[ -z "${n//[[:space:]]/}" ]]; then
+    n="$(autoname)"
+  fi
+  while chats_db_has_name "$n" >/dev/null 2>&1; do
+    n="${base}-${i}"
+    i=$((i+1))
+  done
+  printf '%s\n' "$n"
+}
+
+focus_chrome_window() {
+  # Best-effort: raise the window for our automation profile so the user can see it.
+  if ! command -v wmctrl >/dev/null 2>&1; then
+    return 0
+  fi
+  wmctrl -lx | python3 -c '
+import sys
+profile = sys.argv[1]
+for line in sys.stdin:
+    parts = line.strip().split(None, 3)
+    if len(parts) < 3:
+        continue
+    wid = parts[0]
+    wcls = parts[2]
+    if profile in wcls:
+        print(wid)
+        break
+' "$PROFILE_DIR" || true
+}
+
+cdp_open_tab() {
+  # Best-effort: open a new tab in the shared Chrome instance.
+  # Works only when CDP is up.
+  local url="$1"
+  if ! cdp_is_up; then
+    return 1
+  fi
+  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/new?${url}" >/dev/null 2>&1 || true
+  return 0
+}
+
+chat_id_from_url() {
+  # Extract ChatGPT conversation id from a URL, if present.
+  # Example: https://chatgpt.com/c/<id> -> <id>
+  local u="${1:-}"
+  if [[ "$u" =~ ^https://chatgpt\.com/c/([0-9a-fA-F-]{16,}).*$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+capture_chat_title_for_url_from_cdp() {
+  # Usage: capture_chat_title_for_url_from_cdp <url>
+  # Prints the title (may be empty) for the matching chat URL.
+  local target="$1"
+  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+import json,sys
+target=sys.argv[1]
+try:
+    tabs=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for t in tabs:
+    u=(t.get("url") or "").split("#",1)[0].strip()
+    if u==target:
+        print((t.get("title") or "").strip())
+        break
+' "$target"
+}
+
+cdp_cleanup_chat_tabs() {
+  # Close extra ChatGPT conversation tabs so the user doesn't end up with a pile
+  # of /c/... tabs. Keeps exactly one tab for the target chat id.
+  local target_url="$1"
+  local target_id
+  target_id="$(chat_id_from_url "$target_url" 2>/dev/null || true)"
+  if [[ -z "${target_id:-}" ]] || ! cdp_is_up; then
+    return 0
+  fi
+
+  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+import json,re,sys,urllib.parse
+target_id=sys.argv[1]
+raw=sys.stdin.read()
+try:
+    tabs=json.loads(raw)
+except Exception:
+    sys.exit(0)
+
+def chat_id(u:str):
+    m=re.match(r"^https://chatgpt\\.com/c/([0-9a-fA-F-]{16,})", u or "")
+    return m.group(1) if m else None
+
+keep=None
+to_close=[]
+for t in tabs:
+    tid=(t.get("id") or "").strip()
+    u=(t.get("url") or "").split("#",1)[0].strip()
+    cid=chat_id(u)
+    if not cid:
+        continue
+    if cid==target_id:
+        if keep is None:
+            keep=tid
+        else:
+            to_close.append(tid)
+    else:
+        to_close.append(tid)
+
+for tid in to_close:
+    if tid:
+        print(tid)
+' "$target_id" | while read -r tab_id; do
+    [[ -z "${tab_id:-}" ]] && continue
+    curl -fsS "http://127.0.0.1:${CDP_PORT}/json/close/${tab_id}" >/dev/null 2>&1 || true
+  done
+}
+
+cdp_close_all_conversation_tabs() {
+  # Close all ChatGPT conversation tabs (/c/...). Useful when starting a "new"
+  # session to avoid sync ambiguity.
+  if ! cdp_is_up; then
+    return 0
+  fi
+  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+import json,re,sys
+try:
+    tabs=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for t in tabs:
+    tid=(t.get("id") or "").strip()
+    u=(t.get("url") or "").split("#",1)[0].strip()
+    if tid and re.match(r"^https://chatgpt\.com/c/[0-9a-fA-F-]{16,}", u):
+        print(tid)
+' | while read -r tab_id; do
+    [[ -z "${tab_id:-}" ]] && continue
+    curl -fsS "http://127.0.0.1:${CDP_PORT}/json/close/${tab_id}" >/dev/null 2>&1 || true
+  done
+}
+
+open_browser_impl() {
+  # Usage: open_browser_impl <url>
+  # Opens (or focuses) a shared automation Chrome instance and returns 0 on success.
+  local url="$1"
+
+  # Use a dedicated automation profile under this project (login persists).
+  if [[ "$url" =~ ^https://chatgpt\.com/c/ ]] && ! is_chat_conversation_url "$url"; then
+    echo "Warning: pinned chat URL is invalid; opening https://chatgpt.com/ instead." >&2
+    url="https://chatgpt.com/"
+  fi
+
+  if cdp_is_up; then
+    echo "Chrome already running (CDP port $CDP_PORT). Bringing its window to front..." >&2
+    wid="$(focus_chrome_window | head -n 1 || true)"
+    if [[ -n "${wid:-}" ]] && command -v wmctrl >/dev/null 2>&1; then
+      wmctrl -ia "$wid" >/dev/null 2>&1 || true
+    fi
+    # If the user explicitly asked for the ChatGPT home (new chat), close all
+    # existing conversation tabs so later --sync-chatgpt-url is unambiguous.
+    if [[ "$url" == "https://chatgpt.com/" ]] || [[ "$url" == "https://chatgpt.com" ]]; then
+      cdp_close_all_conversation_tabs || true
+    fi
+    # Activate existing tab if possible; only open a new one if missing.
+    cdp_activate_or_open_url "$url" || true
+    return 0
+  fi
+
+  if [[ $PRINT_URL -eq 1 ]]; then
+    echo "ChatGPT URL: $url" >&2
+  fi
+  mkdir -p "$PROFILE_DIR" >/dev/null 2>&1 || true
+
+  chrome_log="/tmp/chatgpt_send_chrome_${CDP_PORT}.log"
+  chrome_pidfile="$ROOT/state/chrome_${CDP_PORT}.pid"
+  rm -f "$chrome_log" >/dev/null 2>&1 || true
+
+  # Use setsid to detach from the caller's process group/cgroup cleanup.
+  setsid -f "$CHROME_PATH" \
+    --remote-debugging-address=127.0.0.1 \
+    --remote-debugging-port="$CDP_PORT" \
+    --remote-allow-origins="http://127.0.0.1:${CDP_PORT}" \
+    --no-first-run \
+    --no-default-browser-check \
+    --disable-gpu \
+    --use-gl=swiftshader \
+    --new-window \
+    --user-data-dir="$PROFILE_DIR" \
+    "$url" >"$chrome_log" 2>&1 || true
+  : >"$chrome_pidfile" 2>/dev/null || true
+
+  if wait_for_cdp; then
+    echo "Opened Chrome (CDP port $CDP_PORT) at: $url" >&2
+    wid="$(focus_chrome_window | head -n 1 || true)"
+    if [[ -n "${wid:-}" ]] && command -v wmctrl >/dev/null 2>&1; then
+      wmctrl -ia "$wid" >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+
+  stale_pids="$(chrome_pids_for_profile | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  if [[ -n "${stale_pids//[[:space:]]/}" ]]; then
+    echo "Chrome didn't come up (CDP $CDP_PORT). Found stale Chrome PIDs for this automation profile: $stale_pids" >&2
+    echo "Trying to stop them and restart..." >&2
+    for p in $stale_pids; do
+      kill "$p" 2>/dev/null || true
+    done
+    sleep 0.8
+
+    setsid -f "$CHROME_PATH" \
+      --remote-debugging-address=127.0.0.1 \
+      --remote-debugging-port="$CDP_PORT" \
+      --remote-allow-origins="http://127.0.0.1:${CDP_PORT}" \
+      --no-first-run \
+      --no-default-browser-check \
+      --disable-gpu \
+      --use-gl=swiftshader \
+      --new-window \
+      --user-data-dir="$PROFILE_DIR" \
+      "$url" >"$chrome_log" 2>&1 || true
+    : >"$chrome_pidfile" 2>/dev/null || true
+
+    if wait_for_cdp; then
+      echo "Opened Chrome (CDP port $CDP_PORT) at: $url" >&2
+      wid="$(focus_chrome_window | head -n 1 || true)"
+      if [[ -n "${wid:-}" ]] && command -v wmctrl >/dev/null 2>&1; then
+        wmctrl -ia "$wid" >/dev/null 2>&1 || true
+      fi
+      return 0
+    fi
+  fi
+
+  echo "Failed to open a visible Chrome window. CDP is not reachable on 127.0.0.1:$CDP_PORT." >&2
+  if [[ -f "$chrome_log" ]]; then
+    echo "tail(chrome log):" >&2
+    tail -n 120 "$chrome_log" >&2 || true
+  fi
+  return 1
+}
+
+capture_chat_url_from_cdp() {
+  # Prints a single https://chatgpt.com/c/... URL or nothing if not found/ambiguous.
+  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+import json,re,sys
+raw = sys.stdin.read()
+try:
+    tabs = json.loads(raw)
+except Exception:
+    sys.exit(0)
+
+urls = []
+for t in tabs:
+    u = (t.get("url") or "").strip()
+    if re.match(r"^https://chatgpt\.com/c/[0-9a-fA-F-]+", u):
+        urls.append(u.split("#",1)[0])
+
+uniq=[]
+seen=set()
+for u in urls:
+    if u not in seen:
+        uniq.append(u)
+        seen.add(u)
+
+if len(uniq) == 1:
+    print(uniq[0])
+'
+}
+
+capture_chat_urls_from_cdp() {
+  # Prints all unique chat URLs (one per line).
+  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+import json,re,sys
+raw=sys.stdin.read()
+try:
+    tabs=json.loads(raw)
+except Exception:
+    sys.exit(0)
+urls=[]
+for t in tabs:
+    u=(t.get("url") or "").strip()
+    if re.match(r"^https://chatgpt\.com/c/[0-9a-fA-F-]+", u):
+        urls.append(u.split("#",1)[0])
+seen=set()
+for u in urls:
+    if u not in seen:
+        print(u)
+        seen.add(u)
+'
+}
+
+capture_chat_tab_from_cdp() {
+  # Prints "url<TAB>title" when there is exactly one chat tab open.
+  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+import json,re,sys
+raw = sys.stdin.read()
+try:
+    tabs = json.loads(raw)
+except Exception:
+    sys.exit(0)
+
+hits = []
+for t in tabs:
+    u = (t.get("url") or "").strip()
+    if not u:
+        continue
+    if re.match(r"^https://chatgpt\.com/c/[0-9a-fA-F-]+", u):
+        hits.append((u.split("#",1)[0], (t.get("title") or "").strip()))
+
+uniq=[]
+seen=set()
+for u,title in hits:
+    if u not in seen:
+        uniq.append((u,title))
+        seen.add(u)
+
+if len(uniq) == 1:
+    u,title = uniq[0]
+    print(u + "\t" + title)
+'
+}
+
+capture_chat_tab_from_cdp_last() {
+  # Prints "url<TAB>title" for the last chat tab in the CDP list (best-effort).
+  # This is a fallback for humans: when multiple chat tabs are open, we still
+  # want to sync *something* (usually the most recently created tab).
+  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+import json,re,sys
+raw = sys.stdin.read()
+try:
+    tabs = json.loads(raw)
+except Exception:
+    sys.exit(0)
+
+hits = []
+for t in tabs:
+    u = (t.get("url") or "").strip()
+    if not u:
+        continue
+    if re.match(r"^https://chatgpt\.com/c/[0-9a-fA-F-]+", u):
+        hits.append((u.split("#",1)[0], (t.get("title") or "").strip()))
+
+uniq=[]
+seen=set()
+for u,title in hits:
+    if u not in seen:
+        uniq.append((u,title))
+        seen.add(u)
+
+if uniq:
+    u,title = uniq[-1]
+    print(u + "\t" + title)
+'
+}
+
+capture_best_chat_tab_from_cdp() {
+  # Prints "url<TAB>title" selecting the most likely "new" chat.
+  # Heuristic: if multiple chat tabs exist, pick the first URL that is not yet
+  # present in our chats DB; otherwise pick the last chat URL.
+  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+import json,re,sys,os
+chats_db_path=sys.argv[1]
+try:
+    tabs=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+known=set()
+try:
+    with open(chats_db_path,"r",encoding="utf-8") as f:
+        db=json.load(f)
+    for c in (db.get("chats") or {}).values():
+        u=(c or {}).get("url") or ""
+        if isinstance(u,str) and u.startswith("https://chatgpt.com/c/"):
+            known.add(u)
+except Exception:
+    pass
+
+hits=[]
+for t in tabs:
+    u=(t.get("url") or "").strip()
+    if not u:
+        continue
+    if re.match(r"^https://chatgpt\.com/c/[0-9a-fA-F-]+", u):
+        hits.append((u.split("#",1)[0], (t.get("title") or "").strip()))
+
+uniq=[]
+seen=set()
+for u,title in hits:
+    if u not in seen:
+        uniq.append((u,title))
+        seen.add(u)
+
+if not uniq:
+    sys.exit(0)
+
+# Prefer an unknown URL (likely newly created chat).
+for u,title in uniq:
+    if u not in known:
+        print(u + "\t" + title)
+        sys.exit(0)
+
+# Otherwise pick the last one.
+u,title=uniq[-1]
+print(u + "\t" + title)
+' "$CHATS_DB"
+}
+
+cdp_activate_or_open_url() {
+  # Usage: cdp_activate_or_open_url <url>
+  local target="$1"
+  if ! cdp_is_up; then
+    return 1
+  fi
+  # Try to find an existing tab and activate it; otherwise open a new one.
+  local tab_id
+  tab_id="$(curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+import json,re,sys
+target=sys.argv[1]
+target=target.split("#",1)[0].strip()
+target_id=None
+m=re.match(r"^https://chatgpt\\.com/c/([0-9a-fA-F-]{16,})", target)
+if m:
+    target_id=m.group(1)
+try:
+    tabs=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+def chat_id(u:str):
+    m=re.match(r"^https://chatgpt\\.com/c/([0-9a-fA-F-]{16,})", u or "")
+    return m.group(1) if m else None
+
+for t in tabs:
+    u=(t.get("url") or "").split("#",1)[0].strip()
+    tid=(t.get("id") or "").strip()
+    if not tid:
+        continue
+    if target_id:
+        if chat_id(u)==target_id:
+            print(tid)
+            break
+    else:
+        if u==target:
+            print(tid)
+            break
+' "$target" | head -n 1 || true)"
+
+  if [[ -n "${tab_id:-}" ]]; then
+    curl -fsS "http://127.0.0.1:${CDP_PORT}/json/activate/${tab_id}" >/dev/null 2>&1 || true
+  else
+    cdp_open_tab "$target" || true
+  fi
+  # Raise the window so user can see the chat.
+  local wid
+  wid="$(focus_chrome_window | head -n 1 || true)"
+  if [[ -n "${wid:-}" ]] && command -v wmctrl >/dev/null 2>&1; then
+    wmctrl -ia "$wid" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prompt) PROMPT="$2"; shift 2;;
+    --prompt-file) PROMPT_FILE="$2"; shift 2;;
+    --model) MODEL="$2"; shift 2;;
+    --model-strategy) MODEL_STRATEGY="$2"; shift 2;;
+    --keep-browser) KEEP_BROWSER=1; shift;;
+    --no-keep-browser) KEEP_BROWSER=0; shift;;
+    --manual-login) MANUAL_LOGIN=1; shift;;
+    --no-manual-login) MANUAL_LOGIN=0; shift;;
+    --chrome-path) CHROME_PATH="$2"; shift 2;;
+    --chatgpt-url) CHATGPT_URL="$2"; shift 2;;
+    --chat-id) CHATGPT_URL="https://chatgpt.com/c/$2"; shift 2;;
+    --init-specialist) INIT_SPECIALIST=1; shift;;
+    --topic) INIT_TOPIC="$2"; shift 2;;
+    --set-active-title) SET_ACTIVE_TITLE="$2"; shift 2;;
+    --open-browser) OPEN_BROWSER=1; shift;;
+    --sync-chatgpt-url) SYNC_URL=1; shift;;
+    --print-chatgpt-url) PRINT_URL=1; shift;;
+    --cdp-port) CDP_PORT="$2"; shift 2;;
+    --list-chats) LIST_CHATS=1; shift;;
+    --doctor) DOCTOR=1; shift;;
+    --save-chat) SAVE_CHAT_NAME="$2"; shift 2;;
+    --use-chat) USE_CHAT_NAME="$2"; shift 2;;
+    --delete-chat) DELETE_CHAT_NAME="$2"; shift 2;;
+    --loop-init) LOOP_INIT="$2"; shift 2;;
+    --loop-status) LOOP_STATUS=1; shift;;
+    --loop-inc) LOOP_INC=1; shift;;
+    --loop-clear) LOOP_CLEAR=1; shift;;
+    --set-chatgpt-url)
+      mkdir -p "$(dirname "$CHATGPT_URL_FILE")" >/dev/null 2>&1 || true
+      url="$2"
+      # If the user tries to set a /c/... URL, enforce validity (prevents saving garbage like /c/test-loop).
+      if [[ "$url" =~ ^https://chatgpt\.com/c/ ]] && ! is_chat_conversation_url "$url"; then
+        echo "Error: invalid ChatGPT conversation URL: $url" >&2
+        exit 2
+      fi
+
+      printf '%s\n' "$url" >"$CHATGPT_URL_FILE"
+
+      # Persist as a Specialist session only when it's a conversation URL.
+      if is_chat_conversation_url "$url"; then
+        chats_db_upsert "last" "$url" "" >/dev/null 2>&1 || true
+        chats_db_set_active "last" >/dev/null 2>&1 || true
+      fi
+
+      echo "Saved default ChatGPT URL: $url" >&2
+      exit 0
+      ;;
+    --clear-chatgpt-url)
+      rm -f "$CHATGPT_URL_FILE"
+      echo "Cleared default ChatGPT URL." >&2
+      exit 0
+      ;;
+    --show-chatgpt-url)
+      if [[ -f "$CHATGPT_URL_FILE" ]]; then
+        cat "$CHATGPT_URL_FILE"
+        exit 0
+      fi
+      if [[ -n "${CHATGPT_URL_DEFAULT:-}" ]]; then
+        echo "$CHATGPT_URL_DEFAULT"
+        exit 0
+      fi
+      echo ""  # empty means "no default"
+      exit 0
+      ;;
+    --timeout) TIMEOUT="$2"; shift 2;;
+    --attach) ATTACH+=("$2"); shift 2;;
+    --dry-run) DRY_RUN=1; shift;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown arg: $1" >&2; usage >&2; exit 2;;
+  esac
+done
+
+# Chat database operations (human-friendly "Specialist sessions")
+if [[ $LIST_CHATS -eq 1 ]]; then
+  chats_db_list
+  exit 0
+fi
+
+if [[ $DOCTOR -eq 1 ]]; then
+  echo "chatgpt_send doctor"
+  echo "  root: $ROOT"
+  echo "  cdp_port: $CDP_PORT"
+  if cdp_is_up; then
+    echo "  cdp: OK"
+  else
+    echo "  cdp: DOWN"
+  fi
+
+  pinned=""
+  if [[ -f "$CHATGPT_URL_FILE" ]]; then
+    pinned="$(cat "$CHATGPT_URL_FILE" | head -n 1 || true)"
+  fi
+  echo "  pinned_url: ${pinned:-"(none)"}"
+
+  active="$(chats_db_get_active_name | head -n 1 || true)"
+  echo "  active_session: ${active:-"(none)"}"
+
+  if [[ -n "${active:-}" ]]; then
+    (chats_db_loop_status 2>/dev/null | sed 's/^/  /') || true
+  fi
+
+  if cdp_is_up; then
+    echo "  open_chat_tabs:"
+    curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+import json,re,sys
+try:
+    tabs=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+hits=[]
+for t in tabs:
+    u=(t.get("url") or "").split("#",1)[0].strip()
+    if re.match(r"^https://chatgpt\.com/c/[0-9a-fA-F-]{16,}", u):
+        hits.append((t.get("id") or "", u, (t.get("title") or "").strip()))
+for tid,u,title in hits[:12]:
+    print("   -", tid, u, ("(" + title + ")") if title else "")
+print("   total:", len(hits))
+'
+  fi
+  exit 0
+fi
+
+if [[ -n "${SET_ACTIVE_TITLE//[[:space:]]/}" ]]; then
+  active="$(chats_db_get_active_name | head -n 1 || true)"
+  if [[ -z "${active:-}" ]]; then
+    echo "No active Specialist session." >&2
+    exit 2
+  fi
+  # Update title of active session.
+  chats_db_read | python3 -c '
+import json,sys
+active=sys.argv[1]
+title=sys.argv[2]
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    db={"active":active,"chats":{}}
+db.setdefault("chats", {})
+db["chats"].setdefault(active, {})
+db["chats"][active]["title"]=title
+print(json.dumps(db, ensure_ascii=False, sort_keys=True))
+' "$active" "$SET_ACTIVE_TITLE" | chats_db_write
+  chats_md_render
+  echo "Updated title for $active" >&2
+  exit 0
+fi
+
+if [[ $INIT_SPECIALIST -eq 1 ]]; then
+  # Ensure a shared browser exists and force a "new chat" page. Then send the
+  # bootstrap prompt which will create a /c/<id> URL that we can pin.
+  open_browser_impl "https://chatgpt.com/" || exit 1
+  CHATGPT_URL="https://chatgpt.com/"
+  topic="${INIT_TOPIC:-}"
+  # Allow passing topic via --prompt/--prompt-file too.
+  if [[ -z "${topic//[[:space:]]/}" ]] && [[ -n "${PROMPT//[[:space:]]/}" ]]; then
+    topic="$PROMPT"
+  fi
+  if [[ -z "${topic//[[:space:]]/}" ]] && [[ -n "${PROMPT_FILE:-}" ]]; then
+    topic="$(cat "$PROMPT_FILE" 2>/dev/null || true)"
+  fi
+
+  bootstrap="$(cat "$ROOT/docs/specialist_bootstrap.txt" 2>/dev/null || true)"
+  PROMPT="$bootstrap"
+  if [[ -n "${topic//[[:space:]]/}" ]]; then
+    PROMPT+=$'\n\n'"Коротко: ${topic}"
+  fi
+  PROMPT_FILE=""
+
+  # Prepare a nicer session name/title for the newly created chat.
+  if [[ -n "${topic//[[:space:]]/}" ]]; then
+    INIT_SESSION_TITLE="${topic} ($(date +%Y-%m-%d))"
+    base_slug="$(slugify_ascii "$topic")"
+    if [[ -z "${base_slug//[[:space:]]/}" ]]; then
+      base_slug="session"
+    fi
+    INIT_SESSION_NAME="${base_slug}-$(date +%Y%m%d-%H%M%S)"
+    INIT_SESSION_NAME="$(chats_db_unique_name "$INIT_SESSION_NAME")"
+  else
+    INIT_SESSION_TITLE="Specialist session ($(date +%Y-%m-%d))"
+    INIT_SESSION_NAME="$(chats_db_unique_name "session-$(date +%Y%m%d-%H%M%S)")"
+  fi
+fi
+
+if [[ -n "${LOOP_INIT//[[:space:]]/}" ]]; then
+  chats_db_loop_init "$LOOP_INIT"
+  exit 0
+fi
+
+if [[ $LOOP_STATUS -eq 1 ]]; then
+  chats_db_loop_status
+  exit 0
+fi
+
+if [[ $LOOP_INC -eq 1 ]]; then
+  chats_db_loop_inc
+  exit 0
+fi
+
+if [[ $LOOP_CLEAR -eq 1 ]]; then
+  chats_db_loop_clear
+  exit 0
+fi
+
+if [[ -n "${DELETE_CHAT_NAME//[[:space:]]/}" ]]; then
+  chats_db_delete "$DELETE_CHAT_NAME"
+  exit 0
+fi
+
+if [[ -n "${USE_CHAT_NAME//[[:space:]]/}" ]]; then
+  resolved="$(chats_db_read | python3 -c '
+import json,sys,re
+name=sys.argv[1]
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+chats=(db.get("chats") or {})
+names=sorted(chats.keys())
+if name.isdigit():
+    idx=int(name)
+    if 1 <= idx <= len(names):
+        name=names[idx-1]
+c=(chats.get(name) or {})
+u=c.get("url","")
+if u and re.match(r"^https://chatgpt\.com/c/[0-9a-fA-F-]{16,}$", u):
+    print(name + "\t" + u)
+' "$USE_CHAT_NAME")"
+  resolved_name="${resolved%%$'\t'*}"
+  url="${resolved#*$'\t'}"
+  if [[ -z "${url:-}" ]]; then
+    echo "Unknown chat name: $USE_CHAT_NAME" >&2
+    exit 2
+  fi
+  chats_db_set_active "$resolved_name" >/dev/null 2>&1 || true
+  mkdir -p "$(dirname "$CHATGPT_URL_FILE")" >/dev/null 2>&1 || true
+  printf '%s\n' "$url" >"$CHATGPT_URL_FILE"
+  echo "Using chat: $resolved_name" >&2
+  exit 0
+fi
+
+# Resolve default chat URL (persisted or env) if caller didn't specify one.
+if [[ -z "$CHATGPT_URL" ]]; then
+  if [[ -f "$CHATGPT_URL_FILE" ]]; then
+    CHATGPT_URL="$(cat "$CHATGPT_URL_FILE" | head -n 1)"
+  elif [[ -n "${CHATGPT_URL_DEFAULT:-}" ]]; then
+    CHATGPT_URL="$CHATGPT_URL_DEFAULT"
+  else
+    CHATGPT_URL="$(chats_db_get_active_url || true)"
+  fi
+fi
+
+if [[ $OPEN_BROWSER -eq 1 ]]; then
+  url="${CHATGPT_URL:-https://chatgpt.com/}"
+  open_browser_impl "$url" || exit 1
+  exit 0
+fi
+
+if [[ $SYNC_URL -eq 1 ]]; then
+  if ! cdp_is_up; then
+    echo "CDP is not reachable on 127.0.0.1:$CDP_PORT. Run open-browser first." >&2
+    exit 2
+  fi
+  tab="$(capture_best_chat_tab_from_cdp || true)"
+  detected="${tab%%$'\t'*}"
+  title="${tab#*$'\t'}"
+  if [[ -z "${detected:-}" ]] || [[ "$detected" == "$tab" ]]; then
+    echo "Could not detect any https://chatgpt.com/c/... tab." >&2
+    exit 3
+  fi
+  mkdir -p "$(dirname "$CHATGPT_URL_FILE")" >/dev/null 2>&1 || true
+  printf '%s\n' "$detected" >"$CHATGPT_URL_FILE"
+  chats_db_upsert "last" "$detected" "${title:-}" >/dev/null 2>&1 || true
+  existing="$(chats_db_find_name_by_url "$detected" | head -n 1 || true)"
+  if [[ -z "${existing:-}" ]] || [[ "$existing" == "last" ]]; then
+    name="$(autoname)"
+    chats_db_upsert "$name" "$detected" "${title:-}" >/dev/null 2>&1 || true
+    chats_db_set_active "$name" >/dev/null 2>&1 || true
+  else
+    chats_db_set_active "$existing" >/dev/null 2>&1 || true
+  fi
+  echo "Synced default ChatGPT URL: $detected" >&2
+  exit 0
+fi
+
+# If a pinned URL exists but it's an invalid conversation URL, ignore it for sending.
+if [[ -n "${CHATGPT_URL:-}" ]] && [[ "$CHATGPT_URL" =~ ^https://chatgpt\.com/c/ ]] && ! is_chat_conversation_url "$CHATGPT_URL"; then
+  echo "Warning: ignoring invalid pinned chat URL: $CHATGPT_URL" >&2
+  CHATGPT_URL=""
+fi
+
+if [[ -n "${SAVE_CHAT_NAME//[[:space:]]/}" ]]; then
+  if [[ -z "${CHATGPT_URL:-}" ]] && cdp_is_up; then
+    tab="$(capture_chat_tab_from_cdp || true)"
+    CHATGPT_URL="${tab%%$'\t'*}"
+    title="${tab#*$'\t'}"
+  fi
+  if [[ -z "${CHATGPT_URL:-}" ]]; then
+    echo "No chat URL to save. Provide --chatgpt-url, pin one via --set-chatgpt-url, or open browser and keep a single chat tab open." >&2
+    exit 2
+  fi
+  chats_db_upsert "$SAVE_CHAT_NAME" "$CHATGPT_URL" "${title:-}" >/dev/null 2>&1 || true
+  chats_db_set_active "$SAVE_CHAT_NAME" >/dev/null 2>&1 || true
+  printf '%s\n' "$CHATGPT_URL" >"$CHATGPT_URL_FILE" 2>/dev/null || true
+  echo "Saved chat as: $SAVE_CHAT_NAME" >&2
+  exit 0
+fi
+
+if [[ -n "$PROMPT_FILE" ]]; then
+  PROMPT="$(cat "$PROMPT_FILE")"
+fi
+
+if [[ -z "${PROMPT//[[:space:]]/}" ]]; then
+  if [[ -t 0 ]]; then
+    echo "Missing prompt. Provide --prompt/--prompt-file or pipe via stdin." >&2
+    exit 2
+  fi
+  PROMPT="$(cat)"
+fi
+
+if [[ -z "${PROMPT//[[:space:]]/}" ]]; then
+  echo "Prompt is empty" >&2
+  exit 2
+fi
+
+# If no explicit/default chat URL is configured, try to auto-capture it from the
+# already-open shared Chrome instance. This enables the UX:
+# "open browser" -> user creates chat -> first send auto-pins that chat.
+if [[ -z "$CHATGPT_URL" ]] && cdp_is_up; then
+  tab="$(capture_chat_tab_from_cdp || true)"
+  detected="${tab%%$'\t'*}"
+  title="${tab#*$'\t'}"
+  if [[ -n "${detected:-}" ]] && [[ "$detected" != "$tab" ]]; then
+    CHATGPT_URL="$detected"
+    mkdir -p "$(dirname "$CHATGPT_URL_FILE")" >/dev/null 2>&1 || true
+    printf '%s\n' "$CHATGPT_URL" >"$CHATGPT_URL_FILE"
+    chats_db_upsert "last" "$CHATGPT_URL" "${title:-}" >/dev/null 2>&1 || true
+    existing="$(chats_db_find_name_by_url "$CHATGPT_URL" | head -n 1 || true)"
+    if [[ -z "${existing:-}" ]] || [[ "$existing" == "last" ]]; then
+      name="$(autoname)"
+      chats_db_upsert "$name" "$CHATGPT_URL" "${title:-}" >/dev/null 2>&1 || true
+      chats_db_set_active "$name" >/dev/null 2>&1 || true
+    else
+      chats_db_set_active "$existing" >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+
+has_convo_url=0
+if [[ -n "${CHATGPT_URL:-}" ]] && is_chat_conversation_url "$CHATGPT_URL"; then
+  has_convo_url=1
+fi
+
+slug="send-$(date +%Y%m%d-%H%M%S)"
+out="/tmp/chatgpt_send_${slug}_$$.md"
+
+# Ensure we have a visible, shared Chrome to operate against.
+# (Do this before we capture pre/post URLs for auto-pinning.)
+if ! cdp_is_up; then
+  open_browser_impl "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+fi
+if ! cdp_is_up; then
+  echo "CDP is not reachable on 127.0.0.1:$CDP_PORT. Browser is not ready." >&2
+  exit 2
+fi
+
+# If no conversation URL is pinned yet, remember current chat tabs; after the
+# first send we can pin the newly created conversation URL.
+pre_chat_urls=""
+if [[ $has_convo_url -eq 0 ]] && cdp_is_up; then
+  pre_chat_urls="$(capture_chat_urls_from_cdp | sort -u || true)"
+fi
+
+# If we already have a pinned conversation URL and CDP is available, activate it
+# before sending so the human can see the message being sent in the same tab.
+if [[ $has_convo_url -eq 1 ]] && cdp_is_up; then
+  cdp_activate_or_open_url "$CHATGPT_URL" || true
+  cdp_cleanup_chat_tabs "$CHATGPT_URL" || true
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "(dry-run) would send prompt to: ${CHATGPT_URL:-https://chatgpt.com/}" >&2
+  echo "(dry-run) prompt bytes: $(printf '%s' "$PROMPT" | wc -c | tr -d ' ')" >&2
+  exit 0
+fi
+
+if [[ $PRINT_URL -eq 1 ]]; then
+  echo "ChatGPT URL: ${CHATGPT_URL:-https://chatgpt.com/}" >&2
+fi
+
+timeout_s="$(resolve_timeout_seconds)"
+
+# Use CDP to type/click in the existing, visible ChatGPT tab and then scrape
+# the final assistant response.
+send_via_cdp() {
+  python3 "$ROOT/bin/cdp_chatgpt.py" \
+    --cdp-port "$CDP_PORT" \
+    --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
+    --timeout "$timeout_s" \
+    --prompt "$PROMPT" >"$out"
+}
+
+set +e
+send_via_cdp
+status=$?
+set -e
+
+if [[ $status -eq 6 ]]; then
+  # Chrome may be running without --remote-allow-origins; restart our automation
+  # Chrome instance with the correct flags.
+  stale_pids="$(chrome_pids_for_profile | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  if [[ -n "${stale_pids//[[:space:]]/}" ]]; then
+    echo "Restarting automation Chrome to enable CDP WebSocket access..." >&2
+    for p in $stale_pids; do
+      kill "$p" 2>/dev/null || true
+    done
+    sleep 0.8
+  fi
+  open_browser_impl "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+  set +e
+  send_via_cdp
+  status=$?
+  set -e
+fi
+
+if [[ $status -ne 0 ]]; then
+  echo "chatgpt_send failed (cdp status=$status)." >&2
+  # Keep browser visible for manual inspection.
+  if [[ -n "${CHATGPT_URL:-}" ]]; then
+    cdp_activate_or_open_url "$CHATGPT_URL" || true
+  fi
+  exit $status
+fi
+
+# Ensure the chat stays visible for the human: after automation, bring the
+# conversation tab to the front in the shared Chrome.
+if cdp_is_up; then
+  if [[ -n "${CHATGPT_URL:-}" ]] && is_chat_conversation_url "$CHATGPT_URL"; then
+    cdp_activate_or_open_url "$CHATGPT_URL" || true
+    cdp_cleanup_chat_tabs "$CHATGPT_URL" || true
+  fi
+fi
+
+# If we didn't have a conversation URL before (or we started from https://chatgpt.com/),
+# try to pin it now (after the first message creates the conversation and the
+# /c/<id> URL exists).
+if [[ $has_convo_url -eq 0 ]] && cdp_is_up; then
+  post_chat_urls="$(capture_chat_urls_from_cdp | sort -u || true)"
+  new_chat_url=""
+  if [[ -n "${post_chat_urls//[[:space:]]/}" ]]; then
+    # Prefer a newly-created URL (post - pre).
+    if [[ -n "${pre_chat_urls//[[:space:]]/}" ]]; then
+      new_chat_url="$(comm -13 <(printf '%s\n' "$pre_chat_urls") <(printf '%s\n' "$post_chat_urls") | head -n 1 || true)"
+    fi
+    # Fallback: if there is exactly one chat URL open, pick it.
+    if [[ -z "${new_chat_url:-}" ]]; then
+      if [[ "$(printf '%s\n' "$post_chat_urls" | sed '/^$/d' | wc -l)" -eq 1 ]]; then
+        new_chat_url="$(printf '%s\n' "$post_chat_urls" | sed '/^$/d' | head -n 1)"
+      fi
+    fi
+  fi
+
+  if [[ -n "${new_chat_url:-}" ]] && is_chat_conversation_url "$new_chat_url"; then
+    new_title="$(capture_chat_title_for_url_from_cdp "$new_chat_url" | head -n 1 || true)"
+    mkdir -p "$(dirname "$CHATGPT_URL_FILE")" >/dev/null 2>&1 || true
+    printf '%s\n' "$new_chat_url" >"$CHATGPT_URL_FILE"
+    # Save as last + active session name if needed.
+    chats_db_upsert "last" "$new_chat_url" "${new_title:-}" >/dev/null 2>&1 || true
+    existing="$(chats_db_find_name_by_url "$new_chat_url" | head -n 1 || true)"
+    if [[ -z "${existing:-}" ]] || [[ "$existing" == "last" ]]; then
+      if [[ -n "${INIT_SESSION_NAME:-}" ]]; then
+        name="$INIT_SESSION_NAME"
+        title="${INIT_SESSION_TITLE:-$new_title}"
+      else
+        name="$(autoname)"
+        title="${new_title:-}"
+      fi
+      name="$(chats_db_unique_name "$name")"
+      chats_db_upsert "$name" "$new_chat_url" "${title:-}" >/dev/null 2>&1 || true
+      chats_db_set_active "$name" >/dev/null 2>&1 || true
+    else
+      chats_db_set_active "$existing" >/dev/null 2>&1 || true
+    fi
+
+    # Make sure the newly created chat is visible in the browser.
+    cdp_activate_or_open_url "$new_chat_url" || true
+    cdp_cleanup_chat_tabs "$new_chat_url" || true
+  fi
+fi
+
+cat "$out"

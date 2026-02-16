@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+echo "chatgpt-send doctor"
+echo ""
+"$ROOT/bin/chatgpt_send" --doctor
+
+echo ""
+echo "Dry-run preview (no send):"
+"$ROOT/bin/chatgpt_send" --prompt "ping" --dry-run
