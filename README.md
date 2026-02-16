@@ -223,6 +223,7 @@ ln -sf "$(pwd)/bin/chatgpt_send" ~/.local/bin/chatgpt_send
 Then in Codex you can say things like:
 
 - "I want to work with the Specialist"
+- "Работаем со Специалистом"
 - "Open the browser"
 - "Talk to the Specialist, max 5 iterations"
 - "Explain how Specialist mode works"
