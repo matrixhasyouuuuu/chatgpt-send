@@ -148,6 +148,30 @@ def js_state_expr() -> str:
 """.strip()
 
 
+def js_send_ready_expr() -> str:
+    return r"""
+(() => {
+  const q = (sel) => document.querySelector(sel);
+  const ed =
+    q('#prompt-textarea[contenteditable="true"]') ||
+    q('#prompt-textarea') ||
+    q('[contenteditable="true"].ProseMirror');
+  const form = ed ? (ed.closest('form') || document) : document;
+  const btn =
+    form.querySelector('button[data-testid="send-button"]') ||
+    form.querySelector('button[aria-label="Send prompt"]') ||
+    form.querySelector('button[aria-label*="Send"]') ||
+    form.querySelector('button[type="submit"]');
+  const stop = q('button[data-testid="stop-button"], button[aria-label*="Stop"]');
+  return {
+    hasEditor: !!ed,
+    hasSend: !!btn,
+    stopVisible: !!stop,
+  };
+})()
+""".strip()
+
+
 def js_send_expr(prompt: str) -> str:
     # Use JSON encoding to avoid quoting issues.
     # ChatGPT composer uses a ProseMirror contenteditable div (#prompt-textarea).
@@ -178,13 +202,27 @@ def js_send_expr(prompt: str) -> str:
   const inserted = (ed.innerText || '').trim();
   if (!inserted) return {{ok:false, error:'failed to insert prompt text'}};
 
+  const form = ed.closest('form') || document;
   const btn =
-    q('button[data-testid="send-button"]') ||
-    q('button[aria-label="Send prompt"]') ||
-    q('button[aria-label*="Send"]');
-  if (!btn) return {{ok:false, error:'send button not found'}};
-  btn.click();
-  return {{ok:true, insertedPreview: inserted.slice(0, 60)}};
+    form.querySelector('button[data-testid="send-button"]') ||
+    form.querySelector('button[aria-label="Send prompt"]') ||
+    form.querySelector('button[aria-label*="Send"]') ||
+    form.querySelector('button[type="submit"]');
+  if (btn) {{
+    btn.click();
+    return {{ok:true, insertedPreview: inserted.slice(0, 60), method:'button'}};
+  }}
+
+  // Fallback: when ChatGPT UI hides/renames send button, try Enter send.
+  try {{
+    ed.focus();
+    ed.dispatchEvent(new KeyboardEvent('keydown', {{key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}}));
+    ed.dispatchEvent(new KeyboardEvent('keypress', {{key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}}));
+    ed.dispatchEvent(new KeyboardEvent('keyup', {{key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}}));
+    return {{ok:true, insertedPreview: inserted.slice(0, 60), method:'enter'}};
+  }} catch (e) {{
+    return {{ok:false, error:'send button not found'}};
+  }}
 }})()
 """.strip()
 
@@ -252,6 +290,26 @@ def wait_for_composer(cdp: CDP, timeout_s: float = 30.0) -> None:
     raise TimeoutError("Timed out waiting for ChatGPT composer to be ready")
 
 
+def wait_until_send_ready(cdp: CDP, timeout_s: float = 180.0) -> None:
+    """Wait until ChatGPT is idle enough to accept a new message.
+
+    When the assistant is currently generating, the send button is replaced by
+    a Stop button. In that state retries with "send button not found" are noisy
+    and lead to false "hung" conclusions.
+    """
+    deadline = time.time() + timeout_s
+    expr = js_send_ready_expr()
+    while time.time() < deadline:
+        st = cdp.eval(expr, timeout=10.0) or {}
+        has_editor = bool(st.get("hasEditor"))
+        stop_visible = bool(st.get("stopVisible"))
+        # hasSend can be false on some UI variants; Enter fallback still works.
+        if has_editor and not stop_visible:
+            return
+        time.sleep(0.5)
+    raise TimeoutError("Timed out waiting for ChatGPT to become ready for a new prompt")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cdp-port", type=int, default=9222)
@@ -299,6 +357,8 @@ def main() -> int:
             pass
 
         wait_for_composer(cdp, timeout_s=30.0)
+        # If ChatGPT is still generating previous answer, wait before sending.
+        wait_until_send_ready(cdp, timeout_s=min(float(args.timeout), 300.0))
 
         baseline = cdp.eval(js_state_expr(), timeout=10.0) or {}
         send_res = {}
