@@ -26,6 +26,38 @@ pip3 install -r requirements.txt
 ./bin/chatgpt_send --prompt "Reply with exactly: pong"
 ```
 
+## Install Once (Then Use Anywhere)
+
+If you want to install once and stop thinking about paths, put `chatgpt_send` on your `PATH`:
+
+```bash
+git clone https://github.com/matrixhasyouuuuu/chatgpt-send.git ~/opt/chatgpt-send
+cd ~/opt/chatgpt-send
+pip3 install --user -r requirements.txt
+
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/bin/chatgpt_send" ~/.local/bin/chatgpt_send
+```
+
+One-time login (keeps a dedicated browser profile under `state/`):
+
+```bash
+chatgpt_send --open-browser
+```
+
+Now you can run it from any folder:
+
+```bash
+chatgpt_send --init-specialist --topic "my task"
+chatgpt_send --prompt "Reply with exactly: pong"
+```
+
+Update later:
+
+```bash
+cd ~/opt/chatgpt-send && git pull
+```
+
 ## Why This Exists
 
 - Codex is great at executing. The Specialist is great at holding long context + fresh docs.
@@ -193,6 +225,9 @@ Then in Codex you can say things like:
 - "I want to work with the Specialist"
 - "Open the browser"
 - "Talk to the Specialist, max 5 iterations"
+- "Explain how Specialist mode works"
+
+You can also just talk normally (e.g. Russian is fine). The skill will guide you one question at a time and run the right `chatgpt_send` commands behind the scenes.
 
 </details>
 
