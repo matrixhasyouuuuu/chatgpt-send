@@ -1,8 +1,10 @@
 # chatgpt-send
 
-Send a prompt to ChatGPT **in your browser** and get the final assistant reply back in your terminal.
+A tiny CLI bridge: send a prompt to ChatGPT **in your browser** and get the final assistant reply back in your terminal.
 
-This is a small, pragmatic bridge for a workflow like:
+No API keys. Uses your ChatGPT Web login.
+
+Best use-case: a "two-brain loop":
 
 - **Codex (CLI)**: reads code, runs commands, edits files.
 - **Specialist (ChatGPT Web)**: keeps long context, does web research, sanity-checking, strategy.
@@ -10,17 +12,25 @@ This is a small, pragmatic bridge for a workflow like:
 
 Not affiliated with OpenAI. This is UI automation: it can break when ChatGPT's web UI changes.
 
-## How It Works
+## 30-Second Demo
 
-`chatgpt_send` controls an already-open ChatGPT Web tab using **Chrome DevTools Protocol (CDP)**:
+```bash
+git clone https://github.com/matrixhasyouuuuu/chatgpt-send.git
+cd chatgpt-send
+pip3 install -r requirements.txt
 
-- types your prompt into the composer
-- clicks Send
-- waits for generation to finish
-- scrapes the last assistant message from the page DOM
-- prints it to stdout
+./bin/chatgpt_send --open-browser
+# Log into chatgpt.com in the opened Chrome window (one time)
 
-State is stored under `state/` (pinned chat URL, saved sessions, loop counters, and a dedicated Chrome profile for login).
+./bin/chatgpt_send --init-specialist --topic "hello"
+./bin/chatgpt_send --prompt "Reply with exactly: pong"
+```
+
+## Why This Exists
+
+- Codex is great at executing. The Specialist is great at holding long context + fresh docs.
+- You can cap back-and-forth to N iterations (and stop anytime).
+- One chat thread per task, not a new chat every time.
 
 ## Requirements
 
@@ -30,13 +40,14 @@ State is stored under `state/` (pinned chat URL, saved sessions, loop counters, 
 - Python package: `websocket-client`
 - Optional: `wmctrl` (focus Chrome window)
 
-Install Python deps:
+Install deps:
 
 ```bash
 pip3 install -r requirements.txt
 ```
 
-## Quick Start
+<details>
+<summary><strong>Quick Start (step-by-step)</strong></summary>
 
 1) Open the automation browser and sign in once:
 
@@ -64,7 +75,10 @@ Or via stdin:
 printf '%s\n' "my prompt" | ./bin/chatgpt_send
 ```
 
-## Use An Existing Chat
+</details>
+
+<details>
+<summary><strong>Use an existing chat</strong></summary>
 
 Pin a specific ChatGPT chat:
 
@@ -84,7 +98,10 @@ Show the currently pinned chat:
 ./bin/chatgpt_send --show-chatgpt-url
 ```
 
-## Saved Sessions ("Specialist Chats")
+</details>
+
+<details>
+<summary><strong>Saved sessions ("Specialist chats")</strong></summary>
 
 Sessions are stored in:
 
@@ -110,7 +127,10 @@ Save current/resolved chat as a name:
 ./bin/chatgpt_send --save-chat alpha
 ```
 
-## Iteration Loop (N Back-and-Forths)
+</details>
+
+<details>
+<summary><strong>Iteration loop (N back-and-forths)</strong></summary>
 
 This is just a per-session counter stored in `state/`. It's useful for agent workflows:
 
@@ -121,7 +141,10 @@ This is just a per-session counter stored in `state/`. It's useful for agent wor
 ./bin/chatgpt_send --loop-clear
 ```
 
-## Codex Integration (Optional)
+</details>
+
+<details>
+<summary><strong>Codex integration (optional)</strong></summary>
 
 This repo ships a Codex skill that makes the UX "speak in natural language" and keeps a single Specialist chat per task.
 
@@ -149,6 +172,20 @@ Then in Codex you can say things like:
 - "Open the browser"
 - "Talk to the Specialist, max 5 iterations"
 
+</details>
+
+## How It Works (Under the Hood)
+
+`chatgpt_send` controls an already-open ChatGPT Web tab via **Chrome DevTools Protocol (CDP)**:
+
+- types your prompt into the composer
+- clicks Send
+- waits for generation to finish
+- scrapes the last assistant message from the page DOM
+- prints it to stdout
+
+State is stored under `state/` (pinned chat URL, saved sessions, loop counters, and a dedicated Chrome profile for login).
+
 ## Security Notes
 
 - This uses CDP (`--remote-debugging-port`). It binds to `127.0.0.1` by default. Do not expose it.
@@ -164,4 +201,3 @@ Then in Codex you can say things like:
 ```bash
 ./bin/chatgpt_send --doctor
 ```
-
