@@ -521,7 +521,9 @@ focus_chrome_window() {
   if ! command -v wmctrl >/dev/null 2>&1; then
     return 0
   fi
-  wmctrl -lx | python3 -c '
+  # Some X11/WM states can make wmctrl emit BadWindow and return non-zero.
+  # Never fail the whole command because of focus helpers.
+  wmctrl -lx 2>/dev/null | python3 -c '
 import sys
 profile = sys.argv[1]
 for line in sys.stdin:
