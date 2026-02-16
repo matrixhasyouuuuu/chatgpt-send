@@ -31,6 +31,28 @@ pip3 install -r requirements.txt
 - Codex is great at executing. The Specialist is great at holding long context + fresh docs.
 - You can cap back-and-forth to N iterations (and stop anytime).
 - One chat thread per task, not a new chat every time.
+- Optional: a Codex skill so you can drive this in plain English (no shell commands).
+
+## Why It's Powerful (Plain English)
+
+Think of it as giving your coding agent a research teammate.
+
+When you ask a coding agent: “find the bug in this repo”, you often get a short answer, a wrong guess, or a pile of clarifying questions.
+
+This workflow helps because it splits roles:
+
+- **Codex** gathers *evidence* (reads code, runs commands, extracts logs, tests hypotheses).
+- **The Specialist (ChatGPT Web)** turns that evidence into a *better next step* (what to check next, where to look, which docs matter).
+
+In practice this means:
+
+- A vague idea becomes a structured checklist.
+- You can keep “the long story” in one web chat while Codex stays focused on execution.
+- The Specialist can use web browsing / up-to-date docs (depending on your ChatGPT plan/features).
+- You control the loop: run N iterations, stop/steer anytime, and the browser stays visible.
+- Works with whatever model you pick in the ChatGPT Web UI and whatever model Codex is running.
+
+If you want the longer pitch + examples (for sharing), see: `docs/WHY.md`.
 
 ## Requirements
 
