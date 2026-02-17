@@ -34,6 +34,7 @@ PROFILE_DIR_DEFAULT="$ROOT/state/manual-login-profile"
 PROFILE_DIR="${CHATGPT_SEND_PROFILE_DIR:-$PROFILE_DIR_DEFAULT}"
 CHROME_PATH="$ROOT/bin/chrome_no_sandbox"
 CHATGPT_URL=""
+CHATGPT_URL_EXPLICIT=0
 CHATGPT_URL_FILE="$ROOT/state/chatgpt_url.txt"
 CHATS_DB="$ROOT/state/chats.json"
 CHATS_MD="$ROOT/state/sessions.md"
@@ -64,6 +65,25 @@ ORIG_ARGS=("$@")
 LOCK_FILE="${CHATGPT_SEND_LOCK_FILE:-}"
 LOCK_TIMEOUT_SEC="${CHATGPT_SEND_LOCK_TIMEOUT_SEC:-120}"
 LOCK_HELD="${CHATGPT_SEND_LOCK_HELD:-0}"
+RUN_ID="${CHATGPT_SEND_RUN_ID:-run-$(date +%s)-$$}"
+LOG_DIR="${CHATGPT_SEND_LOG_DIR:-}"
+WAIT_ONLY="${CHATGPT_SEND_WAIT_ONLY:-0}"
+SKIP_PRECHECK="${CHATGPT_SEND_SKIP_PRECHECK:-0}"
+AUTO_WAIT_ON_GENERATION="${CHATGPT_SEND_AUTO_WAIT_ON_GENERATION:-1}"
+AUTO_WAIT_MAX_SEC="${CHATGPT_SEND_AUTO_WAIT_MAX_SEC:-60}"
+AUTO_WAIT_POLL_MS="${CHATGPT_SEND_AUTO_WAIT_POLL_MS:-500}"
+REPLY_POLLING="${CHATGPT_SEND_REPLY_POLLING:-1}"
+REPLY_POLL_MS="${CHATGPT_SEND_REPLY_POLL_MS:-700}"
+REPLY_MAX_SEC="${CHATGPT_SEND_REPLY_MAX_SEC:-90}"
+REQUIRE_CONVO_URL="${CHATGPT_SEND_REQUIRE_CONVO_URL:-1}"
+ALLOW_HOME_SEND="${CHATGPT_SEND_ALLOW_HOME_SEND:-0}"
+ENFORCE_ACTIVE_PIN_MATCH="${CHATGPT_SEND_ENFORCE_ACTIVE_PIN_MATCH:-1}"
+CDP_RECOVER_LOCK_FILE="${CHATGPT_SEND_CDP_RECOVER_LOCK_FILE:-/tmp/chatgpt-send-cdp-recover.lock}"
+CDP_RECOVER_LAST_TS_FILE="${CHATGPT_SEND_CDP_RECOVER_LAST_TS_FILE:-/tmp/chatgpt-send-cdp-recover.last}"
+CDP_RECOVER_COOLDOWN_SEC="${CHATGPT_SEND_CDP_RECOVER_COOLDOWN_SEC:-2}"
+CDP_RECOVER_LOCK_TIMEOUT_SEC="${CHATGPT_SEND_CDP_RECOVER_LOCK_TIMEOUT_SEC:-30}"
+CDP_RECOVER_BUDGET="${CHATGPT_SEND_CDP_RECOVER_BUDGET:-1}"
+CDP_RECOVER_USED=0
 
 usage() {
   cat <<'EOF'
@@ -143,6 +163,43 @@ resolve_timeout_seconds() {
   echo "900"
 }
 
+emit_wait_only_block() {
+  local action="${1:-unknown}"
+  echo "E_USER_REQUEST_WAIT_ONLY action=${action} run_id=${RUN_ID}" >&2
+  exit 74
+}
+
+emit_target_chat_required() {
+  local got="${1:-none}"
+  echo "E_TARGET_CHAT_REQUIRED got=${got} run_id=${RUN_ID}" >&2
+  exit 72
+}
+
+emit_chat_state_mismatch() {
+  local active_url="${1:-none}"
+  local pinned_url="${2:-none}"
+  echo "E_CHAT_STATE_MISMATCH active_url=${active_url} pinned_url=${pinned_url} run_id=${RUN_ID}" >&2
+  exit 72
+}
+
+log_action() {
+  local action="$1"
+  shift || true
+  local extra="$*"
+  if [[ -n "${extra//[[:space:]]/}" ]]; then
+    echo "action=${action} run_id=${RUN_ID} ${extra}" >&2
+  else
+    echo "action=${action} run_id=${RUN_ID}" >&2
+  fi
+}
+
+now_ms() {
+  date +%s%3N 2>/dev/null || python3 - <<'PY'
+import time
+print(int(time.time()*1000))
+PY
+}
+
 cdp_is_up() {
   curl -fsS "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1
 }
@@ -164,6 +221,77 @@ wait_for_cdp() {
     sleep 0.5
   done
   return 1
+}
+
+cdp_recover_single_flight() {
+  # Serialize CDP/browser recovery and apply a short cooldown to avoid
+  # restart storms when several agents hit transient CDP errors together.
+  local reason="$1"
+  local url="$2"
+  local cooldown now last wait_s recover_rc lock_fd
+  cooldown="$CDP_RECOVER_COOLDOWN_SEC"
+  if [[ ! "$cooldown" =~ ^[0-9]+$ ]]; then
+    cooldown=2
+  fi
+
+  _recover_body() {
+    now="$(date +%s)"
+    last=0
+    if [[ -f "$CDP_RECOVER_LAST_TS_FILE" ]]; then
+      last="$(cat "$CDP_RECOVER_LAST_TS_FILE" 2>/dev/null | tr -d '[:space:]' || true)"
+      [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    fi
+    wait_s=0
+    if (( cooldown > 0 )) && (( now > 0 )) && (( last > 0 )) && (( now - last < cooldown )); then
+      wait_s=$((cooldown - (now - last)))
+    fi
+    if (( wait_s > 0 )); then
+      echo "[P4] cdp_recover cooldown_wait=${wait_s}s reason=${reason} run_id=${RUN_ID}" >&2
+      sleep "$wait_s"
+    fi
+    echo "[P4] cdp_recover single_flight reason=${reason} url=${url} run_id=${RUN_ID}" >&2
+    open_browser_impl "$url"
+    recover_rc=$?
+    date +%s >"$CDP_RECOVER_LAST_TS_FILE" 2>/dev/null || true
+    return "$recover_rc"
+  }
+
+  mkdir -p "$(dirname "$CDP_RECOVER_LOCK_FILE")" >/dev/null 2>&1 || true
+  mkdir -p "$(dirname "$CDP_RECOVER_LAST_TS_FILE")" >/dev/null 2>&1 || true
+  if command -v flock >/dev/null 2>&1; then
+    exec {lock_fd}>"$CDP_RECOVER_LOCK_FILE" || return 1
+    if flock -x -w "$CDP_RECOVER_LOCK_TIMEOUT_SEC" "$lock_fd"; then
+      _recover_body
+      recover_rc=$?
+      flock -u "$lock_fd" >/dev/null 2>&1 || true
+      exec {lock_fd}>&- || true
+      return "$recover_rc"
+    fi
+    echo "E_CDP_RECOVER_LOCK_TIMEOUT reason=${reason} file=${CDP_RECOVER_LOCK_FILE} run_id=${RUN_ID}" >&2
+    exec {lock_fd}>&- || true
+    return 1
+  fi
+  _recover_body
+}
+
+maybe_cdp_recover() {
+  local reason="$1"
+  local url="$2"
+  local budget="$CDP_RECOVER_BUDGET"
+  if [[ ! "$budget" =~ ^[0-9]+$ ]]; then
+    budget=1
+  fi
+  if (( CDP_RECOVER_USED >= budget )); then
+    echo "E_CDP_RECOVER_BUDGET_EXCEEDED used=${CDP_RECOVER_USED} budget=${budget} reason=${reason} run_id=${RUN_ID}" >&2
+    return 1
+  fi
+  cdp_recover_single_flight "$reason" "$url"
+  local rc=$?
+  if [[ $rc -eq 0 ]]; then
+    CDP_RECOVER_USED=$((CDP_RECOVER_USED + 1))
+    echo "[P4] cdp_recover used=${CDP_RECOVER_USED}/${budget} reason=${reason} run_id=${RUN_ID}" >&2
+  fi
+  return $rc
 }
 
 chrome_pids_for_profile() {
@@ -557,7 +685,32 @@ cdp_open_tab() {
   if ! cdp_is_up; then
     return 1
   fi
-  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/new?${url}" >/dev/null 2>&1 || true
+  # Chrome 144+ requires PUT for /json/new; GET can return HTTP 405.
+  local encoded endpoint hdr body http allow snippet
+  encoded="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$url" 2>/dev/null || true)"
+  [[ -z "${encoded:-}" ]] && encoded="$url"
+  endpoint="http://127.0.0.1:${CDP_PORT}/json/new?${encoded}"
+  hdr="$(mktemp)"
+  body="$(mktemp)"
+
+  http="$(curl -sS --max-time 2 -D "$hdr" -o "$body" -X PUT "$endpoint" -w '%{http_code}' || echo "000")"
+  if [[ ! "$http" =~ ^2 ]]; then
+    allow="$(awk 'tolower($1)=="allow:"{sub(/\r$/,"",$0); print $2}' "$hdr" | head -n 1 || true)"
+    snippet="$(head -c 240 "$body" 2>/dev/null | tr '\n' ' ' | tr -d '\r')"
+    echo "cdp_open_tab: PUT failed http=$http allow=${allow:-} body_snip=${snippet:-}" >&2
+
+    http="$(curl -sS --max-time 2 -D "$hdr" -o "$body" -X GET "$endpoint" -w '%{http_code}' || echo "000")"
+    if [[ ! "$http" =~ ^2 ]]; then
+      allow="$(awk 'tolower($1)=="allow:"{sub(/\r$/,"",$0); print $2}' "$hdr" | head -n 1 || true)"
+      snippet="$(head -c 240 "$body" 2>/dev/null | tr '\n' ' ' | tr -d '\r')"
+      echo "[E_CDP_NEW_TAB_FAILED] cdp_open_tab: GET failed http=$http allow=${allow:-} body_snip=${snippet:-}" >&2
+      export CHATGPT_SEND_ERROR_CODE="E_CDP_NEW_TAB_FAILED"
+      rm -f "$hdr" "$body"
+      return 1
+    fi
+  fi
+
+  rm -f "$hdr" "$body"
   return 0
 }
 
@@ -697,8 +850,14 @@ open_browser_impl() {
   fi
   mkdir -p "$PROFILE_DIR" >/dev/null 2>&1 || true
 
-  chrome_log="/tmp/chatgpt_send_chrome_${CDP_PORT}.log"
-  chrome_pidfile="$ROOT/state/chrome_${CDP_PORT}.pid"
+  if [[ -n "${LOG_DIR:-}" ]]; then
+    mkdir -p "${LOG_DIR}/cdp" >/dev/null 2>&1 || true
+    chrome_log="${LOG_DIR}/cdp/chrome_${CDP_PORT}.log"
+    chrome_pidfile="${LOG_DIR}/cdp/chrome_${CDP_PORT}.pid"
+  else
+    chrome_log="/tmp/chatgpt_send_chrome_${CDP_PORT}.log"
+    chrome_pidfile="$ROOT/state/chrome_${CDP_PORT}.pid"
+  fi
   rm -f "$chrome_log" >/dev/null 2>&1 || true
 
   # Use setsid to detach from the caller's process group/cgroup cleanup.
@@ -988,15 +1147,41 @@ for t in tabs:
 if [[ -n "${LOCK_FILE:-}" ]] && [[ "${LOCK_HELD}" != "1" ]]; then
   mkdir -p "$(dirname "$LOCK_FILE")" >/dev/null 2>&1 || true
   if command -v flock >/dev/null 2>&1; then
-    export CHATGPT_SEND_LOCK_HELD=1
+    lock_run_id="${CHATGPT_SEND_LOCK_RUN_ID:-lock-$(date +%s)-$$}"
+    _now_ms() { date +%s%3N 2>/dev/null || python3 - <<'PY'
+import time
+print(int(time.time()*1000))
+PY
+}
+    lock_wait_start_ms="$(_now_ms)"
+    exec {lock_fd}>"$LOCK_FILE"
     set +e
-    flock -x -w "$LOCK_TIMEOUT_SEC" -E 75 "$LOCK_FILE" "$SCRIPT_PATH" "${ORIG_ARGS[@]}"
+    flock -x -w "$LOCK_TIMEOUT_SEC" -E 75 "$lock_fd"
+    lock_acq_st=$?
+    set -e
+    lock_acq_ms="$(_now_ms)"
+    lock_wait_ms=$((lock_acq_ms - lock_wait_start_ms))
+    echo "[LOCK] event=acquire_attempt run_id=${lock_run_id} lock_file=${LOCK_FILE} wait_ms=${lock_wait_ms}" >&2
+    if [[ $lock_acq_st -ne 0 ]]; then
+      exec {lock_fd}>&- || true
+      if [[ $lock_acq_st -eq 75 ]]; then
+        echo "[E_LOCK_TIMEOUT] Failed to acquire chatgpt_send lock within ${LOCK_TIMEOUT_SEC}s: $LOCK_FILE" >&2
+        export CHATGPT_SEND_ERROR_CODE="E_LOCK_TIMEOUT"
+        exit 70
+      fi
+      exit $lock_acq_st
+    fi
+    export CHATGPT_SEND_LOCK_HELD=1
+    export CHATGPT_SEND_LOCK_RUN_ID="$lock_run_id"
+    set +e
+    "$SCRIPT_PATH" "${ORIG_ARGS[@]}"
     lock_st=$?
     set -e
-    if [[ $lock_st -eq 75 ]]; then
-      echo "Failed to acquire chatgpt_send lock within ${LOCK_TIMEOUT_SEC}s: $LOCK_FILE" >&2
-      exit 70
-    fi
+    lock_rel_ms="$(_now_ms)"
+    lock_held_ms=$((lock_rel_ms - lock_acq_ms))
+    echo "[LOCK] event=release run_id=${lock_run_id} lock_file=${LOCK_FILE} lock_held_ms=${lock_held_ms}" >&2
+    flock -u "$lock_fd" >/dev/null 2>&1 || true
+    exec {lock_fd}>&- || true
     if [[ $lock_st -ne 0 ]]; then
       exit $lock_st
     fi
@@ -1017,8 +1202,8 @@ while [[ $# -gt 0 ]]; do
     --manual-login) MANUAL_LOGIN=1; shift;;
     --no-manual-login) MANUAL_LOGIN=0; shift;;
     --chrome-path) CHROME_PATH="$2"; shift 2;;
-    --chatgpt-url) CHATGPT_URL="$2"; shift 2;;
-    --chat-id) CHATGPT_URL="https://chatgpt.com/c/$2"; shift 2;;
+    --chatgpt-url) CHATGPT_URL="$2"; CHATGPT_URL_EXPLICIT=1; shift 2;;
+    --chat-id) CHATGPT_URL="https://chatgpt.com/c/$2"; CHATGPT_URL_EXPLICIT=1; shift 2;;
     --init-specialist) INIT_SPECIALIST=1; shift;;
     --topic) INIT_TOPIC="$2"; shift 2;;
     --set-active-title) SET_ACTIVE_TITLE="$2"; shift 2;;
@@ -1164,6 +1349,9 @@ print(json.dumps(db, ensure_ascii=False, sort_keys=True))
 fi
 
 if [[ $INIT_SPECIALIST -eq 1 ]]; then
+  if [[ "${WAIT_ONLY}" == "1" ]]; then
+    emit_wait_only_block "init_specialist"
+  fi
   # Ensure a shared browser exists and force a "new chat" page. Then send the
   # bootstrap prompt which will create a /c/<id> URL that we can pin.
   open_browser_impl "https://chatgpt.com/" || exit 1
@@ -1267,10 +1455,24 @@ if [[ -z "$CHATGPT_URL" ]]; then
   fi
 fi
 
+# Optional hard route pin for child/coordinator flows.
+# When set, all sends are forced to this exact /c/... URL.
+if [[ -n "${CHATGPT_SEND_FORCE_CHAT_URL:-}" ]]; then
+  if is_chat_conversation_url "${CHATGPT_SEND_FORCE_CHAT_URL}"; then
+    CHATGPT_URL="${CHATGPT_SEND_FORCE_CHAT_URL}"
+    CHATGPT_URL_EXPLICIT=1
+    if [[ $PRINT_URL -eq 1 ]]; then
+      echo "[P3] forced_chat_url=${CHATGPT_URL}" >&2
+    fi
+  else
+    echo "Warning: ignoring invalid CHATGPT_SEND_FORCE_CHAT_URL: ${CHATGPT_SEND_FORCE_CHAT_URL}" >&2
+  fi
+fi
+
 # If caller passed generic home URL, prefer continuing active Specialist chat.
 # This preserves context by default and prevents accidental "new chat" sends.
 # Set CHATGPT_SEND_HOME_REUSES_ACTIVE=0 to disable.
-if [[ $INIT_SPECIALIST -eq 0 ]] && [[ "${CHATGPT_SEND_HOME_REUSES_ACTIVE:-1}" != "0" ]]; then
+if [[ $INIT_SPECIALIST -eq 0 ]] && [[ "${CHATGPT_SEND_HOME_REUSES_ACTIVE:-1}" != "0" ]] && [[ $CHATGPT_URL_EXPLICIT -eq 0 ]]; then
   if [[ "${CHATGPT_URL:-}" == "https://chatgpt.com/" || "${CHATGPT_URL:-}" == "https://chatgpt.com" ]]; then
     active_url="$(chats_db_get_active_url || true)"
     if [[ -n "${active_url:-}" ]] && is_chat_conversation_url "$active_url"; then
@@ -1280,15 +1482,25 @@ if [[ $INIT_SPECIALIST -eq 0 ]] && [[ "${CHATGPT_SEND_HOME_REUSES_ACTIVE:-1}" !=
       fi
     fi
   fi
+elif [[ $INIT_SPECIALIST -eq 0 ]] && [[ "${CHATGPT_SEND_HOME_REUSES_ACTIVE:-1}" != "0" ]] && [[ $CHATGPT_URL_EXPLICIT -eq 1 ]]; then
+  if [[ $PRINT_URL -eq 1 ]]; then
+    echo "Not reusing active chat: explicit --chatgpt-url set." >&2
+  fi
 fi
 
 if [[ $OPEN_BROWSER -eq 1 ]]; then
+  if [[ "${WAIT_ONLY}" == "1" ]]; then
+    emit_wait_only_block "open_browser"
+  fi
   url="${CHATGPT_URL:-https://chatgpt.com/}"
   open_browser_impl "$url" || exit 1
   exit 0
 fi
 
 if [[ $SYNC_URL -eq 1 ]]; then
+  if [[ "${WAIT_ONLY}" == "1" ]]; then
+    emit_wait_only_block "sync_chat_url"
+  fi
   if ! cdp_is_up; then
     echo "CDP is not reachable on 127.0.0.1:$CDP_PORT. Run open-browser first." >&2
     exit 2
@@ -1338,11 +1550,31 @@ if [[ -n "${SAVE_CHAT_NAME//[[:space:]]/}" ]]; then
   exit 0
 fi
 
+EXPLICIT_HOME_PROBE=0
+if [[ $CHATGPT_URL_EXPLICIT -eq 1 ]] && [[ "${CHATGPT_URL:-}" == "https://chatgpt.com/" || "${CHATGPT_URL:-}" == "https://chatgpt.com" ]]; then
+  EXPLICIT_HOME_PROBE=1
+fi
+OLD_ACTIVE_NAME="$(chats_db_get_active_name | head -n 1 || true)"
+OLD_ACTIVE_URL="$(chats_db_get_active_url | head -n 1 || true)"
+if [[ $PRINT_URL -eq 1 ]]; then
+  echo "[P2] explicit_home_probe=${EXPLICIT_HOME_PROBE} active_before=${OLD_ACTIVE_NAME:-"(none)"} active_url_before=${OLD_ACTIVE_URL:-"(none)"}" >&2
+fi
+
 if [[ -n "$PROMPT_FILE" ]]; then
+  if [[ "${WAIT_ONLY}" == "1" ]]; then
+    emit_wait_only_block "prompt_file_send"
+  fi
   PROMPT="$(cat "$PROMPT_FILE")"
 fi
 
+if [[ "${WAIT_ONLY}" == "1" ]] && [[ -n "${PROMPT//[[:space:]]/}" ]]; then
+  emit_wait_only_block "prompt_send"
+fi
+
 if [[ -z "${PROMPT//[[:space:]]/}" ]]; then
+  if [[ "${WAIT_ONLY}" == "1" ]]; then
+    emit_wait_only_block "stdin_send"
+  fi
   if [[ -t 0 ]]; then
     echo "Missing prompt. Provide --prompt/--prompt-file or pipe via stdin." >&2
     exit 2
@@ -1368,12 +1600,44 @@ if [[ -z "$CHATGPT_URL" ]] && cdp_is_up; then
     printf '%s\n' "$CHATGPT_URL" >"$CHATGPT_URL_FILE"
     chats_db_upsert "last" "$CHATGPT_URL" "${title:-}" >/dev/null 2>&1 || true
     existing="$(chats_db_find_name_by_url "$CHATGPT_URL" | head -n 1 || true)"
-    if [[ -z "${existing:-}" ]] || [[ "$existing" == "last" ]]; then
-      name="$(autoname)"
-      chats_db_upsert "$name" "$CHATGPT_URL" "${title:-}" >/dev/null 2>&1 || true
-      chats_db_set_active "$name" >/dev/null 2>&1 || true
+    if [[ "${EXPLICIT_HOME_PROBE}" == "1" ]]; then
+      echo "[P2] active_update=skipped reason=explicit_home_probe old_active=${OLD_ACTIVE_URL:-"(none)"} new_candidate=${CHATGPT_URL}" >&2
     else
-      chats_db_set_active "$existing" >/dev/null 2>&1 || true
+      if [[ -z "${existing:-}" ]] || [[ "$existing" == "last" ]]; then
+        name="$(autoname)"
+        chats_db_upsert "$name" "$CHATGPT_URL" "${title:-}" >/dev/null 2>&1 || true
+        chats_db_set_active "$name" >/dev/null 2>&1 || true
+      else
+        chats_db_set_active "$existing" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+fi
+
+# Hard send guard: prevent "wrong chat" drift by requiring a conversation URL
+# and consistent active/pinned metadata before every normal prompt send.
+if [[ $INIT_SPECIALIST -eq 0 ]]; then
+  pinned_url_current=""
+  if [[ -f "$CHATGPT_URL_FILE" ]]; then
+    pinned_url_current="$(cat "$CHATGPT_URL_FILE" | head -n 1 || true)"
+  fi
+  active_url_current="$(chats_db_get_active_url | head -n 1 || true)"
+
+  if [[ "${ENFORCE_ACTIVE_PIN_MATCH}" == "1" ]] \
+    && is_chat_conversation_url "${active_url_current:-}" \
+    && is_chat_conversation_url "${pinned_url_current:-}" \
+    && [[ "${active_url_current}" != "${pinned_url_current}" ]]; then
+    emit_chat_state_mismatch "${active_url_current}" "${pinned_url_current}"
+  fi
+
+  if [[ "${REQUIRE_CONVO_URL}" == "1" ]]; then
+    if is_chat_conversation_url "${CHATGPT_URL:-}"; then
+      :
+    elif [[ "${ALLOW_HOME_SEND}" == "1" ]] \
+      && [[ "${CHATGPT_URL:-}" == "https://chatgpt.com/" || "${CHATGPT_URL:-}" == "https://chatgpt.com" ]]; then
+      log_action "target_guard" "result=allow_home_send"
+    else
+      emit_target_chat_required "${CHATGPT_URL:-none}"
     fi
   fi
 fi
@@ -1384,7 +1648,12 @@ if [[ -n "${CHATGPT_URL:-}" ]] && is_chat_conversation_url "$CHATGPT_URL"; then
 fi
 
 slug="send-$(date +%Y%m%d-%H%M%S)"
-out="/tmp/chatgpt_send_${slug}_$$.md"
+if [[ -n "${LOG_DIR:-}" ]]; then
+  mkdir -p "${LOG_DIR}/cdp" >/dev/null 2>&1 || true
+  out="${LOG_DIR}/cdp/chatgpt_send_${slug}_$$.md"
+else
+  out="/tmp/chatgpt_send_${slug}_$$.md"
+fi
 
 # Ensure we have a visible, shared Chrome to operate against.
 # (Do this before we capture pre/post URLs for auto-pinning.)
@@ -1421,6 +1690,73 @@ if [[ $PRINT_URL -eq 1 ]]; then
 fi
 
 timeout_s="$(resolve_timeout_seconds)"
+PRECHECK_DONE=0
+
+precheck_via_cdp() {
+  python3 "$ROOT/bin/cdp_chatgpt.py" \
+    --cdp-port "$CDP_PORT" \
+    --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
+    --timeout "$timeout_s" \
+    --prompt "$PROMPT" \
+    --precheck-only >"$out"
+}
+
+precheck_auto_wait_loop() {
+  local max_sec poll_ms poll_s start_ms now elapsed_ms max_ms precheck_status
+  max_sec="$AUTO_WAIT_MAX_SEC"
+  poll_ms="$AUTO_WAIT_POLL_MS"
+  [[ "$max_sec" =~ ^[0-9]+$ ]] || max_sec=60
+  [[ "$poll_ms" =~ ^[0-9]+$ ]] || poll_ms=500
+  (( max_sec < 1 )) && max_sec=1
+  (( poll_ms < 50 )) && poll_ms=50
+  poll_s="$(awk -v ms="$poll_ms" 'BEGIN { printf "%.3f", ms/1000 }')"
+  start_ms="$(now_ms)"
+  max_ms=$((max_sec * 1000))
+
+  echo "AUTO_WAIT start max_sec=${max_sec} poll_ms=${poll_ms} run_id=${RUN_ID}" >&2
+  while true; do
+    sleep "$poll_s"
+    now="$(now_ms)"
+    elapsed_ms=$((now - start_ms))
+    echo "AUTO_WAIT tick elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+    if (( elapsed_ms >= max_ms )); then
+      echo "AUTO_WAIT done outcome=timeout elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+      echo "E_AUTO_WAIT_TIMEOUT elapsed_ms=${elapsed_ms} max_sec=${max_sec} run_id=${RUN_ID}" >&2
+      return 73
+    fi
+
+    precheck_via_cdp
+    precheck_status=$?
+
+    if [[ $precheck_status -eq 11 ]]; then
+      continue
+    fi
+    if [[ $precheck_status -eq 0 ]]; then
+      echo "AUTO_WAIT done outcome=reuse elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+      return 0
+    fi
+    if [[ $precheck_status -eq 10 ]]; then
+      echo "AUTO_WAIT done outcome=send elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+      return 10
+    fi
+    echo "AUTO_WAIT done outcome=precheck_status${precheck_status} elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+    return "$precheck_status"
+  done
+}
+
+run_send_checked() {
+  local stage="${1:-send}"
+  if [[ "${PRECHECK_DONE}" != "1" ]]; then
+    echo "E_SEND_WITHOUT_PRECHECK stage=${stage} run_id=${RUN_ID}" >&2
+    return 71
+  fi
+  log_action "send" "stage=${stage}"
+  if [[ "${REPLY_POLLING}" == "1" ]]; then
+    send_no_wait_via_cdp
+  else
+    send_via_cdp
+  fi
+}
 
 # Use CDP to type/click in the existing, visible ChatGPT tab and then scrape
 # the final assistant response.
@@ -1432,8 +1768,117 @@ send_via_cdp() {
     --prompt "$PROMPT" >"$out"
 }
 
+send_no_wait_via_cdp() {
+  python3 "$ROOT/bin/cdp_chatgpt.py" \
+    --cdp-port "$CDP_PORT" \
+    --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
+    --timeout "$timeout_s" \
+    --prompt "$PROMPT" \
+    --send-no-wait >"$out"
+}
+
+reply_ready_probe_via_cdp() {
+  python3 "$ROOT/bin/cdp_chatgpt.py" \
+    --cdp-port "$CDP_PORT" \
+    --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
+    --timeout "20" \
+    --prompt "$PROMPT" \
+    --reply-ready-probe >/dev/null
+}
+
+reply_wait_collect_via_probe() {
+  local max_sec poll_ms poll_s start_ms now elapsed_ms max_ms probe_status fetch_status
+  max_sec="$REPLY_MAX_SEC"
+  poll_ms="$REPLY_POLL_MS"
+  [[ "$max_sec" =~ ^[0-9]+$ ]] || max_sec=90
+  [[ "$poll_ms" =~ ^[0-9]+$ ]] || poll_ms=700
+  (( max_sec < 1 )) && max_sec=1
+  (( poll_ms < 100 )) && poll_ms=100
+  poll_s="$(awk -v ms="$poll_ms" 'BEGIN { printf "%.3f", ms/1000 }')"
+  start_ms="$(now_ms)"
+  max_ms=$((max_sec * 1000))
+
+  echo "REPLY_WAIT start max_sec=${max_sec} poll_ms=${poll_ms} run_id=${RUN_ID}" >&2
+  while true; do
+    now="$(now_ms)"
+    elapsed_ms=$((now - start_ms))
+    if (( elapsed_ms >= max_ms )); then
+      echo "REPLY_WAIT done outcome=timeout elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+      echo "E_REPLY_WAIT_TIMEOUT elapsed_ms=${elapsed_ms} max_sec=${max_sec} run_id=${RUN_ID}" >&2
+      return 76
+    fi
+
+    set +e
+    reply_ready_probe_via_cdp
+    probe_status=$?
+    set -e
+    if [[ $probe_status -eq 0 ]]; then
+      set +e
+      precheck_via_cdp
+      fetch_status=$?
+      set -e
+      if [[ $fetch_status -eq 0 ]]; then
+        echo "REPLY_WAIT done outcome=ready elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+        return 0
+      fi
+      if [[ $fetch_status -eq 2 ]]; then
+        echo "REPLY_WAIT done outcome=route_mismatch elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+        return 2
+      fi
+      echo "REPLY_WAIT tick elapsed_ms=${elapsed_ms} probe_status=0 fetch_status=${fetch_status} run_id=${RUN_ID}" >&2
+    elif [[ $probe_status -eq 2 ]]; then
+      echo "REPLY_WAIT done outcome=route_mismatch elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+      return 2
+    else
+      echo "REPLY_WAIT tick elapsed_ms=${elapsed_ms} probe_status=${probe_status} run_id=${RUN_ID}" >&2
+    fi
+    sleep "$poll_s"
+  done
+}
+
+if [[ "${SKIP_PRECHECK}" == "1" ]]; then
+  PRECHECK_DONE=1
+  log_action "precheck" "result=skipped debug=1"
+else
+  log_action "precheck" "result=start"
+  set +e
+  precheck_via_cdp
+  precheck_status=$?
+  set -e
+
+  if [[ $precheck_status -eq 11 ]] && [[ "${AUTO_WAIT_ON_GENERATION}" != "0" ]]; then
+    set +e
+    precheck_auto_wait_loop
+    precheck_status=$?
+    set -e
+    if [[ $precheck_status -eq 73 ]]; then
+      exit 73
+    fi
+  fi
+
+  if [[ $precheck_status -eq 0 ]]; then
+    PRECHECK_DONE=1
+    log_action "reuse" "result=precheck_hit"
+    cat "$out"
+    exit 0
+  fi
+  if [[ $precheck_status -eq 10 ]]; then
+    PRECHECK_DONE=1
+    log_action "precheck" "result=no_new_reply"
+  elif [[ $precheck_status -eq 11 ]]; then
+    PRECHECK_DONE=1
+    log_action "precheck" "result=generation_in_progress continue=1"
+  elif [[ $precheck_status -eq 2 ]]; then
+    echo "chatgpt_send precheck failed (route mismatch)." >&2
+    exit 2
+  else
+    PRECHECK_DONE=1
+    log_action "precheck" "result=failed status=${precheck_status} continue=1"
+  fi
+fi
+
 set +e
-send_via_cdp
+run_send_checked "initial"
 status=$?
 set -e
 
@@ -1448,9 +1893,9 @@ if [[ $status -eq 6 ]]; then
     done
     sleep 0.8
   fi
-  open_browser_impl "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+  maybe_cdp_recover "status6_websocket_handshake" "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
   set +e
-  send_via_cdp
+  run_send_checked "retry_status6"
   status=$?
   set -e
 fi
@@ -1460,21 +1905,61 @@ if [[ $status -eq 1 ]]; then
   # Wait briefly and retry once before failing hard.
   echo "CDP connection failed (status=1). Waiting for browser CDP to become ready..." >&2
   if ! wait_for_cdp; then
-    open_browser_impl "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+    maybe_cdp_recover "status1_initial" "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
     wait_for_cdp || true
   fi
   set +e
-  send_via_cdp
+  run_send_checked "retry_status1"
   status=$?
   set -e
 fi
 
+tab_recover_attempted=0
 if [[ $status -eq 2 || $status -eq 5 ]]; then
+  tab_recover_attempted=1
   # Recover from missing/invalid active target tab or transient CDP disconnects.
-  # Re-focus/open target URL once and retry.
-  open_browser_impl "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+  # Keep retries bounded and deterministic.
+  recover_try=1
+  while [[ $recover_try -le 2 ]] && [[ $status -eq 2 || $status -eq 5 ]]; do
+    if [[ $status -eq 2 ]]; then
+      echo "E_TAB_NOT_FOUND.retry attempt=${recover_try}" >&2
+    fi
+    if [[ -n "${CHATGPT_URL:-}" ]] && is_chat_conversation_url "$CHATGPT_URL"; then
+      cdp_activate_or_open_url "$CHATGPT_URL" || maybe_cdp_recover "status${status}_convo_target" "$CHATGPT_URL" || exit 1
+    else
+      maybe_cdp_recover "status${status}_home_target" "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+    fi
+    sleep 0.2
+    set +e
+    run_send_checked "retry_status${status}_tab_recover_${recover_try}"
+    status=$?
+    set -e
+    recover_try=$((recover_try+1))
+  done
+fi
+
+if [[ $status -eq 1 ]] && [[ $tab_recover_attempted -eq 1 ]]; then
+  # One controlled recover after tab-not-found branch to avoid noisy fail loops.
+  echo "E_CDP_UNREACHABLE.recover_once reason=post_tab_recover" >&2
+  maybe_cdp_recover "status1_post_tab_recover" "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+  sleep 0.5
   set +e
-  send_via_cdp
+  run_send_checked "retry_post_tab_recover"
+  status=$?
+  set -e
+fi
+
+if [[ $status -eq 4 ]]; then
+  # Controlled one-shot retry for transient Runtime.evaluate/CDP method timeouts.
+  echo "E_CDP_TIMEOUT_RETRY attempt=1" >&2
+  if [[ -n "${CHATGPT_URL:-}" ]] && is_chat_conversation_url "$CHATGPT_URL"; then
+    cdp_activate_or_open_url "$CHATGPT_URL" || maybe_cdp_recover "status4_timeout_convo_target" "$CHATGPT_URL" || exit 1
+  else
+    maybe_cdp_recover "status4_timeout_home_target" "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+  fi
+  sleep 0.2
+  set +e
+  run_send_checked "retry_status4_timeout"
   status=$?
   set -e
 fi
@@ -1486,6 +1971,24 @@ if [[ $status -ne 0 ]]; then
     cdp_activate_or_open_url "$CHATGPT_URL" || true
   fi
   exit $status
+fi
+
+if [[ "${REPLY_POLLING}" == "1" ]]; then
+  set +e
+  reply_wait_collect_via_probe
+  reply_status=$?
+  set -e
+  if [[ $reply_status -ne 0 ]]; then
+    if [[ $reply_status -eq 2 ]]; then
+      echo "chatgpt_send failed (reply wait route mismatch)." >&2
+      exit 2
+    fi
+    if [[ $reply_status -eq 76 ]]; then
+      exit 76
+    fi
+    echo "chatgpt_send failed (reply wait status=$reply_status)." >&2
+    exit "$reply_status"
+  fi
 fi
 
 # Ensure the chat stays visible for the human: after automation, bring the
@@ -1538,25 +2041,37 @@ if [[ $has_convo_url -eq 0 ]] && cdp_is_up; then
     printf '%s\n' "$new_chat_url" >"$CHATGPT_URL_FILE"
     # Save as last + active session name if needed.
     chats_db_upsert "last" "$new_chat_url" "${new_title:-}" >/dev/null 2>&1 || true
-    existing="$(chats_db_find_name_by_url "$new_chat_url" | head -n 1 || true)"
-    if [[ -z "${existing:-}" ]] || [[ "$existing" == "last" ]]; then
-      if [[ -n "${INIT_SESSION_NAME:-}" ]]; then
-        name="$INIT_SESSION_NAME"
-        title="${INIT_SESSION_TITLE:-$new_title}"
-      else
-        name="$(autoname)"
-        title="${new_title:-}"
-      fi
-      name="$(chats_db_unique_name "$name")"
-      chats_db_upsert "$name" "$new_chat_url" "${title:-}" >/dev/null 2>&1 || true
-      chats_db_set_active "$name" >/dev/null 2>&1 || true
+    if [[ "${EXPLICIT_HOME_PROBE}" == "1" ]]; then
+      echo "[P2] active_update=skipped reason=explicit_home_probe old_active=${OLD_ACTIVE_URL:-"(none)"} new_candidate=${new_chat_url}" >&2
     else
-      chats_db_set_active "$existing" >/dev/null 2>&1 || true
+      existing="$(chats_db_find_name_by_url "$new_chat_url" | head -n 1 || true)"
+      if [[ -z "${existing:-}" ]] || [[ "$existing" == "last" ]]; then
+        if [[ -n "${INIT_SESSION_NAME:-}" ]]; then
+          name="$INIT_SESSION_NAME"
+          title="${INIT_SESSION_TITLE:-$new_title}"
+        else
+          name="$(autoname)"
+          title="${new_title:-}"
+        fi
+        name="$(chats_db_unique_name "$name")"
+        chats_db_upsert "$name" "$new_chat_url" "${title:-}" >/dev/null 2>&1 || true
+        chats_db_set_active "$name" >/dev/null 2>&1 || true
+      else
+        chats_db_set_active "$existing" >/dev/null 2>&1 || true
+      fi
     fi
 
     # Make sure the newly created chat is visible in the browser.
     cdp_activate_or_open_url "$new_chat_url" || true
     cdp_cleanup_chat_tabs "$new_chat_url" || true
+  fi
+fi
+
+if [[ "${EXPLICIT_HOME_PROBE}" == "1" ]]; then
+  current_active_name="$(chats_db_get_active_name | head -n 1 || true)"
+  if [[ "${current_active_name:-}" != "${OLD_ACTIVE_NAME:-}" ]]; then
+    chats_db_set_active "${OLD_ACTIVE_NAME:-}" >/dev/null 2>&1 || true
+    echo "[P2] active_restore=applied reason=explicit_home_probe old_active=${OLD_ACTIVE_NAME:-"(none)"} old_url=${OLD_ACTIVE_URL:-"(none)"} current_after_restore=${OLD_ACTIVE_NAME:-"(none)"}" >&2
   fi
 fi
 

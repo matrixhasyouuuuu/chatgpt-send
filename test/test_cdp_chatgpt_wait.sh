@@ -88,5 +88,44 @@ except TimeoutError:
 else:
     raise AssertionError("expected TimeoutError for CDP.call event-only stream")
 
+# Case 5: CDP.call should tolerate transient recv timeouts and still return result.
+class FakeWSTimeoutThenReply:
+    def __init__(self):
+        self.sent = []
+        self.n = 0
+
+    def send(self, payload):
+        self.sent.append(payload)
+
+    def settimeout(self, value):
+        pass
+
+    def recv(self):
+        self.n += 1
+        if self.n <= 2:
+            raise TimeoutError("Connection timed out")
+        return '{"id":1,"result":{"ok":1}}'
+
+cdp2 = mod.CDP.__new__(mod.CDP)
+cdp2.ws = FakeWSTimeoutThenReply()
+cdp2.next_id = 1
+res = cdp2.call("Runtime.enable", timeout=0.8)
+assert res.get("ok") == 1, res
+
+# Case 6: CDP.eval should retry transient TimeoutError from Runtime.evaluate.
+class EvalTimeoutDummy:
+    def __init__(self):
+        self.n = 0
+
+    def call(self, method, params=None, timeout=None):
+        self.n += 1
+        if self.n <= 2:
+            raise TimeoutError("CDP timeout waiting for response to Runtime.evaluate")
+        return {"result": {"value": 123}}
+
+dummy = EvalTimeoutDummy()
+v = mod.CDP.eval(dummy, "1+1", timeout=0.3)
+assert v == 123, v
+
 print("OK")
 PY

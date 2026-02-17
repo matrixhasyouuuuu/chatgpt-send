@@ -59,6 +59,7 @@ WAIT_MODE=0
 TIMEOUT_SEC=3600
 OPEN_BROWSER=1
 LOG_DIR="/tmp/chatgpt-send-child"
+LOG_DIR_SET=0
 STATE_ROOT=""
 CDP_PORT=""
 BROWSER_MODE="shared"
@@ -91,7 +92,7 @@ while [[ $# -gt 0 ]]; do
     --no-open-browser) OPEN_BROWSER=0; shift;;
     --skip-git-repo-check) SKIP_GIT_REPO_CHECK=1; shift;;
     --no-skip-git-repo-check) SKIP_GIT_REPO_CHECK=0; shift;;
-    --log-dir) LOG_DIR="${2:-}"; shift 2;;
+    --log-dir) LOG_DIR="${2:-}"; LOG_DIR_SET=1; shift 2;;
     --state-root) STATE_ROOT="${2:-}"; STATE_ROOT_SET=1; shift 2;;
     --cdp-port) CDP_PORT="${2:-}"; CDP_PORT_SET=1; shift 2;;
     --model) MODEL="${2:-}"; shift 2;;
@@ -167,6 +168,10 @@ if [[ -n "${TASK_FILE:-}" ]]; then
     exit 2
   fi
   TASK_TEXT="$(cat "$TASK_FILE")"
+fi
+
+if (( LOG_DIR_SET == 0 )) && [[ -n "${CHATGPT_SEND_LOG_DIR:-}" ]]; then
+  LOG_DIR="${CHATGPT_SEND_LOG_DIR}/child"
 fi
 
 run_id="child-$(date +%Y%m%d-%H%M%S)-$$"
@@ -267,6 +272,7 @@ last_file="$LOG_DIR/${run_id}.last.txt"
 exit_file="$LOG_DIR/${run_id}.exit"
 pid_file="$LOG_DIR/${run_id}.pid"
 runner_file="$LOG_DIR/${run_id}.runner.sh"
+status_file="$LOG_DIR/${run_id}.status.log"
 
 cat >"$prompt_file" <<EOF
 Ты второй агент (child agent), запущенный главным агентом.
@@ -305,7 +311,39 @@ export CHATGPT_SEND_PRESERVE_TABS='${CHATGPT_SEND_PRESERVE_TABS_VALUE}'
 export CHATGPT_SEND_LOCK_FILE='${SHARED_BROWSER_LOCK_FILE}'
 export CHATGPT_SEND_LOCK_TIMEOUT_SEC='180'
 export CHATGPT_SEND_AUTO_TIMEOUT_SEC='${CHATGPT_SEND_AUTO_TIMEOUT_SEC:-120}'
+export CHATGPT_SEND_MAX_CDP_SLOTS='${CHATGPT_SEND_MAX_CDP_SLOTS:-2}'
+export CHATGPT_SEND_SLOT_WAIT_TIMEOUT_SEC='${CHATGPT_SEND_SLOT_WAIT_TIMEOUT_SEC:-180}'
+export CHATGPT_SEND_RUN_ID="\${CHATGPT_SEND_RUN_ID:-${run_id}}"
+export CHATGPT_SEND_LOG_DIR="\${CHATGPT_SEND_LOG_DIR:-${LOG_DIR}}"
+: > '${status_file}'
 echo \$\$ > '${pid_file}'
+
+now_ms() {
+  date +%s%3N 2>/dev/null || python3 - <<'PY'
+import time
+print(int(time.time()*1000))
+PY
+}
+
+iter_status() {
+  local step="\$1"
+  local status="\$2"
+  local reason="\$3"
+  local ts_ms
+  ts_ms="\$(now_ms)"
+  local line="[child] ITER_STATUS step=\${step} status=\${status} reason=\${reason} ts_ms=\${ts_ms} run_id=${run_id} child_id=${run_id} pinned_url=\${CHATGPT_SEND_FORCE_CHAT_URL:-none}"
+  echo "\${line}" >> '${log_file}'
+  echo "\${line}" >> '${status_file}'
+}
+
+flow_ok() {
+  local phase="\$1"
+  local ts_ms
+  ts_ms="\$(now_ms)"
+  local line="[child] FLOW_OK phase=\${phase} ts_ms=\${ts_ms} run_id=${run_id} child_id=${run_id}"
+  echo "\${line}" >> '${log_file}'
+  echo "\${line}" >> '${status_file}'
+}
 
 {
   echo "[child] run_id=${run_id}"
@@ -316,12 +354,18 @@ echo \$\$ > '${pid_file}'
   echo "[child] profile_dir=\${CHATGPT_SEND_PROFILE_DIR}"
   echo "[child] preserve_tabs=\${CHATGPT_SEND_PRESERVE_TABS}"
   echo "[child] lock_file=\${CHATGPT_SEND_LOCK_FILE}"
+  echo "[child] run_id_env=\${CHATGPT_SEND_RUN_ID}"
+  echo "[child] log_dir_env=\${CHATGPT_SEND_LOG_DIR}"
   echo "[child] auto_timeout=\${CHATGPT_SEND_AUTO_TIMEOUT_SEC}"
   echo "[child] started_at=\$(date -Iseconds)"
 } >> '${log_file}'
+iter_status "bootstrap" "done" "runner_started"
 
 child_finalize() {
   local rc=\$?
+  if [[ -f '${status_file}' ]]; then
+    cat '${status_file}' >> '${last_file}' 2>/dev/null || true
+  fi
   echo "\${rc}" > '${exit_file}'
   echo "[child] exit_code=\${rc}" >> '${log_file}'
   echo "[child] finished_at=\$(date -Iseconds)" >> '${log_file}'
@@ -329,7 +373,77 @@ child_finalize() {
 trap child_finalize EXIT
 
 run_chatgpt_send() {
+  local max_slots="\${CHATGPT_SEND_MAX_CDP_SLOTS:-2}"
+  local wait_timeout="\${CHATGPT_SEND_SLOT_WAIT_TIMEOUT_SEC:-180}"
+  local slot_id=""
+  local slot_fd=""
+  local slot_wait_start_ms=""
+  local slot_acquire_ms=""
+  local slot_hold_start_ms=""
+  local st=0
+  local slot_wait_s0=""
+  local now_s=""
+  local i=0
+  local slot_file=""
+  local fd=""
+  local wait_ms=0
+  local slot_release_ms=0
+  local held_ms=0
+
+  now_ms() {
+    date +%s%3N 2>/dev/null || python3 - <<'PY'
+import time
+print(int(time.time()*1000))
+PY
+  }
+
+  if [[ ! "\${max_slots}" =~ ^[0-9]+$ ]] || (( max_slots < 1 )); then
+    max_slots=2
+  fi
+  if [[ ! "\${wait_timeout}" =~ ^[0-9]+$ ]] || (( wait_timeout < 1 )); then
+    wait_timeout=180
+  fi
+
+  slot_wait_start_ms="\$(now_ms)"
+  while true; do
+    for ((i=0; i<max_slots; i++)); do
+      slot_file="/tmp/chatgpt-send-cdp-slot.\${i}.lock"
+      exec {fd}>"\${slot_file}" || continue
+      if flock -n "\${fd}"; then
+        slot_id="\${i}"
+        slot_fd="\${fd}"
+        slot_acquire_ms="\$(now_ms)"
+        slot_hold_start_ms="\${slot_acquire_ms}"
+        wait_ms=\$((slot_acquire_ms - slot_wait_start_ms))
+        echo "[child] SLOT_ACQUIRE slot=\${slot_id} wait_ms=\${wait_ms} ts_ms=\${slot_acquire_ms} run_id=${run_id} child_id=${run_id}" >> '${log_file}'
+        break 2
+      fi
+      exec {fd}>&- || true
+    done
+    now_s="\$(date +%s)"
+    if [[ -z "\${slot_wait_s0:-}" ]]; then
+      slot_wait_s0="\${now_s}"
+    fi
+    if (( now_s - slot_wait_s0 >= wait_timeout )); then
+      echo "[child] E_SLOT_ACQUIRE_TIMEOUT wait_timeout_sec=\${wait_timeout} run_id=${run_id}" >> '${log_file}'
+      return 73
+    fi
+    sleep 0.05
+  done
+
+  set +e
   '${CHATGPT_SEND_PATH}' "\$@"
+  st=\$?
+  set -e
+
+  if [[ -n "\${slot_fd:-}" ]]; then
+    slot_release_ms="\$(now_ms)"
+    held_ms=\$((slot_release_ms - slot_hold_start_ms))
+    echo "[child] SLOT_RELEASE slot=\${slot_id} held_ms=\${held_ms} ts_ms=\${slot_release_ms}" >> '${log_file}'
+    flock -u "\${slot_fd}" >/dev/null 2>&1 || true
+    exec {slot_fd}>&- || true
+  fi
+  return "\${st}"
 }
 
 run_chatgpt_send_logged() {
@@ -341,6 +455,11 @@ run_chatgpt_send_logged() {
   local rc=\$?
   set -e
   echo "[child] step=\${step} rc=\${rc}" >> '${log_file}'
+  if [[ "\${rc}" == "0" ]]; then
+    iter_status "\${step}" "done" "chatgpt_send_rc=0"
+  else
+    iter_status "\${step}" "blocked" "chatgpt_send_rc=\${rc}"
+  fi
   return "\$rc"
 }
 
@@ -354,11 +473,17 @@ run_chatgpt_send_capture() {
   local rc=\$?
   set -e
   echo "[child] step=\${step} rc=\${rc} out=\${out}" >> '${log_file}'
+  if [[ "\${rc}" == "0" ]]; then
+    iter_status "\${step}" "done" "chatgpt_send_capture_rc=0"
+  else
+    iter_status "\${step}" "blocked" "chatgpt_send_capture_rc=\${rc}"
+  fi
   printf '%s\n' "\$out"
   return "\$rc"
 }
 
 cd '${PROJECT_PATH}'
+child_chat_url=""
 if [[ '${OPEN_BROWSER}' == '1' ]]; then
   if [[ '${BROWSER_POLICY}' == 'required' ]]; then
     run_chatgpt_send_logged "open-browser" --open-browser --chatgpt-url https://chatgpt.com/
@@ -386,6 +511,20 @@ if [[ '${INIT_SPECIALIST_CHAT}' == '1' ]]; then
   fi
 fi
 
+if [[ -z "\${child_chat_url:-}" ]]; then
+  child_chat_url="\$(run_chatgpt_send_capture "show-chat-url" --show-chatgpt-url | tail -n 1 || true)"
+  if [[ -n "\${child_chat_url:-}" ]]; then
+    echo "[child] specialist_chat_url=\${child_chat_url}" >> '${log_file}'
+  fi
+fi
+if [[ -n "\${child_chat_url:-}" ]] && [[ "\${child_chat_url}" =~ ^https://chatgpt\\.com/c/[A-Za-z0-9-]+$ ]]; then
+  export CHATGPT_SEND_FORCE_CHAT_URL="\${child_chat_url}"
+  echo "[child] pinned_route_url=\${CHATGPT_SEND_FORCE_CHAT_URL}" >> '${log_file}'
+  cat >> '${prompt_file}' <<PINNED_ROUTE
+12) Для каждого вызова /home/matrix/projects/chatgpt-send/bin/chatgpt_send с отправкой сообщения ( --prompt / --prompt-file ) обязательно указывай явный --chatgpt-url '\${child_chat_url}'.
+PINNED_ROUTE
+fi
+
 set +e
 extra_git_arg=""
 if [[ '${SKIP_GIT_REPO_CHECK}' == '1' ]]; then
@@ -393,13 +532,18 @@ if [[ '${SKIP_GIT_REPO_CHECK}' == '1' ]]; then
 fi
 
 if [[ -n '${MODEL}' ]]; then
+  flow_ok "read"
   '${CODEX_BIN}' exec --full-auto \${extra_git_arg} -m '${MODEL}' -C '${PROJECT_PATH}' -o '${last_file}' - < '${prompt_file}' 2>&1 | tee -a '${log_file}'
   st=\${PIPESTATUS[0]}
 else
+  flow_ok "read"
   '${CODEX_BIN}' exec --full-auto \${extra_git_arg} -C '${PROJECT_PATH}' -o '${last_file}' - < '${prompt_file}' 2>&1 | tee -a '${log_file}'
   st=\${PIPESTATUS[0]}
 fi
 set -e
+if [[ "\${st}" == "0" ]]; then
+  flow_ok "execute"
+fi
 
 # Enforce browser policy from child final message/logs.
 browser_line=""
@@ -446,11 +590,62 @@ if [[ "\${policy_fail_code}" != "0" ]]; then
   st="\${policy_fail_code}"
 fi
 
+# Mark common transient infra failures explicitly in child logs.
+if [[ -f '${log_file}' ]] && grep -q 'Timed out waiting for assistant response activity' '${log_file}'; then
+  echo "[child] error_code=E_ACTIVITY_TIMEOUT reason=assistant_activity_timeout original_exit=\${st}" >> '${log_file}'
+elif [[ -f '${last_file}' ]] && grep -q 'Timed out waiting for assistant response activity' '${last_file}'; then
+  echo "[child] error_code=E_ACTIVITY_TIMEOUT reason=assistant_activity_timeout original_exit=\${st}" >> '${log_file}'
+fi
+if [[ "\${st}" == "70" ]] || ( [[ -f '${log_file}' ]] && grep -q 'Failed to acquire chatgpt_send lock within' '${log_file}' ); then
+  echo "[child] error_code=E_LOCK_TIMEOUT reason=lock_timeout original_exit=\${st}" >> '${log_file}'
+fi
+
 # Codex may return non-zero on rollout-recorder shutdown even after producing
 # a valid final CHILD_RESULT. Keep successful handoffs stable for coordinator.
-if [[ "\${st}" != "0" ]] && [[ "\${policy_fail_code}" == "0" ]] && [[ -f '${last_file}' ]] && grep -q '^CHILD_RESULT:' '${last_file}'; then
+if [[ "\${st}" != "0" ]] \
+  && [[ "\${policy_fail_code}" == "0" ]] \
+  && [[ "\${st}" != "70" ]] \
+  && [[ "\${st}" != "41" ]] && [[ "\${st}" != "42" ]] && [[ "\${st}" != "43" ]] && [[ "\${st}" != "44" ]] && [[ "\${st}" != "45" ]] \
+  && [[ -f '${last_file}' ]] \
+  && grep -q '^CHILD_RESULT:' '${last_file}'; then
   echo "[child] normalized_exit=0 reason=child_result_present original_exit=\${st}" >> '${log_file}'
   st=0
+fi
+
+flow_read_ln="\$(grep -n 'FLOW_OK phase=read' '${status_file}' | head -n 1 | cut -d: -f1 || true)"
+flow_exec_ln="\$(grep -n 'FLOW_OK phase=execute' '${status_file}' | head -n 1 | cut -d: -f1 || true)"
+flow_report_ln="\$(grep -n 'FLOW_OK phase=report' '${status_file}' | head -n 1 | cut -d: -f1 || true)"
+flow_violation=0
+flow_violation_reason=""
+if [[ -n "\${flow_exec_ln:-}" ]] && { [[ -z "\${flow_read_ln:-}" ]] || (( flow_exec_ln < flow_read_ln )); }; then
+  flow_violation=1
+  flow_violation_reason="execute_without_read"
+fi
+if [[ -n "\${flow_report_ln:-}" ]] && { [[ -z "\${flow_exec_ln:-}" ]] || (( flow_report_ln < flow_exec_ln )); }; then
+  flow_violation=1
+  if [[ -n "\${flow_violation_reason:-}" ]]; then
+    flow_violation_reason="\${flow_violation_reason},report_without_execute"
+  else
+    flow_violation_reason="report_without_execute"
+  fi
+fi
+if [[ "\${flow_violation}" == "1" ]]; then
+  echo "[child] E_FLOW_ORDER_VIOLATION reason=\${flow_violation_reason}" >> '${log_file}'
+  iter_status "flow-order" "blocked" "E_FLOW_ORDER_VIOLATION:\${flow_violation_reason}"
+  if [[ '${BROWSER_POLICY}' == 'required' ]] && [[ "\${st}" == "0" ]]; then
+    st=46
+  fi
+fi
+
+if [[ "\${st}" == "0" ]]; then
+  iter_status "final" "done" "child_completed"
+  flow_ok "report"
+else
+  if [[ -f '${log_file}' ]] && grep -q 'E_PRECHECK_GENERATION_IN_PROGRESS' '${log_file}'; then
+    iter_status "final" "waiting" "generation_in_progress rc=\${st}"
+  else
+    iter_status "final" "blocked" "child_exit=\${st}"
+  fi
 fi
 
 exit \$st
@@ -500,6 +695,7 @@ echo "PROFILE_DIR=${CHILD_PROFILE_DIR}"
 echo "CDP_PORT=${CDP_PORT}"
 echo "LOG_FILE=${log_file}"
 echo "LAST_FILE=${last_file}"
+echo "STATUS_FILE=${status_file}"
 echo "EXIT_FILE=${exit_file}"
 echo "PID_FILE=${pid_file}"
 
@@ -515,7 +711,10 @@ if (( WAIT_MODE == 1 )); then
   st="$(cat "$exit_file" | tr -d '[:space:]')"
   result=""
   if [[ -f "$last_file" ]]; then
-    result="$(tail -n 1 "$last_file" || true)"
+    result="$(grep -E '^CHILD_RESULT:' "$last_file" | tail -n 1 || true)"
+    if [[ -z "${result:-}" ]]; then
+      result="$(tail -n 1 "$last_file" || true)"
+    fi
   fi
   echo "CHILD_STATUS=${st:-unknown}"
   echo "CHILD_RESULT=${result}"

@@ -56,6 +56,9 @@ set -euo pipefail
 if [[ "\${FAKE_CHATGPT_FAIL_INIT:-0}" == "1" ]] && [[ "\$*" == *"--init-specialist"* ]]; then
   exit 5
 fi
+if [[ "\$*" == *"--show-chatgpt-url"* ]]; then
+  echo "https://chatgpt.com/c/abcd-1234"
+fi
 printf 'ROOT=%s\nPORT=%s\nPROFILE=%s\nPRESERVE_TABS=%s\nLOCK_FILE=%s\nLOCK_TIMEOUT=%s\nAUTO_TIMEOUT=%s\nARGS=%s\n' \
   "\${CHATGPT_SEND_ROOT:-}" \
   "\${CHATGPT_SEND_CDP_PORT:-}" \
@@ -93,11 +96,21 @@ codex_chatgpt_root="$(echo "$out" | sed -n 's/^CODEX_CHATGPT_SEND_ROOT=//p' | he
 cdp_port="$(echo "$out" | sed -n 's/^CDP_PORT=//p' | head -n 1)"
 browser_mode="$(echo "$out" | sed -n 's/^BROWSER_MODE=//p' | head -n 1)"
 last_file="$(echo "$out" | sed -n 's/^LAST_FILE=//p' | head -n 1)"
+log_file="$(echo "$out" | sed -n 's/^LOG_FILE=//p' | head -n 1)"
+status_file="$(echo "$out" | sed -n 's/^STATUS_FILE=//p' | head -n 1)"
 
 [[ -d "$state_root" ]]
 [[ -d "$codex_chatgpt_root" ]]
 [[ -f "$last_file" ]]
+[[ -f "$log_file" ]]
+[[ -f "$status_file" ]]
 rg -q -- '^CHILD_RESULT: fake solved task$' "$last_file"
+rg -q -- '^\[child\] ITER_STATUS step=bootstrap status=done reason=runner_started' "$log_file"
+rg -q -- '^\[child\] ITER_STATUS step=final status=done reason=child_completed' "$log_file"
+rg -q -- '^\[child\] FLOW_OK phase=read' "$log_file"
+rg -q -- '^\[child\] FLOW_OK phase=report' "$log_file"
+# Emit markers into test stdout so release_gate_check can see child status lines.
+grep -E '^\[child\] ITER_STATUS ' "$log_file" | sed -n '1,8p'
 [[ "$browser_mode" == "shared" ]]
 [[ "$state_root" == "$tool_root/state/child-agents-shared/"* ]]
 [[ "$codex_chatgpt_root" == "$proj/.chatgpt_send_child_state/"* ]]
@@ -116,6 +129,7 @@ rg -q -- "LOCK_TIMEOUT=180" "$env_capture"
 rg -q -- "AUTO_TIMEOUT=120" "$env_capture"
 rg -q -- "ARGS=--open-browser --chatgpt-url https://chatgpt.com/" "$env_capture"
 rg -q -- 'ARGS=.*--init-specialist --topic child-' "$env_capture"
+rg -q -- '^\[child\] pinned_route_url=https://chatgpt.com/c/abcd-1234$' "$log_file"
 
 # Verify browser-disabled policy never opens browser.
 : >"$env_capture"

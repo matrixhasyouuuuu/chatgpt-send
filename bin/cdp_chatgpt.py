@@ -8,7 +8,7 @@ import time
 import urllib.request
 
 import websocket
-from websocket._exceptions import WebSocketBadStatusException
+from websocket._exceptions import WebSocketBadStatusException, WebSocketTimeoutException
 
 
 PROGRESS_ENABLED = os.environ.get("CHATGPT_SEND_PROGRESS", "1") != "0"
@@ -20,6 +20,14 @@ def progress(msg: str) -> None:
     if not PROGRESS_ENABLED:
         return
     sys.stderr.write(f"[cdp_chatgpt] {msg}\n")
+    sys.stderr.flush()
+
+
+def error_marker(code: str, detail: str = "") -> None:
+    if detail:
+        sys.stderr.write(f"{code}: {detail}\n")
+    else:
+        sys.stderr.write(f"{code}\n")
     sys.stderr.flush()
 
 
@@ -50,25 +58,38 @@ def find_target_tab(tabs: list[dict], target_url: str) -> dict | None:
             u = normalize_url(t.get("url") or "")
             if chat_id_from_url(u) == target_chat_id:
                 return t
+        sys.stderr.write(f"E_TAB_NOT_FOUND: chat_id_not_found target_chat_id={target_chat_id}\n")
         return None
 
     # Non-conversation URL: use the last matching ChatGPT tab.
     if target_url.startswith("https://chatgpt.com"):
+        is_home = target_url in ("https://chatgpt.com", "https://chatgpt.com/")
         best = None
+        best_conv = None
         for t in tabs:
             u = normalize_url(t.get("url") or "")
             if not u.startswith("https://chatgpt.com"):
                 continue
             # Prefer "home/new chat" tabs, not /c/ conversation tabs.
             if u.startswith("https://chatgpt.com/c/"):
+                best_conv = t
                 continue
             best = t
-        return best
+        if best is not None:
+            return best
+        if not is_home and best_conv is not None:
+            return best_conv
+        if is_home:
+            sys.stderr.write(f"E_TAB_NOT_FOUND: home_tab_missing target_url={target_url}\n")
+        else:
+            sys.stderr.write(f"E_TAB_NOT_FOUND: no_chatgpt_tabs target_url={target_url}\n")
+        return None
 
     # Exact URL match fallback.
     for t in tabs:
         if normalize_url(t.get("url") or "") == target_url:
             return t
+    sys.stderr.write(f"E_TAB_NOT_FOUND: exact_url_not_found target_url={target_url}\n")
     return None
 
 
@@ -99,7 +120,12 @@ class CDP:
                 raise TimeoutError(f"CDP timeout waiting for response to {method}")
             remaining = max(0.1, deadline - time.time())
             self.ws.settimeout(remaining)
-            raw = self.ws.recv()
+            try:
+                raw = self.ws.recv()
+            except (WebSocketTimeoutException, TimeoutError):
+                # Transient idle gaps on CDP websocket are expected; keep waiting
+                # until our method-level deadline is reached.
+                continue
             data = json.loads(raw)
             if data.get("id") == msg_id:
                 if "error" in data:
@@ -136,6 +162,10 @@ class CDP:
                     time.sleep(0.15)
                     continue
                 raise
+            except TimeoutError as e:
+                last_err = e
+                time.sleep(0.15)
+                continue
         if last_err:
             raise last_err
         return None
@@ -297,6 +327,49 @@ def normalize_assistant_text(s: str) -> str:
     return txt
 
 
+def normalize_text_for_compare(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def prompt_echo_matches(prompt: str, last_user_text: str) -> bool:
+    p = normalize_text_for_compare(prompt)
+    u = normalize_text_for_compare(last_user_text)
+    if not p or not u:
+        return False
+    if p == u or p in u or u in p:
+        return True
+    head = min(len(p), len(u), 64)
+    if head >= 24 and p[:head] == u[:head]:
+        return True
+    tail = min(len(p), len(u), 32)
+    if tail >= 24 and p[-tail:] == u[-tail:]:
+        return True
+    return False
+
+
+def should_skip_duplicate_send(prompt: str, baseline: dict) -> bool:
+    last_user = baseline.get("lastUser") or ""
+    return prompt_echo_matches(prompt, last_user)
+
+
+def wait_for_user_echo(cdp: CDP, baseline: dict, prompt: str, timeout_s: float = 8.0) -> dict | None:
+    """Wait until the sent prompt is visible as the newest user message."""
+    deadline = time.time() + timeout_s
+    state_expr = js_state_expr()
+    b_user_count = int(baseline.get("userCount") or 0)
+    b_user_sig = (baseline.get("lastUserSig") or "").strip()
+    while time.time() < deadline:
+        st = cdp.eval(state_expr, timeout=10.0) or {}
+        user_count = int(st.get("userCount") or 0)
+        user_sig = (st.get("lastUserSig") or "").strip()
+        last_user = st.get("lastUser") or ""
+        if user_sig and user_sig != b_user_sig and user_count >= b_user_count:
+            if prompt_echo_matches(prompt, last_user):
+                return st
+        time.sleep(0.25)
+    return None
+
+
 def wait_for_dispatch_signal(cdp: CDP, baseline: dict, max_wait_s: float = 8.0) -> bool:
     """Return True if UI indicates prompt was dispatched (stop/activity/user turn)."""
     deadline = time.time() + max_wait_s
@@ -377,6 +450,10 @@ def wait_for_response(cdp: CDP, baseline: dict, timeout_s: float) -> str:
         time.sleep(0.5)
     else:
         waited = time.time() - t0
+        error_marker(
+            "E_ACTIVITY_TIMEOUT",
+            f"phase=wait_activity waited={waited:.1f}s limit={min(timeout_s, max(15.0, ACTIVITY_TIMEOUT_SEC)):.1f}s",
+        )
         raise TimeoutError(
             f"Timed out waiting for assistant response activity "
             f"(phase=wait_activity waited={waited:.1f}s limit={min(timeout_s, max(15.0, ACTIVITY_TIMEOUT_SEC)):.1f}s)"
@@ -431,7 +508,9 @@ def wait_for_response(cdp: CDP, baseline: dict, timeout_s: float) -> str:
             progress(f"phase=wait_finish event=completed elapsed={time.time()-t0:.1f}s")
             return (raw_txt or last_raw_text).strip()
         time.sleep(0.5)
-    raise TimeoutError(f"Timed out waiting for assistant to finish (phase=wait_finish waited={time.time()-t0:.1f}s)")
+    waited_finish = time.time() - t0
+    error_marker("E_ACTIVITY_TIMEOUT", f"phase=wait_finish waited={waited_finish:.1f}s")
+    raise TimeoutError(f"Timed out waiting for assistant to finish (phase=wait_finish waited={waited_finish:.1f}s)")
 
 
 def wait_for_composer(cdp: CDP, timeout_s: float = 30.0) -> None:
@@ -461,7 +540,7 @@ def wait_for_composer(cdp: CDP, timeout_s: float = 30.0) -> None:
     raise TimeoutError("Timed out waiting for ChatGPT composer to be ready")
 
 
-def wait_until_send_ready(cdp: CDP, timeout_s: float = 180.0) -> None:
+def wait_until_send_ready(cdp: CDP, timeout_s: float = 180.0) -> bool:
     """Wait until ChatGPT is idle enough to accept a new message.
 
     When the assistant is currently generating, the send button is replaced by
@@ -471,20 +550,27 @@ def wait_until_send_ready(cdp: CDP, timeout_s: float = 180.0) -> None:
     deadline = time.time() + timeout_s
     t0 = time.time()
     next_heartbeat = t0
+    saw_generation_in_progress = False
     expr = js_send_ready_expr()
     while time.time() < deadline:
         st = cdp.eval(expr, timeout=10.0) or {}
         has_editor = bool(st.get("hasEditor"))
         has_send = bool(st.get("hasSend"))
         stop_visible = bool(st.get("stopVisible"))
+        if stop_visible:
+            if not saw_generation_in_progress:
+                error_marker("E_PRECHECK_GENERATION_IN_PROGRESS", "generation_active_before_send")
+            saw_generation_in_progress = True
         # hasSend can be false on some UI variants; Enter fallback still works.
         if has_editor and not stop_visible:
+            if saw_generation_in_progress:
+                error_marker("E_GENERATION_IN_PROGRESS", "waited_until_idle_before_send")
             progress(
                 "phase=wait_send_ready event=ready"
                 f" elapsed={time.time()-t0:.1f}s"
                 f" has_send={int(has_send)}"
             )
-            return
+            return saw_generation_in_progress
         if time.time() >= next_heartbeat:
             progress(
                 "phase=wait_send_ready"
@@ -495,7 +581,98 @@ def wait_until_send_ready(cdp: CDP, timeout_s: float = 180.0) -> None:
             )
             next_heartbeat = time.time() + HEARTBEAT_SEC
         time.sleep(0.5)
+    if saw_generation_in_progress:
+        error_marker("E_PRECHECK_GENERATION_IN_PROGRESS", "generation_still_active_at_send_ready_timeout")
+        error_marker("E_GENERATION_IN_PROGRESS", "still_generating_at_send_ready_timeout")
     raise TimeoutError("Timed out waiting for ChatGPT to become ready for a new prompt")
+
+
+def ensure_target_route(cdp: CDP, target_url: str) -> bool:
+    """Ensure we are on the expected /c/<id> conversation before sending."""
+    target_chat_id = chat_id_from_url(target_url)
+    if not target_chat_id:
+        return True
+    state_expr = js_state_expr()
+    for attempt in range(1, 3):
+        st = cdp.eval(state_expr, timeout=10.0) or {}
+        current_url = normalize_url(st.get("url") or "")
+        current_chat_id = chat_id_from_url(current_url)
+        if current_chat_id == target_chat_id:
+            return True
+        error_marker(
+            "E_ROUTE_MISMATCH",
+            f"expected={target_chat_id} got={current_chat_id or 'none'} attempt={attempt}",
+        )
+        if attempt >= 2:
+            break
+        try:
+            cdp.call("Page.navigate", {"url": target_url}, timeout=10.0)
+            progress(f"phase=route_guard event=navigate attempt={attempt}")
+        except Exception as e:
+            progress(f"phase=route_guard event=navigate_error attempt={attempt} err={e}")
+        time.sleep(0.5)
+        try:
+            wait_for_composer(cdp, timeout_s=20.0)
+            wait_until_send_ready(cdp, timeout_s=30.0)
+        except Exception:
+            pass
+    return False
+
+
+def precheck_reply_before_send(cdp: CDP, target_url: str, prompt: str, timeout_s: float) -> tuple[bool, str]:
+    """Check whether a ready answer already exists for this prompt.
+
+    Returns (reused, text). If reused=True, caller should return text and skip send.
+    """
+    if not ensure_target_route(cdp, target_url):
+        error_marker("E_ROUTE_MISMATCH_FATAL", "failed_to_activate_expected_target_chat")
+        raise RuntimeError("Route mismatch: failed to activate expected target chat.")
+
+    baseline = cdp.eval(js_state_expr(), timeout=10.0) or {}
+    if should_skip_duplicate_send(prompt, baseline):
+        stop_visible = bool(baseline.get("stopVisible"))
+        existing_answer = (baseline.get("lastAssistant") or "").strip()
+        if stop_visible:
+            error_marker("E_PRECHECK_GENERATION_IN_PROGRESS", "waiting_existing_generation")
+            answer = wait_for_response(cdp, baseline, timeout_s=min(timeout_s, 300.0))
+            error_marker("E_PRECHECK_REPLY_ALREADY_AVAILABLE", "completed_existing_generation")
+            return True, answer
+        if existing_answer:
+            error_marker("E_PRECHECK_REPLY_ALREADY_AVAILABLE", "last_user_matches_prompt")
+            return True, existing_answer
+    error_marker("E_PRECHECK_NO_NEW_REPLY", "need_send")
+    return False, ""
+
+
+def is_generation_in_progress(cdp: CDP) -> bool:
+    """Return True when ChatGPT currently shows the Stop button."""
+    try:
+        st = cdp.eval(js_send_ready_expr(), timeout=10.0) or {}
+    except Exception:
+        return False
+    return bool(st.get("stopVisible"))
+
+
+def emit_timing(
+    *,
+    precheck_ms: int | None = None,
+    send_ms: int | None = None,
+    wait_reply_ms: int | None = None,
+    total_ms: int | None = None,
+) -> None:
+    parts: list[str] = []
+    if precheck_ms is not None:
+        parts.append(f"precheck_ms={int(precheck_ms)}")
+    if send_ms is not None:
+        parts.append(f"send_ms={int(send_ms)}")
+    if wait_reply_ms is not None:
+        parts.append(f"wait_reply_ms={int(wait_reply_ms)}")
+    if total_ms is not None:
+        parts.append(f"total_ms={int(total_ms)}")
+    if not parts:
+        return
+    sys.stderr.write("TIMING " + " ".join(parts) + "\n")
+    sys.stderr.flush()
 
 
 def main() -> int:
@@ -504,7 +681,15 @@ def main() -> int:
     ap.add_argument("--chatgpt-url", required=True)
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--timeout", type=float, default=900.0)
+    ap.add_argument("--precheck-only", action="store_true")
+    ap.add_argument("--send-no-wait", action="store_true")
+    ap.add_argument("--reply-ready-probe", action="store_true")
     args = ap.parse_args()
+    t_main_start = time.time()
+    mode_flags = [args.precheck_only, args.send_no_wait, args.reply_ready_probe]
+    if sum(1 for x in mode_flags if x) > 1:
+        sys.stderr.write("Only one mode is allowed: --precheck-only | --send-no-wait | --reply-ready-probe\n")
+        return 2
 
     progress(f"phase=start cdp_port={args.cdp_port} timeout={args.timeout}")
     tabs = http_json(f"http://127.0.0.1:{args.cdp_port}/json/list", timeout=5.0)
@@ -548,8 +733,45 @@ def main() -> int:
             pass
 
         wait_for_composer(cdp, timeout_s=30.0)
+        if args.precheck_only:
+            t_precheck_start = time.time()
+            reused, text = precheck_reply_before_send(cdp, args.chatgpt_url, args.prompt, timeout_s=float(args.timeout))
+            precheck_ms = int((time.time() - t_precheck_start) * 1000)
+            if reused:
+                emit_timing(precheck_ms=precheck_ms, total_ms=int((time.time() - t_main_start) * 1000))
+                sys.stdout.write(text.strip() + "\n")
+                return 0
+            if is_generation_in_progress(cdp):
+                error_marker("E_PRECHECK_GENERATION_IN_PROGRESS", "generation_active_before_send")
+                emit_timing(precheck_ms=precheck_ms, total_ms=int((time.time() - t_main_start) * 1000))
+                return 11
+            emit_timing(precheck_ms=precheck_ms, total_ms=int((time.time() - t_main_start) * 1000))
+            return 10
+        if args.reply_ready_probe:
+            if not ensure_target_route(cdp, args.chatgpt_url):
+                error_marker("E_ROUTE_MISMATCH_FATAL", "failed_to_activate_expected_target_chat")
+                return 2
+            st = cdp.eval(js_state_expr(), timeout=10.0) or {}
+            if not should_skip_duplicate_send(args.prompt, st):
+                error_marker("REPLY_READY", "0 reason=prompt_not_echoed")
+                return 10
+            if bool(st.get("stopVisible")):
+                error_marker("REPLY_READY", "0 reason=stop_visible")
+                return 10
+            existing_answer = (st.get("lastAssistant") or "").strip()
+            if existing_answer:
+                error_marker("REPLY_READY", "1")
+                return 0
+            error_marker("REPLY_READY", "0 reason=empty_assistant")
+            return 10
+
+        t_send_start = time.time()
         # If ChatGPT is still generating previous answer, wait before sending.
         wait_until_send_ready(cdp, timeout_s=min(float(args.timeout), 300.0))
+        if not ensure_target_route(cdp, args.chatgpt_url):
+            error_marker("E_ROUTE_MISMATCH_FATAL", "failed_to_activate_expected_target_chat")
+            sys.stderr.write("Route mismatch: failed to activate expected target chat.\n")
+            return 2
 
         baseline = cdp.eval(js_state_expr(), timeout=10.0) or {}
         progress(
@@ -557,23 +779,74 @@ def main() -> int:
             f" user={int(baseline.get('userCount') or 0)}"
             f" asst={int(baseline.get('assistantCount') or 0)}"
         )
+        if should_skip_duplicate_send(args.prompt, baseline):
+            error_marker("E_DUPLICATE_PROMPT_BLOCKED", "last_user_matches_prompt")
+            stop_visible = bool(baseline.get("stopVisible"))
+            existing_answer = (baseline.get("lastAssistant") or "").strip()
+            if stop_visible:
+                progress("phase=dedupe event=wait_existing_generation")
+                t_wait_reply_start = time.time()
+                answer = wait_for_response(cdp, baseline, timeout_s=float(args.timeout))
+                send_ms = int((t_wait_reply_start - t_send_start) * 1000)
+                wait_reply_ms = int((time.time() - t_wait_reply_start) * 1000)
+                emit_timing(
+                    send_ms=send_ms,
+                    wait_reply_ms=wait_reply_ms,
+                    total_ms=int((time.time() - t_main_start) * 1000),
+                )
+                progress("phase=done event=answer_ready_dedupe")
+                sys.stdout.write(answer.strip() + "\n")
+                return 0
+            if existing_answer:
+                emit_timing(send_ms=int((time.time() - t_send_start) * 1000), total_ms=int((time.time() - t_main_start) * 1000))
+                progress("phase=dedupe event=return_last_answer")
+                sys.stdout.write(existing_answer + "\n")
+                return 0
+
+        send_baseline = dict(baseline)
         send_res = {}
-        for _ in range(20):
+        anchor_state = None
+        last_dispatch_state = None
+        max_send_attempts = 2
+        for attempt in range(1, max_send_attempts + 1):
             send_res = cdp.eval(js_send_expr(args.prompt), timeout=10.0) or {}
             if isinstance(send_res, dict) and send_res.get("ok"):
                 method = send_res.get("method", "unknown")
-                progress(f"phase=send event=ok method={method}")
+                progress(f"phase=send event=ok method={method} attempt={attempt}")
+                dispatched = False
                 if wait_for_dispatch_signal(cdp, baseline, max_wait_s=8.0):
                     progress("phase=send event=dispatched")
+                    dispatched = True
+                else:
+                    progress("phase=send event=no_dispatch_after_send retry=enter")
+                    enter_res = cdp.eval(js_press_enter_expr(), timeout=10.0) or {}
+                    if isinstance(enter_res, dict) and enter_res.get("ok"):
+                        if wait_for_dispatch_signal(cdp, baseline, max_wait_s=8.0):
+                            progress("phase=send event=dispatched_via_enter")
+                            dispatched = True
+                if not dispatched:
+                    time.sleep(0.15)
+                    continue
+                try:
+                    last_dispatch_state = cdp.eval(js_state_expr(), timeout=10.0) or {}
+                except Exception:
+                    last_dispatch_state = None
+
+                # Phase-1 post-verify: the new prompt must be echoed as the latest user turn.
+                anchor_state = wait_for_user_echo(cdp, baseline, args.prompt, timeout_s=8.0)
+                if anchor_state is not None:
+                    progress(f"phase=post_verify event=echo_ok attempt={attempt}")
+                    baseline = anchor_state
                     break
-                progress("phase=send event=no_dispatch_after_send retry=enter")
-                enter_res = cdp.eval(js_press_enter_expr(), timeout=10.0) or {}
-                if isinstance(enter_res, dict) and enter_res.get("ok"):
-                    if wait_for_dispatch_signal(cdp, baseline, max_wait_s=8.0):
-                        progress("phase=send event=dispatched_via_enter")
-                        break
-                time.sleep(0.15)
-                continue
+                error_marker("E_MESSAGE_NOT_ECHOED", f"attempt={attempt}")
+                progress(f"phase=post_verify event=echo_miss attempt={attempt}")
+                if attempt < max_send_attempts:
+                    # Refresh send readiness before one retry.
+                    wait_for_composer(cdp, timeout_s=15.0)
+                    wait_until_send_ready(cdp, timeout_s=min(float(args.timeout), 60.0))
+                    continue
+                send_res = {"ok": False, "error": "post-verify user echo failed"}
+                break
             err = send_res.get("error") if isinstance(send_res, dict) else "unknown"
             if err in ("send button not found", "prompt editor not found"):
                 time.sleep(0.1)
@@ -583,8 +856,36 @@ def main() -> int:
             err = send_res.get("error") if isinstance(send_res, dict) else "unknown"
             sys.stderr.write(f"Failed to send prompt in ChatGPT tab: {err}\n")
             return 3
+        if anchor_state is None:
+            st = last_dispatch_state or {}
+            b_user = int(send_baseline.get("userCount") or 0)
+            b_user_sig = (send_baseline.get("lastUserSig") or "").strip()
+            user_count = int(st.get("userCount") or 0)
+            user_sig = (st.get("lastUserSig") or "").strip()
+            stop_visible = bool(st.get("stopVisible"))
+            if user_count > b_user or (user_sig and user_sig != b_user_sig) or stop_visible:
+                error_marker("E_MESSAGE_NOT_ECHOED_SOFT", "using_dispatch_anchor")
+                baseline = st if st else baseline
+            else:
+                error_marker("E_MESSAGE_NOT_ECHOED", "post-verify-anchor-missing")
+                sys.stderr.write("Failed to verify sent prompt echo in ChatGPT tab.\n")
+                return 3
 
+        if args.send_no_wait:
+            emit_timing(send_ms=int((time.time() - t_send_start) * 1000), total_ms=int((time.time() - t_main_start) * 1000))
+            progress("phase=done event=send_no_wait_ready")
+            return 0
+
+        # Phase-2 post-verify: wait for assistant content after the user anchor.
+        t_wait_reply_start = time.time()
         answer = wait_for_response(cdp, baseline, timeout_s=float(args.timeout))
+        send_ms = int((t_wait_reply_start - t_send_start) * 1000)
+        wait_reply_ms = int((time.time() - t_wait_reply_start) * 1000)
+        emit_timing(
+            send_ms=send_ms,
+            wait_reply_ms=wait_reply_ms,
+            total_ms=int((time.time() - t_main_start) * 1000),
+        )
         progress("phase=done event=answer_ready")
         sys.stdout.write(answer.strip() + "\n")
         return 0
