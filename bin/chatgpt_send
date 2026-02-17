@@ -30,7 +30,8 @@ MODEL="gpt-5.2-pro"         # only used to target a picker label; we keep curren
 MODEL_STRATEGY="current"    # respect whatever model is selected in the open ChatGPT UI.
 KEEP_BROWSER=1
 MANUAL_LOGIN=1
-PROFILE_DIR="$ROOT/state/manual-login-profile"
+PROFILE_DIR_DEFAULT="$ROOT/state/manual-login-profile"
+PROFILE_DIR="${CHATGPT_SEND_PROFILE_DIR:-$PROFILE_DIR_DEFAULT}"
 CHROME_PATH="$ROOT/bin/chrome_no_sandbox"
 CHATGPT_URL=""
 CHATGPT_URL_FILE="$ROOT/state/chatgpt_url.txt"
@@ -56,8 +57,13 @@ LOOP_INIT=""
 LOOP_STATUS=0
 LOOP_INC=0
 LOOP_CLEAR=0
+PRESERVE_TABS="${CHATGPT_SEND_PRESERVE_TABS:-0}"
 
 ATTACH=()
+ORIG_ARGS=("$@")
+LOCK_FILE="${CHATGPT_SEND_LOCK_FILE:-}"
+LOCK_TIMEOUT_SEC="${CHATGPT_SEND_LOCK_TIMEOUT_SEC:-120}"
+LOCK_HELD="${CHATGPT_SEND_LOCK_HELD:-0}"
 
 usage() {
   cat <<'EOF'
@@ -119,7 +125,13 @@ EOF
 resolve_timeout_seconds() {
   # TIMEOUT is either "auto" or a number of seconds.
   if [[ "${TIMEOUT:-auto}" == "auto" ]]; then
-    # Default: give the web UI enough time, but don't hang forever.
+    # Default can be overridden via env for child-agent flows where hanging
+    # for 15 minutes is too expensive.
+    if [[ "${CHATGPT_SEND_AUTO_TIMEOUT_SEC:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      echo "${CHATGPT_SEND_AUTO_TIMEOUT_SEC}"
+      return 0
+    fi
+    # Fallback default: give the web UI enough time, but don't hang forever.
     echo "900"
     return 0
   fi
@@ -667,10 +679,13 @@ open_browser_impl() {
     if [[ -n "${wid:-}" ]] && command -v wmctrl >/dev/null 2>&1; then
       wmctrl -ia "$wid" >/dev/null 2>&1 || true
     fi
-    # If the user explicitly asked for the ChatGPT home (new chat), close all
-    # existing conversation tabs so later --sync-chatgpt-url is unambiguous.
+    # By default we close existing conversation tabs when switching to home to
+    # keep --sync-chatgpt-url unambiguous. Multi-child shared runs can disable
+    # this via CHATGPT_SEND_PRESERVE_TABS=1 to avoid interfering with siblings.
     if [[ "$url" == "https://chatgpt.com/" ]] || [[ "$url" == "https://chatgpt.com" ]]; then
-      cdp_close_all_conversation_tabs || true
+      if [[ "${PRESERVE_TABS}" != "1" ]]; then
+        cdp_close_all_conversation_tabs || true
+      fi
     fi
     # Activate existing tab if possible; only open a new one if missing.
     cdp_activate_or_open_url "$url" || true
@@ -970,6 +985,27 @@ for t in tabs:
   return 0
 }
 
+if [[ -n "${LOCK_FILE:-}" ]] && [[ "${LOCK_HELD}" != "1" ]]; then
+  mkdir -p "$(dirname "$LOCK_FILE")" >/dev/null 2>&1 || true
+  if command -v flock >/dev/null 2>&1; then
+    export CHATGPT_SEND_LOCK_HELD=1
+    set +e
+    flock -x -w "$LOCK_TIMEOUT_SEC" -E 75 "$LOCK_FILE" "$SCRIPT_PATH" "${ORIG_ARGS[@]}"
+    lock_st=$?
+    set -e
+    if [[ $lock_st -eq 75 ]]; then
+      echo "Failed to acquire chatgpt_send lock within ${LOCK_TIMEOUT_SEC}s: $LOCK_FILE" >&2
+      exit 70
+    fi
+    if [[ $lock_st -ne 0 ]]; then
+      exit $lock_st
+    fi
+    exit $lock_st
+  else
+    echo "Warning: CHATGPT_SEND_LOCK_FILE is set but flock is unavailable; running without lock." >&2
+  fi
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --prompt) PROMPT="$2"; shift 2;;
@@ -1032,6 +1068,14 @@ while [[ $# -gt 0 ]]; do
       if [[ -n "${CHATGPT_URL_DEFAULT:-}" ]]; then
         echo "$CHATGPT_URL_DEFAULT"
         exit 0
+      fi
+      if cdp_is_up; then
+        tab="$(capture_best_chat_tab_from_cdp || true)"
+        detected="${tab%%$'\t'*}"
+        if [[ -n "${detected:-}" ]] && [[ "$detected" != "$tab" ]] && is_chat_conversation_url "$detected"; then
+          echo "$detected"
+          exit 0
+        fi
       fi
       echo ""  # empty means "no default"
       exit 0
@@ -1396,6 +1440,16 @@ if [[ $status -eq 6 ]]; then
   set -e
 fi
 
+if [[ $status -eq 2 || $status -eq 5 ]]; then
+  # Recover from missing/invalid active target tab or transient CDP disconnects.
+  # Re-focus/open target URL once and retry.
+  open_browser_impl "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+  set +e
+  send_via_cdp
+  status=$?
+  set -e
+fi
+
 if [[ $status -ne 0 ]]; then
   echo "chatgpt_send failed (cdp status=$status)." >&2
   # Keep browser visible for manual inspection.
@@ -1420,6 +1474,7 @@ fi
 if [[ $has_convo_url -eq 0 ]] && cdp_is_up; then
   post_chat_urls="$(capture_chat_urls_from_cdp | sort -u || true)"
   new_chat_url=""
+  new_title=""
   if [[ -n "${post_chat_urls//[[:space:]]/}" ]]; then
     # Prefer a newly-created URL (post - pre).
     if [[ -n "${pre_chat_urls//[[:space:]]/}" ]]; then
@@ -1432,9 +1487,24 @@ if [[ $has_convo_url -eq 0 ]] && cdp_is_up; then
       fi
     fi
   fi
+  if [[ -z "${new_chat_url:-}" ]]; then
+    # Fallback for shared/multi-tab mode: pick the last visible chat tab.
+    # This keeps child runs from ending with empty EVIDENCE when many chats are open.
+    fallback_tab="$(capture_chat_tab_from_cdp_last || true)"
+    fallback_url="${fallback_tab%%$'\t'*}"
+    if [[ -n "${fallback_url:-}" ]] && [[ "$fallback_url" != "$fallback_tab" ]] && is_chat_conversation_url "$fallback_url"; then
+      new_chat_url="$fallback_url"
+      fallback_title="${fallback_tab#*$'\t'}"
+      if [[ "$fallback_title" != "$fallback_tab" ]]; then
+        new_title="$fallback_title"
+      fi
+    fi
+  fi
 
   if [[ -n "${new_chat_url:-}" ]] && is_chat_conversation_url "$new_chat_url"; then
-    new_title="$(capture_chat_title_for_url_from_cdp "$new_chat_url" | head -n 1 || true)"
+    if [[ -z "${new_title:-}" ]]; then
+      new_title="$(capture_chat_title_for_url_from_cdp "$new_chat_url" | head -n 1 || true)"
+    fi
     mkdir -p "$(dirname "$CHATGPT_URL_FILE")" >/dev/null 2>&1 || true
     printf '%s\n' "$new_chat_url" >"$CHATGPT_URL_FILE"
     # Save as last + active session name if needed.

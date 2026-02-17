@@ -198,6 +198,61 @@ This is just a per-session counter stored in `state/`. It's useful for agent wor
 </details>
 
 <details>
+<summary><strong>Auto commit helper (optional)</strong></summary>
+
+If you want an extra helper to auto-commit after meaningful file growth:
+
+```bash
+./bin/commit_agent --repo /abs/project/path --push
+```
+
+Behavior:
+- In default mode, commits all current repo changes.
+- If there is nothing to commit, prints `нечего коммитить` and exits.
+- Optional trigger mode: add `--trigger-file path --min-growth 10` to commit only after line growth in that file.
+
+</details>
+
+<details>
+<summary><strong>Spawn second Codex agent (optional)</strong></summary>
+
+You can launch a child Codex agent. By default it uses the same Specialist browser/profile/cookies as the main agent:
+
+```bash
+./bin/spawn_second_agent \
+  --project-path /abs/project/path \
+  --task "Investigate and fix X" \
+  --iterations 3 \
+  --launcher window \
+  --browser-required \
+  --skip-git-repo-check \
+  --wait
+```
+
+Behavior:
+- Default mode: shared browser profile/cookies + CDP 9222, with per-child state/chat metadata.
+- Optional isolated mode: add `--isolated-browser` (separate root/port).
+- Browser policy is explicit per child:
+- `--browser-required` forces child to use Specialist/browser and report evidence.
+- `--browser-optional` lets child decide.
+- `--browser-disabled` forbids Specialist/browser for that child.
+- `--skip-git-repo-check` avoids startup failure when child project is outside trusted git repo.
+- Opens child Specialist browser only when policy allows and `--open-browser` is active.
+- Runs child `codex exec` and returns `CHILD_RESULT=...` in `--wait` mode.
+
+Run several child agents (parallel example):
+
+```bash
+./bin/spawn_second_agent --project-path /abs/project/a --task "Task A" --iterations 5 --launcher window
+./bin/spawn_second_agent --project-path /abs/project/b --task "Task B" --iterations 5 --launcher window
+./bin/spawn_second_agent --project-path /abs/project/c --task "Task C" --iterations 5 --launcher window
+```
+
+Each command prints `RUN_ID`, `LOG_FILE`, `LAST_FILE`, `EXIT_FILE`. Use those to monitor completion and build one aggregated summary across all child agents.
+
+</details>
+
+<details>
 <summary><strong>Codex integration (optional)</strong></summary>
 
 This repo ships a Codex skill that makes the UX "speak in natural language" and keeps a single Specialist chat per task.
@@ -227,6 +282,8 @@ Then in Codex you can say things like:
 - "Open the browser"
 - "Talk to the Specialist, max 5 iterations"
 - "Explain how Specialist mode works"
+- "Run 5 child agents and split tasks by folders"
+- "Help me split one goal across agents"
 
 You can also just talk normally (e.g. Russian is fine). The skill will guide you one question at a time and run the right `chatgpt_send` commands behind the scenes.
 

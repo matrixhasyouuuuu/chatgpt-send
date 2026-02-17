@@ -81,6 +81,9 @@ class CDP:
 
         deadline = time.time() + (timeout if timeout is not None else 30.0)
         while True:
+            now = time.time()
+            if now >= deadline:
+                raise TimeoutError(f"CDP timeout waiting for response to {method}")
             remaining = max(0.1, deadline - time.time())
             self.ws.settimeout(remaining)
             raw = self.ws.recv()
@@ -136,12 +139,23 @@ def js_state_expr() -> str:
   const assistants = qa('[data-message-author-role="assistant"]');
   const stop = q('button[data-testid="stop-button"], button[aria-label*="Stop"]');
 
-  const lastA = assistants.length ? text(assistants[assistants.length - 1]) : "";
+  const lastEl = assistants.length ? assistants[assistants.length - 1] : null;
+  const lastA = text(lastEl);
+  const parent = lastEl ? lastEl.parentElement : null;
+  const siblingIndex = (lastEl && parent) ? Array.from(parent.children).indexOf(lastEl) : -1;
+  const lastSig = lastEl ? [
+    lastEl.getAttribute('data-message-id') || '',
+    lastEl.getAttribute('data-testid') || '',
+    lastEl.getAttribute('id') || '',
+    String(siblingIndex),
+    String((lastEl.textContent || '').length),
+  ].join('|') : "";
   return {
     url: location.href,
     userCount: users.length,
     assistantCount: assistants.length,
     lastAssistant: lastA,
+    lastAssistantSig: lastSig,
     stopVisible: !!stop,
   };
 })()
@@ -227,44 +241,80 @@ def js_send_expr(prompt: str) -> str:
 """.strip()
 
 
+def normalize_assistant_text(s: str) -> str:
+    # Normalize whitespace and strip transient typing cursor glyphs.
+    txt = re.sub(r"\s+", " ", (s or "").strip())
+    txt = re.sub(r"[▍▋▌]+\s*$", "", txt).strip()
+    return txt
+
+
 def wait_for_response(cdp: CDP, baseline: dict, timeout_s: float) -> str:
     deadline = time.time() + timeout_s
     state_expr = js_state_expr()
 
     b_user = int(baseline.get("userCount") or 0)
     b_asst = int(baseline.get("assistantCount") or 0)
+    b_sig = (baseline.get("lastAssistantSig") or "").strip()
 
-    # Wait until the user message is registered in DOM.
+    # Wait until we see response activity. ChatGPT UI may virtualize turns, so
+    # assistant/user counters do not always increase.
+    saw_activity = False
+    saw_stop = False
     while time.time() < deadline:
         st = cdp.eval(state_expr, timeout=10.0) or {}
-        if int(st.get("userCount") or 0) >= b_user + 1:
-            break
-        time.sleep(0.25)
-    else:
-        raise TimeoutError("Timed out waiting for user message to appear")
-
-    # Wait until an assistant message appears (count increases).
-    while time.time() < deadline:
-        st = cdp.eval(state_expr, timeout=10.0) or {}
-        if int(st.get("assistantCount") or 0) >= b_asst + 1:
+        user_count = int(st.get("userCount") or 0)
+        asst_count = int(st.get("assistantCount") or 0)
+        sig = (st.get("lastAssistantSig") or "").strip()
+        stop_visible = bool(st.get("stopVisible"))
+        if stop_visible:
+            saw_stop = True
+        if (
+            user_count > b_user
+            or asst_count > b_asst
+            or (sig and sig != b_sig)
+            or stop_visible
+        ):
+            saw_activity = True
             break
         time.sleep(0.5)
     else:
-        raise TimeoutError("Timed out waiting for assistant message to start")
+        raise TimeoutError("Timed out waiting for assistant response activity")
 
-    # Wait until generation is done: stop button hidden AND last assistant text stabilizes.
-    last_txt = None
+    # Wait until generation is done: stop button hidden AND last assistant state stabilizes.
+    last_marker = None
+    last_raw_text = ""
     stable = 0
+    changed_vs_baseline = False
     while time.time() < deadline:
         st = cdp.eval(state_expr, timeout=10.0) or {}
-        txt = (st.get("lastAssistant") or "").strip()
-        if txt == last_txt:
+        raw_txt = (st.get("lastAssistant") or "").strip()
+        txt = normalize_assistant_text(raw_txt)
+        sig = (st.get("lastAssistantSig") or "").strip()
+        asst_count = int(st.get("assistantCount") or 0)
+        stop_visible = bool(st.get("stopVisible"))
+        if stop_visible:
+            saw_stop = True
+        if asst_count > b_asst or (sig and sig != b_sig):
+            changed_vs_baseline = True
+
+        marker = (sig, txt, asst_count)
+        if marker == last_marker:
             stable += 1
         else:
             stable = 0
-            last_txt = txt
-        if (not bool(st.get("stopVisible"))) and stable >= 3:
-            return txt
+            last_marker = marker
+        if raw_txt:
+            last_raw_text = raw_txt
+
+        # If we observed activity and generation is not active, return when
+        # the last assistant state stays unchanged for a short period.
+        if (
+            not stop_visible
+            and stable >= 2
+            and (changed_vs_baseline or saw_stop or saw_activity)
+            and (txt or last_raw_text)
+        ):
+            return (raw_txt or last_raw_text).strip()
         time.sleep(0.5)
     raise TimeoutError("Timed out waiting for assistant to finish")
 

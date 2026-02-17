@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# commit_agent:
+# - commits all repo changes in --repo
+# - optional trigger mode: commit only if trigger file grew by at least N lines
+# - if no changes, prints "нечего коммитить" and exits 10
+
+usage() {
+  cat <<'EOF'
+Usage:
+  commit_agent --repo PATH [--trigger-file PATH --min-growth N] [--push|--no-push]
+
+Options:
+  --repo PATH           Git repository path
+  --trigger-file PATH   Optional file to gate commit by line growth
+  --min-growth N        Minimum line growth in trigger mode (default: 10)
+  --push                Push after commit (default)
+  --no-push             Commit locally only
+  -h, --help            Show help
+
+Exit codes:
+  0   Commit (and optional push) done
+  10  Nothing to commit / growth threshold not met
+  2   Invalid arguments or repo/file validation error
+  21  git commit failed
+  22  git push failed
+EOF
+}
+
+REPO=""
+TRIGGER_FILE=""
+MIN_GROWTH=10
+DO_PUSH=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo) REPO="${2:-}"; shift 2;;
+    --trigger-file) TRIGGER_FILE="${2:-}"; shift 2;;
+    --min-growth) MIN_GROWTH="${2:-}"; shift 2;;
+    --push) DO_PUSH=1; shift;;
+    --no-push) DO_PUSH=0; shift;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown arg: $1" >&2; usage >&2; exit 2;;
+  esac
+done
+
+if [[ -z "${REPO:-}" ]]; then
+  echo "Error: --repo is required." >&2
+  usage >&2
+  exit 2
+fi
+
+if [[ ! "$MIN_GROWTH" =~ ^[0-9]+$ ]]; then
+  echo "Error: --min-growth must be a non-negative integer." >&2
+  exit 2
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "Error: git is required." >&2
+  exit 2
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Error: python3 is required." >&2
+  exit 2
+fi
+
+if [[ ! -d "$REPO" ]]; then
+  echo "Error: repo path does not exist: $REPO" >&2
+  exit 2
+fi
+
+REPO="$(cd "$REPO" && pwd)"
+if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "Error: not a git repository: $REPO" >&2
+  exit 2
+fi
+
+msg="auto(commit): project changes"
+if [[ -n "${TRIGGER_FILE:-}" ]]; then
+  mapfile -t _paths < <(python3 - "$REPO" "$TRIGGER_FILE" <<'PY'
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1]).resolve()
+raw = Path(sys.argv[2])
+abs_path = (raw if raw.is_absolute() else repo / raw).resolve()
+try:
+    rel = abs_path.relative_to(repo)
+except ValueError:
+    sys.exit(3)
+print(str(abs_path))
+print(rel.as_posix())
+PY
+) || true
+
+  if [[ "${#_paths[@]}" -lt 2 ]]; then
+    echo "Error: trigger file must be inside repo." >&2
+    exit 2
+  fi
+
+  ABS_TRIGGER="${_paths[0]}"
+  REL_TRIGGER="${_paths[1]}"
+
+  if [[ ! -f "$ABS_TRIGGER" ]]; then
+    echo "Error: trigger file does not exist: $ABS_TRIGGER" >&2
+    exit 2
+  fi
+
+  current_lines="$(wc -l < "$ABS_TRIGGER" | tr -d '[:space:]')"
+  if [[ -z "$current_lines" ]]; then
+    current_lines=0
+  fi
+
+  head_lines=0
+  if git -C "$REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
+    if git -C "$REPO" cat-file -e "HEAD:$REL_TRIGGER" >/dev/null 2>&1; then
+      head_lines="$(git -C "$REPO" show "HEAD:$REL_TRIGGER" | wc -l | tr -d '[:space:]')"
+      if [[ -z "$head_lines" ]]; then
+        head_lines=0
+      fi
+    fi
+  fi
+
+  delta=$((current_lines - head_lines))
+  if (( delta < MIN_GROWTH )); then
+    echo "нечего коммитить"
+    exit 10
+  fi
+  msg="auto(commit): ${REL_TRIGGER} +${delta} lines"
+fi
+
+if [[ -z "$(git -C "$REPO" status --porcelain)" ]]; then
+  echo "нечего коммитить"
+  exit 10
+fi
+
+git -C "$REPO" add -A
+
+if [[ -z "$(git -C "$REPO" status --porcelain)" ]]; then
+  echo "нечего коммитить"
+  exit 10
+fi
+
+if ! git -C "$REPO" commit -m "$msg" >/dev/null 2>&1; then
+  echo "Error: git commit failed." >&2
+  exit 21
+fi
+
+if (( DO_PUSH == 1 )); then
+  if ! git -C "$REPO" push >/dev/null 2>&1; then
+    echo "Error: git push failed." >&2
+    exit 22
+  fi
+fi
+
+sha="$(git -C "$REPO" rev-parse --short HEAD)"
+echo "ok: ${sha} ${msg}"

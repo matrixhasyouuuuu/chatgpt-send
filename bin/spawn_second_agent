@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Spawn a second Codex agent.
+#
+# Main use-case:
+# - primary agent calls this helper
+# - by default child uses the same Specialist browser/profile/cookies as primary
+# - optional isolated mode gives child its own CHATGPT_SEND_ROOT + CDP port
+# - optional separate terminal window launcher
+# - optional wait mode to return child final message
+
+usage() {
+  cat <<'EOF'
+Usage:
+  spawn_second_agent --project-path PATH (--task TEXT | --task-file FILE) [options]
+
+Required:
+  --project-path PATH         Target project path for child Codex agent
+  --task TEXT                 Child task text
+  --task-file FILE            Child task text from file
+
+Options:
+  --iterations N              Iteration budget hint for child prompt (default: 3)
+  --launcher MODE             auto|window|direct (default: auto)
+  --shared-browser            Use primary browser/profile/cookies (default)
+  --isolated-browser          Use separate browser/profile/cookies for child
+  --browser-required          Child must use Specialist/browser and report evidence
+  --browser-optional          Child may decide whether to use Specialist/browser (default)
+  --browser-disabled          Child must not use Specialist/browser
+  --init-specialist-chat      Create a dedicated Specialist chat for this child (default)
+  --no-init-specialist-chat   Do not auto-create a dedicated Specialist chat
+  --wait                      Wait for child completion and print result
+  --timeout-sec N             Wait timeout in seconds (default: 3600)
+  --open-browser              Open Specialist browser for child (default)
+  --no-open-browser           Skip browser open
+  --skip-git-repo-check       Pass --skip-git-repo-check to child codex exec (default)
+  --no-skip-git-repo-check    Do not pass --skip-git-repo-check
+  --log-dir PATH              Log/output directory (default: /tmp/chatgpt-send-child)
+  --state-root PATH           Override CHATGPT_SEND_ROOT for child
+  --cdp-port PORT             Override child CDP port
+  --model MODEL               Optional model for child codex exec
+  --codex-bin PATH            Codex binary (default: codex)
+  --chatgpt-send-path PATH    chatgpt_send path (default: /home/matrix/projects/chatgpt-send/bin/chatgpt_send)
+  -h, --help                  Show help
+
+Output:
+  Prints child metadata (RUN_ID, LOG_FILE, LAST_FILE, EXIT_FILE, STATE_ROOT, CDP_PORT).
+  In --wait mode also prints CHILD_STATUS and CHILD_RESULT.
+EOF
+}
+
+PROJECT_PATH=""
+TASK_TEXT=""
+TASK_FILE=""
+ITERATIONS=3
+LAUNCHER="auto"
+WAIT_MODE=0
+TIMEOUT_SEC=3600
+OPEN_BROWSER=1
+LOG_DIR="/tmp/chatgpt-send-child"
+STATE_ROOT=""
+CDP_PORT=""
+BROWSER_MODE="shared"
+STATE_ROOT_SET=0
+CDP_PORT_SET=0
+MODEL=""
+CODEX_BIN="codex"
+CHATGPT_SEND_PATH="/home/matrix/projects/chatgpt-send/bin/chatgpt_send"
+BROWSER_POLICY="optional"
+SKIP_GIT_REPO_CHECK=1
+INIT_SPECIALIST_CHAT=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project-path) PROJECT_PATH="${2:-}"; shift 2;;
+    --task) TASK_TEXT="${2:-}"; shift 2;;
+    --task-file) TASK_FILE="${2:-}"; shift 2;;
+    --iterations) ITERATIONS="${2:-}"; shift 2;;
+    --launcher) LAUNCHER="${2:-}"; shift 2;;
+    --shared-browser) BROWSER_MODE="shared"; shift;;
+    --isolated-browser) BROWSER_MODE="isolated"; shift;;
+    --browser-required) BROWSER_POLICY="required"; shift;;
+    --browser-optional) BROWSER_POLICY="optional"; shift;;
+    --browser-disabled) BROWSER_POLICY="disabled"; shift;;
+    --init-specialist-chat) INIT_SPECIALIST_CHAT=1; shift;;
+    --no-init-specialist-chat) INIT_SPECIALIST_CHAT=0; shift;;
+    --wait) WAIT_MODE=1; shift;;
+    --timeout-sec) TIMEOUT_SEC="${2:-}"; shift 2;;
+    --open-browser) OPEN_BROWSER=1; shift;;
+    --no-open-browser) OPEN_BROWSER=0; shift;;
+    --skip-git-repo-check) SKIP_GIT_REPO_CHECK=1; shift;;
+    --no-skip-git-repo-check) SKIP_GIT_REPO_CHECK=0; shift;;
+    --log-dir) LOG_DIR="${2:-}"; shift 2;;
+    --state-root) STATE_ROOT="${2:-}"; STATE_ROOT_SET=1; shift 2;;
+    --cdp-port) CDP_PORT="${2:-}"; CDP_PORT_SET=1; shift 2;;
+    --model) MODEL="${2:-}"; shift 2;;
+    --codex-bin) CODEX_BIN="${2:-}"; shift 2;;
+    --chatgpt-send-path) CHATGPT_SEND_PATH="${2:-}"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown arg: $1" >&2; usage >&2; exit 2;;
+  esac
+done
+
+if [[ -z "${PROJECT_PATH:-}" ]]; then
+  echo "Error: --project-path is required." >&2
+  exit 2
+fi
+if [[ -z "${TASK_TEXT:-}" ]] && [[ -z "${TASK_FILE:-}" ]]; then
+  echo "Error: provide --task or --task-file." >&2
+  exit 2
+fi
+if [[ -n "${TASK_TEXT:-}" ]] && [[ -n "${TASK_FILE:-}" ]]; then
+  echo "Error: use only one of --task or --task-file." >&2
+  exit 2
+fi
+if [[ ! "$ITERATIONS" =~ ^[0-9]+$ ]] || (( ITERATIONS < 1 )); then
+  echo "Error: --iterations must be a positive integer." >&2
+  exit 2
+fi
+if [[ ! "$TIMEOUT_SEC" =~ ^[0-9]+$ ]] || (( TIMEOUT_SEC < 1 )); then
+  echo "Error: --timeout-sec must be a positive integer." >&2
+  exit 2
+fi
+if [[ "$LAUNCHER" != "auto" && "$LAUNCHER" != "window" && "$LAUNCHER" != "direct" ]]; then
+  echo "Error: --launcher must be auto|window|direct." >&2
+  exit 2
+fi
+if [[ "$BROWSER_MODE" != "shared" && "$BROWSER_MODE" != "isolated" ]]; then
+  echo "Error: browser mode must be shared|isolated." >&2
+  exit 2
+fi
+if [[ "$BROWSER_POLICY" != "required" && "$BROWSER_POLICY" != "optional" && "$BROWSER_POLICY" != "disabled" ]]; then
+  echo "Error: browser policy must be required|optional|disabled." >&2
+  exit 2
+fi
+# Apply browser opening policy at launcher level.
+if [[ "$BROWSER_POLICY" == "disabled" ]]; then
+  OPEN_BROWSER=0
+  INIT_SPECIALIST_CHAT=0
+elif [[ "$BROWSER_POLICY" == "required" ]]; then
+  OPEN_BROWSER=1
+fi
+
+if [[ ! -d "$PROJECT_PATH" ]]; then
+  echo "Error: project path does not exist: $PROJECT_PATH" >&2
+  exit 2
+fi
+PROJECT_PATH="$(cd "$PROJECT_PATH" && pwd)"
+
+if ! command -v "$CODEX_BIN" >/dev/null 2>&1; then
+  echo "Error: codex binary not found: $CODEX_BIN" >&2
+  exit 2
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Error: python3 is required." >&2
+  exit 2
+fi
+if (( OPEN_BROWSER == 1 )) && [[ ! -x "$CHATGPT_SEND_PATH" ]]; then
+  echo "Error: chatgpt_send not executable: $CHATGPT_SEND_PATH" >&2
+  exit 2
+fi
+
+if [[ -n "${TASK_FILE:-}" ]]; then
+  if [[ ! -f "$TASK_FILE" ]]; then
+    echo "Error: task file not found: $TASK_FILE" >&2
+    exit 2
+  fi
+  TASK_TEXT="$(cat "$TASK_FILE")"
+fi
+
+run_id="child-$(date +%Y%m%d-%H%M%S)-$$"
+mkdir -p "$LOG_DIR"
+LOG_DIR="$(cd "$LOG_DIR" && pwd)"
+
+# Resolve canonical chatgpt_send tool root.
+chatgpt_send_dir="$(cd "$(dirname "$CHATGPT_SEND_PATH")" && pwd)"
+if [[ "$(basename "$chatgpt_send_dir")" == "bin" ]]; then
+  chatgpt_tool_root="$(cd "$chatgpt_send_dir/.." && pwd)"
+else
+  chatgpt_tool_root="$chatgpt_send_dir"
+fi
+
+if (( STATE_ROOT_SET == 0 )); then
+  if [[ "$BROWSER_MODE" == "shared" ]]; then
+    # Shared browser/cookies, but per-child state to avoid chat URL/session collisions.
+    STATE_ROOT="${chatgpt_tool_root}/state/child-agents-shared/${run_id}"
+  else
+    STATE_ROOT="${chatgpt_tool_root}/state/child-agents/${run_id}"
+  fi
+fi
+mkdir -p "$STATE_ROOT/state"
+
+if [[ "$BROWSER_MODE" == "shared" ]]; then
+  CHILD_PROFILE_DIR="${chatgpt_tool_root}/state/manual-login-profile"
+  CHATGPT_SEND_PRESERVE_TABS_VALUE="1"
+  if [[ "${CHATGPT_SEND_DISABLE_LOCK:-0}" == "1" ]]; then
+    SHARED_BROWSER_LOCK_FILE=""
+  elif [[ "${CHATGPT_SEND_LOCK_FILE+x}" == "x" ]]; then
+    SHARED_BROWSER_LOCK_FILE="${CHATGPT_SEND_LOCK_FILE}"
+  else
+    SHARED_BROWSER_LOCK_FILE="${chatgpt_tool_root}/state/shared-browser.lock"
+  fi
+else
+  CHILD_PROFILE_DIR="${STATE_ROOT}/state/manual-login-profile"
+  CHATGPT_SEND_PRESERVE_TABS_VALUE="0"
+  SHARED_BROWSER_LOCK_FILE="${STATE_ROOT}/state/browser.lock"
+fi
+if [[ -n "${SHARED_BROWSER_LOCK_FILE:-}" ]]; then
+  mkdir -p "$(dirname "$SHARED_BROWSER_LOCK_FILE")"
+fi
+
+# chatgpt_send expects ROOT/bin and ROOT/docs to exist when CHATGPT_SEND_ROOT is overridden.
+# For isolated child roots, provide these as symlinks to the canonical tool root.
+if [[ ! -e "$STATE_ROOT/bin" ]]; then
+  ln -s "$chatgpt_tool_root/bin" "$STATE_ROOT/bin"
+fi
+if [[ ! -e "$STATE_ROOT/docs" ]]; then
+  ln -s "$chatgpt_tool_root/docs" "$STATE_ROOT/docs"
+fi
+
+choose_port() {
+  python3 - <<'PY'
+import socket
+for port in range(9330, 9400):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port))
+    except OSError:
+        s.close()
+        continue
+    s.close()
+    print(port)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+if (( CDP_PORT_SET == 0 )); then
+  if [[ "$BROWSER_MODE" == "shared" ]]; then
+    CDP_PORT="${CHATGPT_SEND_CDP_PORT:-9222}"
+  else
+    CDP_PORT="$(choose_port || true)"
+  fi
+fi
+if [[ -z "${CDP_PORT:-}" ]] || [[ ! "$CDP_PORT" =~ ^[0-9]+$ ]]; then
+  echo "Error: could not resolve child CDP port." >&2
+  exit 2
+fi
+
+prompt_file="$LOG_DIR/${run_id}.prompt.txt"
+log_file="$LOG_DIR/${run_id}.log"
+last_file="$LOG_DIR/${run_id}.last.txt"
+exit_file="$LOG_DIR/${run_id}.exit"
+pid_file="$LOG_DIR/${run_id}.pid"
+runner_file="$LOG_DIR/${run_id}.runner.sh"
+
+cat >"$prompt_file" <<EOF
+Ты второй агент (child agent), запущенный главным агентом.
+
+Контекст:
+- Project path: ${PROJECT_PATH}
+- User task: ${TASK_TEXT}
+- Target iterations hint: ${ITERATIONS}
+- Browser policy: ${BROWSER_POLICY}
+
+ОБЯЗАТЕЛЬНО:
+1) Работай в ${PROJECT_PATH}.
+2) Не меняй цель пользователя и не подменяй задачу: выполни именно User task.
+3) Для Specialist используй /home/matrix/projects/chatgpt-send/bin/chatgpt_send с переменными окружения CHATGPT_SEND_ROOT и CHATGPT_SEND_CDP_PORT.
+4) Пиши ВСЕ сообщения и финальный ответ только на русском языке.
+5) Даже если команды/логи на английском, объяснения, выводы и план всегда пиши по-русски.
+6) В ответе перед финалом обязательно дай строку формата:
+   CHILD_BROWSER_USED: <yes|no> ; REASON: <why> ; EVIDENCE: <chat-url-or-none>
+7) Если Browser policy=required:
+   - ты обязан реально использовать Specialist минимум один раз;
+   - первое сообщение в Specialist должно кратко передать: цель задачи, что уже известно, что нужно проверить по фактам;
+   - используй Specialist как "внешний мозг": актуальные документы/интернет, проверка рисков, проверяемые шаги.
+8) Если Browser policy=disabled, не используй Specialist/browser вообще.
+9) Не выдумывай новый scope и не подменяй задачу.
+10) Сделай задачу и в финале дай короткий результат для главного агента.
+11) Последняя строка ответа должна начинаться так: CHILD_RESULT:
+EOF
+
+cat >"$runner_file" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export CHATGPT_SEND_ROOT='${STATE_ROOT}'
+export CHATGPT_SEND_CDP_PORT='${CDP_PORT}'
+export CHATGPT_SEND_PROFILE_DIR='${CHILD_PROFILE_DIR}'
+export CHATGPT_SEND_PRESERVE_TABS='${CHATGPT_SEND_PRESERVE_TABS_VALUE}'
+export CHATGPT_SEND_LOCK_FILE='${SHARED_BROWSER_LOCK_FILE}'
+export CHATGPT_SEND_LOCK_TIMEOUT_SEC='180'
+export CHATGPT_SEND_AUTO_TIMEOUT_SEC='${CHATGPT_SEND_AUTO_TIMEOUT_SEC:-120}'
+echo \$\$ > '${pid_file}'
+
+{
+  echo "[child] run_id=${run_id}"
+  echo "[child] project=${PROJECT_PATH}"
+  echo "[child] state_root=\${CHATGPT_SEND_ROOT}"
+  echo "[child] cdp_port=\${CHATGPT_SEND_CDP_PORT}"
+  echo "[child] profile_dir=\${CHATGPT_SEND_PROFILE_DIR}"
+  echo "[child] preserve_tabs=\${CHATGPT_SEND_PRESERVE_TABS}"
+  echo "[child] lock_file=\${CHATGPT_SEND_LOCK_FILE}"
+  echo "[child] auto_timeout=\${CHATGPT_SEND_AUTO_TIMEOUT_SEC}"
+  echo "[child] started_at=\$(date -Iseconds)"
+} >> '${log_file}'
+
+child_finalize() {
+  local rc=\$?
+  echo "\${rc}" > '${exit_file}'
+  echo "[child] exit_code=\${rc}" >> '${log_file}'
+  echo "[child] finished_at=\$(date -Iseconds)" >> '${log_file}'
+}
+trap child_finalize EXIT
+
+run_chatgpt_send() {
+  '${CHATGPT_SEND_PATH}' "\$@"
+}
+
+run_chatgpt_send_logged() {
+  local step="\$1"
+  shift
+  echo "[child] step=\${step} cmd=\$*" >> '${log_file}'
+  set +e
+  run_chatgpt_send "\$@" >> '${log_file}' 2>&1
+  local rc=\$?
+  set -e
+  echo "[child] step=\${step} rc=\${rc}" >> '${log_file}'
+  return "\$rc"
+}
+
+run_chatgpt_send_capture() {
+  local step="\$1"
+  shift
+  local out=""
+  echo "[child] step=\${step} cmd=\$*" >> '${log_file}'
+  set +e
+  out="\$(run_chatgpt_send "\$@" 2>> '${log_file}')"
+  local rc=\$?
+  set -e
+  echo "[child] step=\${step} rc=\${rc} out=\${out}" >> '${log_file}'
+  printf '%s\n' "\$out"
+  return "\$rc"
+}
+
+cd '${PROJECT_PATH}'
+if [[ '${OPEN_BROWSER}' == '1' ]]; then
+  if [[ '${BROWSER_POLICY}' == 'required' ]]; then
+    run_chatgpt_send_logged "open-browser" --open-browser --chatgpt-url https://chatgpt.com/
+  else
+    run_chatgpt_send_logged "open-browser" --open-browser --chatgpt-url https://chatgpt.com/ || true
+  fi
+fi
+
+if [[ '${INIT_SPECIALIST_CHAT}' == '1' ]]; then
+  child_topic="child-${run_id}"
+  if [[ '${BROWSER_POLICY}' == 'required' ]]; then
+    init_rc=0
+    run_chatgpt_send_logged "init-specialist" --timeout 120 --init-specialist --topic "\${child_topic}" || init_rc=\$?
+    if [[ "\${init_rc}" != "0" ]]; then
+      echo "[child] step=init-specialist note=non_fatal_failure rc=\${init_rc}; continue_with_fallback" >> '${log_file}'
+    fi
+    run_chatgpt_send_logged "sync-chat-url" --sync-chatgpt-url || true
+    child_chat_url="\$(run_chatgpt_send_capture "show-chat-url" --show-chatgpt-url | tail -n 1 || true)"
+    echo "[child] specialist_chat_url=\${child_chat_url}" >> '${log_file}'
+  else
+    run_chatgpt_send_logged "init-specialist" --timeout 120 --init-specialist --topic "\${child_topic}" || true
+    run_chatgpt_send_logged "sync-chat-url" --sync-chatgpt-url || true
+    child_chat_url="\$(run_chatgpt_send_capture "show-chat-url" --show-chatgpt-url | tail -n 1 || true)"
+    echo "[child] specialist_chat_url=\${child_chat_url}" >> '${log_file}'
+  fi
+fi
+
+set +e
+extra_git_arg=""
+if [[ '${SKIP_GIT_REPO_CHECK}' == '1' ]]; then
+  extra_git_arg="--skip-git-repo-check"
+fi
+
+if [[ -n '${MODEL}' ]]; then
+  '${CODEX_BIN}' exec --full-auto \${extra_git_arg} -m '${MODEL}' -C '${PROJECT_PATH}' -o '${last_file}' - < '${prompt_file}' 2>&1 | tee -a '${log_file}'
+  st=\${PIPESTATUS[0]}
+else
+  '${CODEX_BIN}' exec --full-auto \${extra_git_arg} -C '${PROJECT_PATH}' -o '${last_file}' - < '${prompt_file}' 2>&1 | tee -a '${log_file}'
+  st=\${PIPESTATUS[0]}
+fi
+set -e
+
+# Enforce browser policy from child final message/logs.
+browser_line=""
+if [[ -f '${last_file}' ]]; then
+  browser_line="\$(grep -Eo 'CHILD_BROWSER_USED:.*' '${last_file}' | tail -n 1 || true)"
+fi
+prompt_cmd_count="\$(grep -Ec 'chatgpt_send[^[:cntrl:]]*--prompt' '${log_file}' || true)"
+chat_url_line="\$(grep -Eo 'specialist_chat_url=https://chatgpt\\.com/c/[A-Za-z0-9-]+' '${log_file}' | tail -n 1 || true)"
+policy_fail_code=0
+
+if [[ '${BROWSER_POLICY}' == 'required' ]]; then
+  if [[ '${INIT_SPECIALIST_CHAT}' == '1' ]] && [[ -z "\${chat_url_line}" ]]; then
+    policy_fail_code=45
+  fi
+  if [[ "\${prompt_cmd_count}" == "0" ]]; then
+    if [[ "\${policy_fail_code}" == "0" ]]; then
+      policy_fail_code=44
+    fi
+  fi
+  if [[ ! "\${browser_line}" =~ CHILD_BROWSER_USED:[[:space:]]*yes ]]; then
+    if [[ "\${policy_fail_code}" == "0" ]]; then
+      policy_fail_code=41
+    fi
+  fi
+  if [[ ! "\${browser_line}" =~ EVIDENCE:[[:space:]]*https://chatgpt\.com/c/ ]]; then
+    if [[ "\${policy_fail_code}" == "0" ]]; then
+      policy_fail_code=42
+    fi
+  fi
+elif [[ '${BROWSER_POLICY}' == 'disabled' ]]; then
+  if [[ "\${browser_line}" =~ CHILD_BROWSER_USED:[[:space:]]*yes ]]; then
+    policy_fail_code=43
+  fi
+fi
+
+if [[ "\${policy_fail_code}" != "0" ]]; then
+  echo "[child] browser_policy_check=failed code=\${policy_fail_code} prompt_cmd_count=\${prompt_cmd_count} line=\${browser_line}" >> '${log_file}'
+  st="\${policy_fail_code}"
+fi
+
+exit \$st
+EOF
+chmod +x "$runner_file"
+
+resolve_launcher() {
+  if [[ "$LAUNCHER" == "direct" ]]; then
+    echo "direct"
+    return 0
+  fi
+  if [[ "$LAUNCHER" == "window" ]]; then
+    echo "window"
+    return 0
+  fi
+  if command -v gnome-terminal >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    echo "window"
+    return 0
+  fi
+  echo "direct"
+}
+
+launcher_mode="$(resolve_launcher)"
+if [[ "$launcher_mode" == "window" ]]; then
+  if command -v gnome-terminal >/dev/null 2>&1; then
+    gnome-terminal -- bash -lc "'${runner_file}'"
+  elif command -v x-terminal-emulator >/dev/null 2>&1; then
+    x-terminal-emulator -e "${runner_file}"
+  else
+    echo "Error: no terminal emulator found for window launcher." >&2
+    exit 2
+  fi
+else
+  nohup "$runner_file" >/dev/null 2>&1 &
+fi
+
+echo "RUN_ID=${run_id}"
+echo "LAUNCHER=${launcher_mode}"
+echo "BROWSER_MODE=${BROWSER_MODE}"
+echo "BROWSER_POLICY=${BROWSER_POLICY}"
+echo "OPEN_BROWSER_EFFECTIVE=${OPEN_BROWSER}"
+echo "INIT_SPECIALIST_CHAT=${INIT_SPECIALIST_CHAT}"
+echo "PROJECT_PATH=${PROJECT_PATH}"
+echo "STATE_ROOT=${STATE_ROOT}"
+echo "PROFILE_DIR=${CHILD_PROFILE_DIR}"
+echo "CDP_PORT=${CDP_PORT}"
+echo "LOG_FILE=${log_file}"
+echo "LAST_FILE=${last_file}"
+echo "EXIT_FILE=${exit_file}"
+echo "PID_FILE=${pid_file}"
+
+if (( WAIT_MODE == 1 )); then
+  deadline=$(( $(date +%s) + TIMEOUT_SEC ))
+  while [[ ! -f "$exit_file" ]]; do
+    if (( $(date +%s) >= deadline )); then
+      echo "Error: wait timeout (${TIMEOUT_SEC}s) exceeded." >&2
+      exit 124
+    fi
+    sleep 1
+  done
+  st="$(cat "$exit_file" | tr -d '[:space:]')"
+  result=""
+  if [[ -f "$last_file" ]]; then
+    result="$(tail -n 1 "$last_file" || true)"
+  fi
+  echo "CHILD_STATUS=${st:-unknown}"
+  echo "CHILD_RESULT=${result}"
+  if [[ "${st:-1}" != "0" ]]; then
+    # Browser policy failures are strict and must fail the launch.
+    if [[ "${st:-1}" == "41" || "${st:-1}" == "42" || "${st:-1}" == "43" || "${st:-1}" == "44" || "${st:-1}" == "45" ]]; then
+      echo "CHILD_STATUS_NOTE=browser_policy_failed"
+      exit "${st:-1}"
+    fi
+    # Codex may occasionally finish with non-zero due local recorder/shutdown issues
+    # while still producing a valid final message. In that case, keep it usable.
+    if [[ -n "${result:-}" ]]; then
+      echo "CHILD_STATUS_NOTE=non_zero_exit_but_result_captured"
+      exit 0
+    fi
+    exit "${st:-1}"
+  fi
+fi
