@@ -39,27 +39,27 @@ chmod +x "$fake_bin/curl"
 cat >"$root/bin/cdp_chatgpt.py" <<'EOF'
 #!/usr/bin/env python3
 import argparse
+import hashlib
+import json
+import re
 import sys
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--precheck-only", action="store_true")
 ap.add_argument("--fetch-last", action="store_true")
 ap.add_argument("--fetch-last-n", type=int, default=6)
+ap.add_argument("--send-no-wait", action="store_true")
+ap.add_argument("--soft-reset-only", action="store_true")
+ap.add_argument("--probe-contract", action="store_true")
 ap.add_argument("--prompt")
 ap.add_argument("--chatgpt-url")
-ap.add_argument("--cdp-port")
-ap.add_argument("--timeout")
-args = ap.parse_args()
+args, _ = ap.parse_known_args()
 
 if args.fetch_last:
-    import hashlib
-    import json
-    import re
     norm = re.sub(r"\s+", " ", (args.prompt or "").strip())
     prompt_hash = hashlib.sha256(norm.encode("utf-8", errors="ignore")).hexdigest() if norm else ""
-    assistant_text = f"assistant fetch-last for {norm}" if norm else "assistant fetch-last"
-    tail = re.sub(r"\s+", " ", assistant_text.strip())[-500:]
-    assistant_hash = hashlib.sha256(tail.encode("utf-8", errors="ignore")).hexdigest() if tail else ""
+    assistant_text = "timeout budget fetch-last"
+    assistant_hash = hashlib.sha256(assistant_text.encode("utf-8", errors="ignore")).hexdigest()
     payload = {
         "url": args.chatgpt_url or "",
         "stop_visible": False,
@@ -70,44 +70,48 @@ if args.fetch_last:
         "last_user_hash": prompt_hash,
         "assistant_text": assistant_text,
         "assistant_tail_hash": assistant_hash,
-        "assistant_tail_len": len(tail),
-        "assistant_preview": assistant_text[:220],
+        "assistant_tail_len": len(assistant_text),
+        "assistant_preview": assistant_text,
         "user_tail_hash": prompt_hash,
-        "checkpoint_id": "SPC-2099-01-01T00:00:00Z-" + (assistant_hash[:8] if assistant_hash else "none"),
+        "checkpoint_id": "SPC-2099-01-01T00:00:00Z-" + assistant_hash[:8],
         "ts": "2099-01-01T00:00:00Z",
-        "messages": [
-            {"role": "user", "text": args.prompt or "", "text_len": len(args.prompt or ""), "tail_hash": prompt_hash, "sig": "u", "preview": (args.prompt or "")[:220]},
-            {"role": "assistant", "text": assistant_text, "text_len": len(assistant_text), "tail_hash": assistant_hash, "sig": "a", "preview": assistant_text[:220]},
-        ],
+        "messages": [],
     }
     print(json.dumps(payload, ensure_ascii=False), flush=True)
     raise SystemExit(0)
 
+if args.probe_contract:
+    raise SystemExit(0)
 if args.precheck_only:
     sys.stderr.write("E_PRECHECK_NO_NEW_REPLY: need_send\n")
     raise SystemExit(10)
-print("assistant fake answer")
+if args.send_no_wait or (not args.precheck_only and not args.soft_reset_only and not args.probe_contract):
+    sys.stderr.write("RUNTIME_EVAL_TIMEOUT: phase=main\n")
+    raise SystemExit(4)
+if args.soft_reset_only:
+    raise SystemExit(0)
+raise SystemExit(3)
 EOF
 chmod +x "$root/bin/cdp_chatgpt.py"
 
 printf '%s\n' "bootstrap" >"$root/docs/specialist_bootstrap.txt"
 
 export PATH="$fake_bin:$PATH"
-export CHATGPT_SEND_ROOT="$root"
-export CHATGPT_SEND_CDP_PORT="9222"
-export CHATGPT_SEND_REPLY_POLLING=0
-
 set +e
-out="$("$SCRIPT" --chatgpt-url "https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" --prompt "hello precheck" 2>&1)"
+out="$(
+  CHATGPT_SEND_ROOT="$root" \
+  CHATGPT_SEND_PROFILE_DIR="$root/state/manual-login-profile" \
+  CHATGPT_SEND_REPLY_POLLING=1 \
+  CHATGPT_SEND_TIMEOUT_BUDGET_MAX=1 \
+  CHATGPT_SEND_TIMEOUT_BUDGET_WINDOW_SEC=300 \
+  CHATGPT_SEND_TIMEOUT_BUDGET_ACTION=restart \
+  "$SCRIPT" --chatgpt-url "https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" --prompt "budget fail" 2>&1
+)"
 st=$?
 set -e
-[[ "$st" -eq 0 ]]
-echo "$out" | rg -q -- 'action=precheck'
-echo "$out" | rg -q -- 'action=send'
-if echo "$out" | rg -q -- 'E_SEND_WITHOUT_PRECHECK'; then
-  echo "unexpected E_SEND_WITHOUT_PRECHECK in normal path" >&2
-  exit 1
-fi
-echo "$out" | rg -q -- 'assistant fake answer'
+
+[[ "$st" -eq 79 ]]
+echo "$out" | rg -q -- 'E_TIMEOUT_BUDGET_EXCEEDED'
+echo "$out" | rg -q -- 'E_RESTART_NOT_ALLOWED'
 
 echo "OK"

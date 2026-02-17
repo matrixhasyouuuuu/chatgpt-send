@@ -124,6 +124,7 @@ soak_fails = 0
 iter_status_per_child = defaultdict(int)
 expected_negative_errors_total = 0
 tests_skipped = 0
+prompt_lint_fails = 0
 doctor_invariants_ok = 0
 doctor_force_set = 0
 doctor_profile_used = 0
@@ -140,12 +141,21 @@ marker_keys = {
     "E_SEND_WITHOUT_PRECHECK": "E_SEND_WITHOUT_PRECHECK",
     "E_TARGET_CHAT_REQUIRED": "E_TARGET_CHAT_REQUIRED",
     "E_CHAT_STATE_MISMATCH": "E_CHAT_STATE_MISMATCH",
+    "E_PROTECT_CHAT_MISMATCH": "E_PROTECT_CHAT_MISMATCH",
+    "E_MULTIPLE_CHAT_TABS_BLOCKED": "E_MULTIPLE_CHAT_TABS_BLOCKED",
+    "E_UI_CONTRACT_FAIL": "E_UI_CONTRACT_FAIL",
+    "EVIDENCE_CAPTURED": "EVIDENCE_CAPTURED",
     "E_FLOW_ORDER_VIOLATION": "E_FLOW_ORDER_VIOLATION",
     "E_MESSAGE_NOT_ECHOED": "E_MESSAGE_NOT_ECHOED",
     "E_AUTO_WAIT_TIMEOUT": "E_AUTO_WAIT_TIMEOUT",
     "E_REPLY_WAIT_TIMEOUT": "E_REPLY_WAIT_TIMEOUT",
+    "E_REPLY_UNACKED_BLOCK_SEND": "E_REPLY_UNACKED_BLOCK_SEND",
+    "E_DUPLICATE_PROMPT_BLOCKED": "E_DUPLICATE_PROMPT_BLOCKED",
     "E_PROD_CHAT_PROTECTED": "E_PROD_CHAT_PROTECTED",
     "E_SOFT_RESET_FAILED": "E_SOFT_RESET_FAILED",
+    "E_TIMEOUT_BUDGET_EXCEEDED": "E_TIMEOUT_BUDGET_EXCEEDED",
+    "E_RESTART_NOT_ALLOWED": "E_RESTART_NOT_ALLOWED",
+    "BROWSER_RESTART": "BROWSER_RESTART start",
     "COMPOSER_TIMEOUT": "COMPOSER_TIMEOUT",
     "RUNTIME_EVAL_TIMEOUT": "RUNTIME_EVAL_TIMEOUT",
     "E_CDP_PORT_IN_USE": "E_CDP_PORT_IN_USE",
@@ -169,9 +179,11 @@ soak_done_re = re.compile(r"SOAK_ITER done .*?rc=([0-9]+)")
 profile_dir_re = re.compile(r"\bPROFILE_DIR path=")
 profile_wrap_re = re.compile(r"\bPROFILE_WRAP run_id=")
 cleanup_killed_re = re.compile(r"\bCLEANUP_KILLED_TOTAL=([0-9]+)")
+ack_write_re = re.compile(r"\bACK_WRITE\b")
 doctor_inv_re = re.compile(r'"invariants_ok"\s*:\s*([01]|true|false)', re.IGNORECASE)
 doctor_force_re = re.compile(r'"force_chat_url_set"\s*:\s*([01]|true|false)', re.IGNORECASE)
 doctor_profile_re = re.compile(r'"profile_dir_used"\s*:\s*([01]|true|false)', re.IGNORECASE)
+prompt_lint_re = re.compile(r"\bPROMPT_LINT_FAILS=([0-9]+)")
 
 for path in files:
     try:
@@ -259,6 +271,9 @@ for path in files:
         if m:
             counts["CLEANUP_KILLED_TOTAL"] += int(float(m.group(1)))
             set_evidence("CLEANUP_KILLED_TOTAL", path, i)
+        if ack_write_re.search(line):
+            counts["ACK_WRITE_TOTAL"] += 1
+            set_evidence("ACK_WRITE_TOTAL", path, i)
         m = doctor_inv_re.search(line)
         if m:
             v = m.group(1).lower()
@@ -274,6 +289,10 @@ for path in files:
             v = m.group(1).lower()
             doctor_profile_used = max(doctor_profile_used, 1 if v in ("1", "true") else 0)
             set_evidence("DOCTOR_PROFILE_DIR_USED", path, i)
+        m = prompt_lint_re.search(line)
+        if m:
+            prompt_lint_fails = max(prompt_lint_fails, int(m.group(1)))
+            set_evidence("PROMPT_LINT_FAILS", path, i)
 
 def p95(values):
     if not values:
@@ -303,23 +322,34 @@ metrics = {
     "E_SEND_WITHOUT_PRECHECK": float(counts["E_SEND_WITHOUT_PRECHECK"]),
     "E_TARGET_CHAT_REQUIRED": float(counts["E_TARGET_CHAT_REQUIRED"]),
     "E_CHAT_STATE_MISMATCH": float(counts["E_CHAT_STATE_MISMATCH"]),
+    "E_PROTECT_CHAT_MISMATCH": float(counts["E_PROTECT_CHAT_MISMATCH"]),
+    "E_MULTIPLE_CHAT_TABS_BLOCKED": float(counts["E_MULTIPLE_CHAT_TABS_BLOCKED"]),
+    "E_UI_CONTRACT_FAIL": float(counts["E_UI_CONTRACT_FAIL"]),
+    "EVIDENCE_BUNDLE_TOTAL": float(counts["EVIDENCE_CAPTURED"]),
     "E_FLOW_ORDER_VIOLATION": float(counts["E_FLOW_ORDER_VIOLATION"]),
     "E_MESSAGE_NOT_ECHOED": float(counts["E_MESSAGE_NOT_ECHOED"]),
     "AUTO_WAIT_TOTAL": float(counts["AUTO_WAIT_TOTAL"]),
     "AUTO_WAIT_TIMEOUT_TOTAL": float(counts["E_AUTO_WAIT_TIMEOUT"]),
     "E_REPLY_WAIT_TIMEOUT": float(counts["E_REPLY_WAIT_TIMEOUT"]),
+    "E_REPLY_UNACKED_BLOCK_SEND": float(counts["E_REPLY_UNACKED_BLOCK_SEND"]),
+    "E_DUPLICATE_PROMPT_BLOCKED": float(counts["E_DUPLICATE_PROMPT_BLOCKED"]),
     "E_PROD_CHAT_PROTECTED": float(counts["E_PROD_CHAT_PROTECTED"]),
     "SOFT_RESET_TOTAL": float(counts["SOFT_RESET_TOTAL"]),
     "SOFT_RESET_SUCCESS_TOTAL": float(counts["SOFT_RESET_SUCCESS_TOTAL"]),
     "E_SOFT_RESET_FAILED_TOTAL": float(counts["E_SOFT_RESET_FAILED"]),
+    "TIMEOUT_BUDGET_EXCEEDED_TOTAL": float(counts["E_TIMEOUT_BUDGET_EXCEEDED"]),
+    "E_RESTART_NOT_ALLOWED_TOTAL": float(counts["E_RESTART_NOT_ALLOWED"]),
+    "BROWSER_RESTART_TOTAL": float(counts["BROWSER_RESTART"]),
     "COMPOSER_TIMEOUT_TOTAL": float(counts["COMPOSER_TIMEOUT"]),
     "RUNTIME_EVAL_TIMEOUT_TOTAL": float(counts["RUNTIME_EVAL_TIMEOUT"]),
     "E_CDP_PORT_IN_USE": float(counts["E_CDP_PORT_IN_USE"]),
     "SLOT_RELEASE_FORCED_TOTAL": float(counts["SLOT_RELEASE_FORCED"]),
     "CLEANUP_KILLED_TOTAL": float(counts["CLEANUP_KILLED_TOTAL"]),
+    "ACK_WRITE_TOTAL": float(counts["ACK_WRITE_TOTAL"]),
     "DOCTOR_INVARIANTS_OK": float(doctor_invariants_ok),
     "DOCTOR_FORCE_CHAT_URL_SET": float(doctor_force_set),
     "DOCTOR_PROFILE_DIR_USED": float(doctor_profile_used),
+    "PROMPT_LINT_FAILS": float(prompt_lint_fails),
     "E_CDP_UNREACHABLE_RECOVER_PER_100": float(counts["E_CDP_UNREACHABLE_RECOVER"]),
     "E_CDP_UNREACHABLE_PER_200": float(counts["E_CDP_UNREACHABLE_RECOVER"]),
     "MAX_INFLIGHT_SLOTS": float(max_inflight),

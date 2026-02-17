@@ -103,6 +103,61 @@ assert saw is True
 assert "E_GENERATION_IN_PROGRESS" in err2.getvalue(), err2.getvalue()
 assert "E_PRECHECK_GENERATION_IN_PROGRESS" in err2.getvalue(), err2.getvalue()
 
+# Dispatch signal must not treat already-visible stop as a successful send.
+dispatch_baseline_busy = {
+    "userCount": 8,
+    "assistantCount": 4,
+    "lastUserSig": "u8",
+    "lastAssistantSig": "a4",
+    "stopVisible": True,
+}
+dispatch_busy_states = [
+    {"userCount": 8, "assistantCount": 4, "lastUserSig": "u8", "lastAssistantSig": "a4", "stopVisible": True},
+]
+assert mod.wait_for_dispatch_signal(FakeCDP(dispatch_busy_states), dispatch_baseline_busy, max_wait_s=0.4) is False
+
+dispatch_baseline_idle = {
+    "userCount": 8,
+    "assistantCount": 4,
+    "lastUserSig": "u8",
+    "lastAssistantSig": "a4",
+    "stopVisible": False,
+}
+dispatch_new_activity = [
+    {"userCount": 8, "assistantCount": 4, "lastUserSig": "u8", "lastAssistantSig": "a4", "stopVisible": True},
+]
+assert mod.wait_for_dispatch_signal(FakeCDP(dispatch_new_activity), dispatch_baseline_idle, max_wait_s=0.4) is True
+
+# Stale stop guard: if stop is visible but message state does not change,
+# precheck should treat it as stale and allow sending to continue.
+orig_stale_sec = mod.STALE_STOP_SEC
+orig_stale_poll = mod.STALE_STOP_POLL_SEC
+mod.STALE_STOP_SEC = 0.2
+mod.STALE_STOP_POLL_SEC = 0.02
+try:
+    stale_precheck_states = [
+        {"hasEditor": True, "hasSend": False, "stopVisible": True},  # send-ready probe
+        {"userCount": 8, "assistantCount": 4, "lastUserSig": "u8", "lastAssistantSig": "a4", "stopVisible": True},
+    ]
+    err3 = io.StringIO()
+    with contextlib.redirect_stderr(err3):
+        in_progress = mod.is_generation_in_progress(FakeCDP(stale_precheck_states))
+    assert in_progress is False
+    assert "E_STALE_STOP_ASSUME_IDLE" in err3.getvalue(), err3.getvalue()
+
+    stale_wait_states = [
+        {"hasEditor": True, "hasSend": False, "stopVisible": True},  # ready probe
+        {"userCount": 8, "assistantCount": 4, "lastUserSig": "u8", "lastAssistantSig": "a4", "stopVisible": True},
+    ]
+    err4 = io.StringIO()
+    with contextlib.redirect_stderr(err4):
+        saw_stale = mod.wait_until_send_ready(FakeCDP(stale_wait_states), timeout_s=2.0)
+    assert saw_stale is True
+    assert "E_STALE_STOP_ASSUME_IDLE" in err4.getvalue(), err4.getvalue()
+finally:
+    mod.STALE_STOP_SEC = orig_stale_sec
+    mod.STALE_STOP_POLL_SEC = orig_stale_poll
+
 # Route guard: mismatch once, navigate, then correct chat id.
 print("[NEGATIVE_EXPECTED] error_code=E_ROUTE_MISMATCH")
 route_states_ok = [
@@ -141,7 +196,7 @@ precheck_states_ready = [
     },
 ]
 precheck_cdp_ready = FakeCDP(precheck_states_ready)
-reused, reused_text = mod.precheck_reply_before_send(
+reused, reused_text, _ = mod.precheck_reply_before_send(
     precheck_cdp_ready,
     "https://chatgpt.com/c/dddddddd-dddd-dddd-dddd-dddddddddddd",
     prompt,
@@ -164,7 +219,7 @@ precheck_states_none = [
     },
 ]
 precheck_cdp_none = FakeCDP(precheck_states_none)
-reused2, reused_text2 = mod.precheck_reply_before_send(
+reused2, reused_text2, _ = mod.precheck_reply_before_send(
     precheck_cdp_none,
     "https://chatgpt.com/c/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
     prompt,

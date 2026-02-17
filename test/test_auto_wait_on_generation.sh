@@ -44,11 +44,45 @@ from pathlib import Path
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--precheck-only", action="store_true")
+ap.add_argument("--fetch-last", action="store_true")
+ap.add_argument("--fetch-last-n", type=int, default=6)
 ap.add_argument("--prompt")
 ap.add_argument("--chatgpt-url")
 ap.add_argument("--cdp-port")
 ap.add_argument("--timeout")
 args = ap.parse_args()
+
+if args.fetch_last:
+    import hashlib
+    import json
+    import re
+    norm = re.sub(r"\s+", " ", (args.prompt or "").strip())
+    prompt_hash = hashlib.sha256(norm.encode("utf-8", errors="ignore")).hexdigest() if norm else ""
+    assistant_text = f"assistant fetch-last for {norm}" if norm else "assistant fetch-last"
+    tail = re.sub(r"\s+", " ", assistant_text.strip())[-500:]
+    assistant_hash = hashlib.sha256(tail.encode("utf-8", errors="ignore")).hexdigest() if tail else ""
+    payload = {
+        "url": args.chatgpt_url or "",
+        "stop_visible": False,
+        "total_messages": 2,
+        "limit": int(args.fetch_last_n or 6),
+        "assistant_after_last_user": True,
+        "last_user_text": args.prompt or "",
+        "last_user_hash": prompt_hash,
+        "assistant_text": assistant_text,
+        "assistant_tail_hash": assistant_hash,
+        "assistant_tail_len": len(tail),
+        "assistant_preview": assistant_text[:220],
+        "user_tail_hash": prompt_hash,
+        "checkpoint_id": "SPC-2099-01-01T00:00:00Z-" + (assistant_hash[:8] if assistant_hash else "none"),
+        "ts": "2099-01-01T00:00:00Z",
+        "messages": [
+            {"role": "user", "text": args.prompt or "", "text_len": len(args.prompt or ""), "tail_hash": prompt_hash, "sig": "u", "preview": (args.prompt or "")[:220]},
+            {"role": "assistant", "text": assistant_text, "text_len": len(assistant_text), "tail_hash": assistant_hash, "sig": "a", "preview": assistant_text[:220]},
+        ],
+    }
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+    raise SystemExit(0)
 
 mode = os.environ.get("FAKE_MODE", "send")
 state_path = Path(os.environ.get("FAKE_PRECHECK_STATE", "/tmp/fake_precheck_state.txt"))
@@ -102,6 +136,13 @@ echo "$out" | rg -q -- 'AUTO_WAIT tick'
 echo "$out" | rg -q -- 'AUTO_WAIT done outcome=send'
 echo "$out" | rg -q -- 'action=send'
 echo "$out" | rg -q -- 'assistant auto wait answer'
+
+# Ack consumed reply before the timeout scenario to allow next prompt send.
+ack_out="$(
+  "$SCRIPT" --chatgpt-url "https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" --ack 2>&1
+)"
+echo "$ack_out" | rg -q -- 'ACK_WRITE'
+echo "$ack_out"
 
 # Scenario 2: generation stays active -> bounded timeout.
 export FAKE_MODE="timeout"

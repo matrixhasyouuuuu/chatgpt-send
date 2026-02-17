@@ -16,11 +16,30 @@
 bash test/test_cli.sh
 bash test/test_cleanup_idempotent.sh
 bash test/test_doctor_invariants.sh
+bash test/test_run_manifest_summary.sh
+bash test/test_restart_not_allowed_by_default.sh
+bash test/test_graceful_restart_preserves_work_chat.sh
+bash test/test_timeout_budget_fails_when_restart_not_allowed.sh
+bash test/test_timeout_budget_triggers_restart_in_soak.sh
+bash test/test_prompt_lint.sh
+bash test/test_ui_contract_probe.sh
+bash test/test_evidence_bundle_on_timeout.sh
+bash test/test_evidence_sanitizer.sh
+bash test/test_ack_blocks_send.sh
+bash test/test_ack_allows_next_send.sh
+bash test/test_duplicate_prompt_blocked.sh
+bash test/test_set_chatgpt_url_protect_mismatch.sh
+bash test/test_strict_single_chat_block.sh
+bash test/test_work_chat_url_priority.sh
 bash test/test_auto_wait_on_generation.sh
 bash test/test_reply_wait_polling.sh
 bash test/test_soft_reset_runtime_eval_timeout.sh
 bash test/test_spawn_second_agent.sh
 bash test/test_cdp_chatgpt_wait.sh
+bash test/test_assistant_stability_guard.sh
+bash test/test_echo_miss_recover_no_resend.sh
+bash test/test_echo_miss_recover_soft_reset_probe_reuse.sh
+bash test/test_resend_idempotency_skips_when_reply_tracked.sh
 bash test/test_cdp_chatgpt_stale_guard.sh
 bash test/test_home_probe_no_active_switch.sh state/golden/T_e2e_home_probe_no_active_switch.log
 ```
@@ -52,9 +71,15 @@ MAX_E_ROUTE_MISMATCH=0
 MAX_E_SLOT_ACQUIRE_TIMEOUT=0
 MAX_E_CDP_RECOVER_BUDGET_EXCEEDED=0
 MAX_E_SEND_WITHOUT_PRECHECK=0
+MAX_E_PROTECT_CHAT_MISMATCH=0
+MAX_E_MULTIPLE_CHAT_TABS_BLOCKED=0
+MAX_PROMPT_LINT_FAILS=0
+MAX_E_UI_CONTRACT_FAIL=0
 MAX_CHAT_MISROUTE_TOTAL=0
 MAX_AUTO_WAIT_TIMEOUT_TOTAL=0
 MAX_E_REPLY_WAIT_TIMEOUT=0
+MAX_E_REPLY_UNACKED_BLOCK_SEND=0
+MAX_E_DUPLICATE_PROMPT_BLOCKED=0
 MAX_E_PROD_CHAT_PROTECTED=0
 MAX_E_SOFT_RESET_FAILED_TOTAL=0
 MAX_E_CDP_PORT_IN_USE=0
@@ -69,6 +94,7 @@ MAX_P95_WAIT_REPLY_MS=60000
 MAX_P95_TOTAL_MS=120000
 MIN_ITER_STATUS_LINES_PER_CHILD=2
 MIN_PROFILE_DIR_USED_TOTAL=1
+MIN_ACK_WRITE_TOTAL=1
 MIN_DOCTOR_INVARIANTS_OK=1
 ```
 
@@ -78,9 +104,15 @@ SOAK_ITERS=200
 MAX_SOAK_FAILS=0
 MAX_E_ROUTE_MISMATCH=0
 MAX_E_SEND_WITHOUT_PRECHECK=0
+MAX_E_PROTECT_CHAT_MISMATCH=0
+MAX_E_MULTIPLE_CHAT_TABS_BLOCKED=0
+MAX_PROMPT_LINT_FAILS=0
+MAX_E_UI_CONTRACT_FAIL=0
 MAX_CHAT_MISROUTE_TOTAL=0
 MAX_AUTO_WAIT_TIMEOUT_TOTAL=0
 MAX_E_REPLY_WAIT_TIMEOUT=0
+MAX_E_REPLY_UNACKED_BLOCK_SEND=0
+MAX_E_DUPLICATE_PROMPT_BLOCKED=0
 MAX_E_PROD_CHAT_PROTECTED=0
 MAX_E_SOFT_RESET_FAILED_TOTAL=0
 MAX_E_CDP_PORT_IN_USE=0
@@ -96,13 +128,22 @@ MAX_P95_WAIT_REPLY_MS=90000
 MAX_P95_TOTAL_MS=180000
 MAX_TESTS_SKIPPED=0
 MIN_PROFILE_DIR_USED_TOTAL=1
+MIN_ACK_WRITE_TOTAL=1
 MIN_DOCTOR_INVARIANTS_OK=1
 ```
 
 ## Логи и маркеры, которые должны быть в системе
 - `E_ROUTE_MISMATCH`
+- `E_PROTECT_CHAT_MISMATCH`
+- `E_MULTIPLE_CHAT_TABS_BLOCKED`
 - `E_MESSAGE_NOT_ECHOED`
 - `E_ACTIVITY_TIMEOUT`
+- `E_REPLY_UNACKED_BLOCK_SEND`
+- `E_DUPLICATE_PROMPT_BLOCKED`
+- `ACK_WRITE`
+- `PROMPT_LINT_FAILS`
+- `E_UI_CONTRACT_FAIL`
+- `EVIDENCE_CAPTURED`
 - `E_TAB_NOT_FOUND.retry`
 - `E_CDP_UNREACHABLE.recover_once`
 - `E_CDP_RECOVER_LOCK_TIMEOUT`

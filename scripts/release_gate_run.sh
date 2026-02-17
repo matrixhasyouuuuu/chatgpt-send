@@ -93,6 +93,51 @@ run_one "test_cleanup_idempotent" "bash test/test_cleanup_idempotent.sh" || true
 run_one "test_doctor_invariants" "bash test/test_doctor_invariants.sh" || true
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
+run_one "test_run_manifest_summary" "bash test/test_run_manifest_summary.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_restart_not_allowed_by_default" "bash test/test_restart_not_allowed_by_default.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_graceful_restart_preserves_work_chat" "bash test/test_graceful_restart_preserves_work_chat.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_timeout_budget_fails_when_restart_not_allowed" "bash test/test_timeout_budget_fails_when_restart_not_allowed.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_timeout_budget_triggers_restart_in_soak" "bash test/test_timeout_budget_triggers_restart_in_soak.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_prompt_lint" "bash test/test_prompt_lint.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_ui_contract_probe" "bash test/test_ui_contract_probe.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_evidence_bundle_on_timeout" "bash test/test_evidence_bundle_on_timeout.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_evidence_sanitizer" "bash test/test_evidence_sanitizer.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_ack_blocks_send" "bash test/test_ack_blocks_send.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_ack_allows_next_send" "bash test/test_ack_allows_next_send.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_duplicate_prompt_blocked" "bash test/test_duplicate_prompt_blocked.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_set_chatgpt_url_protect_mismatch" "bash test/test_set_chatgpt_url_protect_mismatch.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_strict_single_chat_block" "bash test/test_strict_single_chat_block.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_work_chat_url_priority" "bash test/test_work_chat_url_priority.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
 run_one "test_target_chat_guard" "bash test/test_target_chat_guard.sh" || true
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
@@ -115,6 +160,18 @@ run_one "test_shared_browser_slots" "bash test/test_shared_browser_slots.sh" || 
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
 run_one "test_cdp_chatgpt_wait" "bash test/test_cdp_chatgpt_wait.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_assistant_stability_guard" "bash test/test_assistant_stability_guard.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_echo_miss_recover_no_resend" "bash test/test_echo_miss_recover_no_resend.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_echo_miss_recover_soft_reset_probe_reuse" "bash test/test_echo_miss_recover_soft_reset_probe_reuse.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_resend_idempotency_skips_when_reply_tracked" "bash test/test_resend_idempotency_skips_when_reply_tracked.sh" || true
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
 run_one "test_cdp_chatgpt_stale_guard" "bash test/test_cdp_chatgpt_stale_guard.sh" || true

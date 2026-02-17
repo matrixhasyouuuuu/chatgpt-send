@@ -26,7 +26,7 @@ EOF
 printf '%s\n' "https://chatgpt.com/c/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" >"$tmp/state/chatgpt_url.txt"
 
 set +e
-out_mismatch="$("$SCRIPT" --chatgpt-url "https://chatgpt.com/c/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" --prompt "must fail mismatch" 2>&1)"
+out_mismatch="$(CHATGPT_SEND_ENFORCE_ACTIVE_PIN_MATCH=1 "$SCRIPT" --chatgpt-url "https://chatgpt.com/c/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" --prompt "must fail mismatch" 2>&1)"
 st_mismatch=$?
 set -e
 [[ "$st_mismatch" -eq 72 ]]

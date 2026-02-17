@@ -640,6 +640,17 @@ fi
 if [[ "\${st}" == "0" ]]; then
   iter_status "final" "done" "child_completed"
   flow_ok "report"
+  if [[ -n "\${child_chat_url:-}" ]] && [[ "\${child_chat_url}" =~ ^https://chatgpt\.com/c/[A-Za-z0-9-]+$ ]]; then
+    set +e
+    run_chatgpt_send --ack --chatgpt-url "\${child_chat_url}" >> '${log_file}' 2>&1
+    ack_rc=\$?
+    set -e
+    if [[ "\${ack_rc}" == "0" ]]; then
+      echo "[child] ack_status=done chat_url=\${child_chat_url}" >> '${log_file}'
+    else
+      echo "[child] ack_status=failed rc=\${ack_rc} chat_url=\${child_chat_url}" >> '${log_file}'
+    fi
+  fi
 else
   if [[ -f '${log_file}' ]] && grep -q 'E_PRECHECK_GENERATION_IN_PROGRESS' '${log_file}'; then
     iter_status "final" "waiting" "generation_in_progress rc=\${st}"
