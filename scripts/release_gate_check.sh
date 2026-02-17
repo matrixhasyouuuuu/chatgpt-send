@@ -119,9 +119,14 @@ precheck_ms_values = []
 send_ms_values = []
 wait_reply_ms_values = []
 total_ms_values = []
+soak_iters = 0
+soak_fails = 0
 iter_status_per_child = defaultdict(int)
 expected_negative_errors_total = 0
 tests_skipped = 0
+doctor_invariants_ok = 0
+doctor_force_set = 0
+doctor_profile_used = 0
 
 def set_evidence(key: str, path: Path, line_no: int) -> None:
     if key not in evidence:
@@ -139,10 +144,18 @@ marker_keys = {
     "E_MESSAGE_NOT_ECHOED": "E_MESSAGE_NOT_ECHOED",
     "E_AUTO_WAIT_TIMEOUT": "E_AUTO_WAIT_TIMEOUT",
     "E_REPLY_WAIT_TIMEOUT": "E_REPLY_WAIT_TIMEOUT",
+    "E_PROD_CHAT_PROTECTED": "E_PROD_CHAT_PROTECTED",
+    "E_SOFT_RESET_FAILED": "E_SOFT_RESET_FAILED",
+    "COMPOSER_TIMEOUT": "COMPOSER_TIMEOUT",
+    "RUNTIME_EVAL_TIMEOUT": "RUNTIME_EVAL_TIMEOUT",
+    "E_CDP_PORT_IN_USE": "E_CDP_PORT_IN_USE",
+    "SLOT_RELEASE_FORCED": "SLOT_RELEASE_FORCED",
 }
 
 recover_re = re.compile(r"E_CDP_UNREACHABLE\.recover_")
 auto_wait_start_re = re.compile(r"\bAUTO_WAIT start\b")
+soft_reset_start_re = re.compile(r"\bSOFT_RESET start\b")
+soft_reset_success_re = re.compile(r"\bSOFT_RESET done outcome=success\b")
 slot_re = re.compile(r"SLOT_(ACQUIRE|RELEASE).*?ts_ms=([0-9]+)")
 lock_wait_re = re.compile(r"\[LOCK\].*wait_ms=([0-9]+)")
 lock_held_re = re.compile(r"\[LOCK\].*lock_held_ms=([0-9]+)")
@@ -152,6 +165,13 @@ precheck_ms_re = re.compile(r"\bprecheck_ms=([0-9]+(?:\.[0-9]+)?)")
 send_ms_re = re.compile(r"\bsend_ms=([0-9]+(?:\.[0-9]+)?)")
 wait_reply_ms_re = re.compile(r"\bwait_reply_ms=([0-9]+(?:\.[0-9]+)?)")
 total_ms_re = re.compile(r"\btotal_ms=([0-9]+(?:\.[0-9]+)?)")
+soak_done_re = re.compile(r"SOAK_ITER done .*?rc=([0-9]+)")
+profile_dir_re = re.compile(r"\bPROFILE_DIR path=")
+profile_wrap_re = re.compile(r"\bPROFILE_WRAP run_id=")
+cleanup_killed_re = re.compile(r"\bCLEANUP_KILLED_TOTAL=([0-9]+)")
+doctor_inv_re = re.compile(r'"invariants_ok"\s*:\s*([01]|true|false)', re.IGNORECASE)
+doctor_force_re = re.compile(r'"force_chat_url_set"\s*:\s*([01]|true|false)', re.IGNORECASE)
+doctor_profile_re = re.compile(r'"profile_dir_used"\s*:\s*([01]|true|false)', re.IGNORECASE)
 
 for path in files:
     try:
@@ -173,6 +193,12 @@ for path in files:
         if not is_negative_file and auto_wait_start_re.search(line):
             counts["AUTO_WAIT_TOTAL"] += 1
             set_evidence("AUTO_WAIT_TOTAL", path, i)
+        if not is_negative_file and soft_reset_start_re.search(line):
+            counts["SOFT_RESET_TOTAL"] += 1
+            set_evidence("SOFT_RESET_TOTAL", path, i)
+        if not is_negative_file and soft_reset_success_re.search(line):
+            counts["SOFT_RESET_SUCCESS_TOTAL"] += 1
+            set_evidence("SOFT_RESET_SUCCESS_TOTAL", path, i)
         if is_negative_file:
             continue
         if recover_re.search(line):
@@ -215,6 +241,39 @@ for path in files:
         if m:
             total_ms_values.append(float(m.group(1)))
             set_evidence("P95_TOTAL_MS", path, i)
+        m = soak_done_re.search(line)
+        if m:
+            soak_iters += 1
+            rc = int(m.group(1))
+            if rc != 0:
+                soak_fails += 1
+                set_evidence("SOAK_FAILS", path, i)
+            set_evidence("SOAK_ITERS", path, i)
+        if profile_dir_re.search(line):
+            counts["PROFILE_DIR_USED_TOTAL"] += 1
+            set_evidence("PROFILE_DIR_USED_TOTAL", path, i)
+        if profile_wrap_re.search(line):
+            counts["PROFILE_DIR_USED_TOTAL"] += 1
+            set_evidence("PROFILE_DIR_USED_TOTAL", path, i)
+        m = cleanup_killed_re.search(line)
+        if m:
+            counts["CLEANUP_KILLED_TOTAL"] += int(float(m.group(1)))
+            set_evidence("CLEANUP_KILLED_TOTAL", path, i)
+        m = doctor_inv_re.search(line)
+        if m:
+            v = m.group(1).lower()
+            doctor_invariants_ok = max(doctor_invariants_ok, 1 if v in ("1", "true") else 0)
+            set_evidence("DOCTOR_INVARIANTS_OK", path, i)
+        m = doctor_force_re.search(line)
+        if m:
+            v = m.group(1).lower()
+            doctor_force_set = max(doctor_force_set, 1 if v in ("1", "true") else 0)
+            set_evidence("DOCTOR_FORCE_CHAT_URL_SET", path, i)
+        m = doctor_profile_re.search(line)
+        if m:
+            v = m.group(1).lower()
+            doctor_profile_used = max(doctor_profile_used, 1 if v in ("1", "true") else 0)
+            set_evidence("DOCTOR_PROFILE_DIR_USED", path, i)
 
 def p95(values):
     if not values:
@@ -249,6 +308,18 @@ metrics = {
     "AUTO_WAIT_TOTAL": float(counts["AUTO_WAIT_TOTAL"]),
     "AUTO_WAIT_TIMEOUT_TOTAL": float(counts["E_AUTO_WAIT_TIMEOUT"]),
     "E_REPLY_WAIT_TIMEOUT": float(counts["E_REPLY_WAIT_TIMEOUT"]),
+    "E_PROD_CHAT_PROTECTED": float(counts["E_PROD_CHAT_PROTECTED"]),
+    "SOFT_RESET_TOTAL": float(counts["SOFT_RESET_TOTAL"]),
+    "SOFT_RESET_SUCCESS_TOTAL": float(counts["SOFT_RESET_SUCCESS_TOTAL"]),
+    "E_SOFT_RESET_FAILED_TOTAL": float(counts["E_SOFT_RESET_FAILED"]),
+    "COMPOSER_TIMEOUT_TOTAL": float(counts["COMPOSER_TIMEOUT"]),
+    "RUNTIME_EVAL_TIMEOUT_TOTAL": float(counts["RUNTIME_EVAL_TIMEOUT"]),
+    "E_CDP_PORT_IN_USE": float(counts["E_CDP_PORT_IN_USE"]),
+    "SLOT_RELEASE_FORCED_TOTAL": float(counts["SLOT_RELEASE_FORCED"]),
+    "CLEANUP_KILLED_TOTAL": float(counts["CLEANUP_KILLED_TOTAL"]),
+    "DOCTOR_INVARIANTS_OK": float(doctor_invariants_ok),
+    "DOCTOR_FORCE_CHAT_URL_SET": float(doctor_force_set),
+    "DOCTOR_PROFILE_DIR_USED": float(doctor_profile_used),
     "E_CDP_UNREACHABLE_RECOVER_PER_100": float(counts["E_CDP_UNREACHABLE_RECOVER"]),
     "E_CDP_UNREACHABLE_PER_200": float(counts["E_CDP_UNREACHABLE_RECOVER"]),
     "MAX_INFLIGHT_SLOTS": float(max_inflight),
@@ -258,6 +329,9 @@ metrics = {
     "P95_SEND_MS": p95(send_ms_values),
     "P95_WAIT_REPLY_MS": p95(wait_reply_ms_values),
     "P95_TOTAL_MS": p95(total_ms_values),
+    "SOAK_ITERS": float(soak_iters),
+    "SOAK_FAILS": float(soak_fails),
+    "PROFILE_DIR_USED_TOTAL": float(counts["PROFILE_DIR_USED_TOTAL"]),
     "MIN_ITER_STATUS_LINES_PER_CHILD": float(min_iter_status),
     "EXPECTED_NEGATIVE_ERRORS_TOTAL": float(expected_negative_errors_total),
     "TESTS_SKIPPED": float(tests_skipped),

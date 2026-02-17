@@ -12,13 +12,15 @@ fake_send="$tmp/fake_chatgpt_send.sh"
 cat >"$fake_send" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+echo "PROFILE_DIR path=/tmp/fake-profile"
 echo "fake assistant reply"
 exit 0
 EOF
 chmod +x "$fake_send"
 
 run_id="soak-short-$(date +%s)-$$"
-bash "$SOAK_RUNNER" --iters 20 --run-id "$run_id" --chatgpt-send-bin "$fake_send"
+bash "$SOAK_RUNNER" --iters 20 --run-id "$run_id" --chatgpt-send-bin "$fake_send" \
+  --force-chat-url "https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
 summary="$ROOT/state/runs/$run_id/soak/summary.txt"
 [[ -f "$summary" ]]

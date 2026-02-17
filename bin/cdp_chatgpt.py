@@ -675,6 +675,55 @@ def emit_timing(
     sys.stderr.flush()
 
 
+def mark_timeout_kind(message: str, phase: str = "main") -> None:
+    msg = (message or "").lower()
+    if "runtime.evaluate" in msg:
+        error_marker("RUNTIME_EVAL_TIMEOUT", f"phase={phase}")
+    if "composer" in msg:
+        error_marker("COMPOSER_TIMEOUT", f"phase={phase}")
+
+
+def soft_reset_tab(cdp: CDP, target_url: str, reason: str, timeout_s: float = 60.0) -> bool:
+    sys.stderr.write(f"SOFT_RESET start reason={reason}\n")
+    sys.stderr.flush()
+    try:
+        try:
+            cdp.call("Page.bringToFront", timeout=10.0)
+        except Exception:
+            pass
+        try:
+            cdp.call("Page.reload", {"ignoreCache": True}, timeout=15.0)
+        except Exception:
+            pass
+
+        # Wait page readyState=complete after reload/navigation.
+        deadline = time.time() + max(10.0, timeout_s)
+        ready_expr = "document.readyState"
+        while time.time() < deadline:
+            try:
+                ready = str(cdp.eval(ready_expr, timeout=10.0) or "").strip().lower()
+                if ready == "complete":
+                    break
+            except TimeoutError as e:
+                mark_timeout_kind(str(e), phase="soft_reset_ready_state")
+            time.sleep(0.2)
+
+        if not ensure_target_route(cdp, target_url):
+            raise RuntimeError("route_mismatch_after_soft_reset")
+        wait_for_composer(cdp, timeout_s=30.0)
+        wait_until_send_ready(cdp, timeout_s=min(timeout_s, 90.0))
+        sys.stderr.write(f"SOFT_RESET done outcome=success reason={reason}\n")
+        sys.stderr.flush()
+        return True
+    except TimeoutError as e:
+        mark_timeout_kind(str(e), phase="soft_reset")
+        error_marker("E_SOFT_RESET_FAILED", f"reason={reason} err={e}")
+        return False
+    except Exception as e:
+        error_marker("E_SOFT_RESET_FAILED", f"reason={reason} err={e}")
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cdp-port", type=int, default=9222)
@@ -684,11 +733,15 @@ def main() -> int:
     ap.add_argument("--precheck-only", action="store_true")
     ap.add_argument("--send-no-wait", action="store_true")
     ap.add_argument("--reply-ready-probe", action="store_true")
+    ap.add_argument("--soft-reset-only", action="store_true")
+    ap.add_argument("--soft-reset-reason", default="manual")
     args = ap.parse_args()
     t_main_start = time.time()
-    mode_flags = [args.precheck_only, args.send_no_wait, args.reply_ready_probe]
+    mode_flags = [args.precheck_only, args.send_no_wait, args.reply_ready_probe, args.soft_reset_only]
     if sum(1 for x in mode_flags if x) > 1:
-        sys.stderr.write("Only one mode is allowed: --precheck-only | --send-no-wait | --reply-ready-probe\n")
+        sys.stderr.write(
+            "Only one mode is allowed: --precheck-only | --send-no-wait | --reply-ready-probe | --soft-reset-only\n"
+        )
         return 2
 
     progress(f"phase=start cdp_port={args.cdp_port} timeout={args.timeout}")
@@ -747,6 +800,9 @@ def main() -> int:
                 return 11
             emit_timing(precheck_ms=precheck_ms, total_ms=int((time.time() - t_main_start) * 1000))
             return 10
+        if args.soft_reset_only:
+            ok = soft_reset_tab(cdp, args.chatgpt_url, args.soft_reset_reason, timeout_s=min(float(args.timeout), 120.0))
+            return 0 if ok else 4
         if args.reply_ready_probe:
             if not ensure_target_route(cdp, args.chatgpt_url):
                 error_marker("E_ROUTE_MISMATCH_FATAL", "failed_to_activate_expected_target_chat")
@@ -890,6 +946,7 @@ def main() -> int:
         sys.stdout.write(answer.strip() + "\n")
         return 0
     except TimeoutError as e:
+        mark_timeout_kind(str(e), phase="main")
         sys.stderr.write(str(e) + "\n")
         return 4
     except Exception as e:

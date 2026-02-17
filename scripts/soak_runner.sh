@@ -6,6 +6,7 @@ ITERS=200
 RUN_ID=""
 CHATGPT_SEND_BIN="${CHATGPT_SEND_BIN:-$ROOT/bin/chatgpt_send}"
 PROMPT_PREFIX="soak"
+FORCE_CHAT_URL="${CHATGPT_SEND_FORCE_CHAT_URL:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -23,6 +24,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --prompt-prefix)
       PROMPT_PREFIX="${2:-soak}"
+      shift 2
+      ;;
+    --force-chat-url)
+      FORCE_CHAT_URL="${2:-}"
       shift 2
       ;;
     *)
@@ -43,12 +48,24 @@ if [[ ! -x "$CHATGPT_SEND_BIN" ]]; then
   echo "chatgpt_send binary not executable: $CHATGPT_SEND_BIN" >&2
   exit 2
 fi
+if [[ -z "${FORCE_CHAT_URL//[[:space:]]/}" ]] && [[ -f "$ROOT/state/chatgpt_url.txt" ]]; then
+  FORCE_CHAT_URL="$(head -n 1 "$ROOT/state/chatgpt_url.txt" || true)"
+fi
+if [[ -z "${FORCE_CHAT_URL//[[:space:]]/}" ]]; then
+  echo "force chat URL is required: pass --force-chat-url https://chatgpt.com/c/<id> or configure $ROOT/state/chatgpt_url.txt" >&2
+  exit 2
+fi
+if [[ -n "${FORCE_CHAT_URL//[[:space:]]/}" ]] && [[ ! "$FORCE_CHAT_URL" =~ ^https://chatgpt\.com/c/[0-9a-fA-F-]{16,}$ ]]; then
+  echo "Invalid --force-chat-url: $FORCE_CHAT_URL" >&2
+  exit 2
+fi
 
 RUN_DIR="$ROOT/state/runs/$RUN_ID"
 SOAK_DIR="$RUN_DIR/soak"
 SOAK_LOG="$SOAK_DIR/soak.log"
 SUMMARY_FILE="$SOAK_DIR/summary.txt"
 CHECK_LOG="$SOAK_DIR/gate_check.log"
+DOCTOR_JSONL="$SOAK_DIR/doctor.jsonl"
 RUNTIME_ROOT="$RUN_DIR/runtime_root"
 
 mkdir -p "$SOAK_DIR"
@@ -68,14 +85,28 @@ echo "profile=soak" | tee -a "$SUMMARY_FILE"
 echo "soak_iters=$ITERS" | tee -a "$SUMMARY_FILE"
 echo "chatgpt_send_bin=$CHATGPT_SEND_BIN" | tee -a "$SUMMARY_FILE"
 echo "runtime_root=$RUNTIME_ROOT" | tee -a "$SUMMARY_FILE"
+echo "force_chat_url=${FORCE_CHAT_URL:-none}" | tee -a "$SUMMARY_FILE"
+echo "doctor_jsonl=$DOCTOR_JSONL" | tee -a "$SUMMARY_FILE"
+
+set +e
+"$ROOT/bin/chatgpt_send" --doctor --json >"$DOCTOR_JSONL" 2>>"$SUMMARY_FILE"
+doctor_st=$?
+set -e
+echo "doctor_status=$doctor_st" | tee -a "$SUMMARY_FILE"
+if [[ "$doctor_st" -ne 0 ]]; then
+  exit 1
+fi
 
 for ((i=1; i<=ITERS; i++)); do
   prompt="${PROMPT_PREFIX} iter ${i}/${ITERS} run_id=${RUN_ID}"
+  echo "SOAK_ITER start i=${i} total=${ITERS} run_id=${RUN_ID}" >>"$SOAK_LOG"
   echo "[SOAK] iter=$i/$ITERS action=send" >>"$SOAK_LOG"
   set +e
-  "$CHATGPT_SEND_BIN" --prompt "$prompt" >>"$SOAK_LOG" 2>&1
+  CHATGPT_SEND_FORCE_CHAT_URL="${FORCE_CHAT_URL:-}" \
+    "$CHATGPT_SEND_BIN" --prompt "$prompt" >>"$SOAK_LOG" 2>&1
   st=$?
   set -e
+  echo "SOAK_ITER done i=${i} total=${ITERS} rc=${st} run_id=${RUN_ID}" >>"$SOAK_LOG"
   echo "[SOAK] iter=$i/$ITERS status=$st" >>"$SOAK_LOG"
   if [[ "$st" -eq 2 ]]; then
     skipped=$((skipped+1))

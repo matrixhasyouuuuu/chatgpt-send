@@ -51,6 +51,8 @@ INIT_SESSION_NAME=""
 INIT_SESSION_TITLE=""
 SET_ACTIVE_TITLE=""
 DOCTOR=0
+DOCTOR_JSON=0
+DO_CLEANUP=0
 SAVE_CHAT_NAME=""
 USE_CHAT_NAME=""
 DELETE_CHAT_NAME=""
@@ -75,6 +77,7 @@ AUTO_WAIT_POLL_MS="${CHATGPT_SEND_AUTO_WAIT_POLL_MS:-500}"
 REPLY_POLLING="${CHATGPT_SEND_REPLY_POLLING:-1}"
 REPLY_POLL_MS="${CHATGPT_SEND_REPLY_POLL_MS:-700}"
 REPLY_MAX_SEC="${CHATGPT_SEND_REPLY_MAX_SEC:-90}"
+PROTECT_CHAT_URL="${CHATGPT_SEND_PROTECT_CHAT_URL:-}"
 REQUIRE_CONVO_URL="${CHATGPT_SEND_REQUIRE_CONVO_URL:-1}"
 ALLOW_HOME_SEND="${CHATGPT_SEND_ALLOW_HOME_SEND:-0}"
 ENFORCE_ACTIVE_PIN_MATCH="${CHATGPT_SEND_ENFORCE_ACTIVE_PIN_MATCH:-1}"
@@ -97,6 +100,8 @@ Usage:
   chatgpt_send --sync-chatgpt-url
   chatgpt_send --list-chats
   chatgpt_send --doctor
+  chatgpt_send --doctor --json
+  chatgpt_send --cleanup
   chatgpt_send --save-chat NAME [--chatgpt-url URL]
   chatgpt_send --use-chat NAME
   chatgpt_send --delete-chat NAME
@@ -126,6 +131,8 @@ Options:
   --print-chatgpt-url           print resolved URL to stderr on each run
   --list-chats                  list saved Specialist chats (name -> url)
   --doctor                      print a quick health report (CDP, pinned chat, sessions)
+  --json                        with --doctor: output one JSON line snapshot
+  --cleanup                     cleanup stale pid artifacts for this profile/cdp port
   --save-chat NAME              save current/resolved chat as NAME
   --use-chat NAME               switch active chat to NAME
   --delete-chat NAME            remove saved chat NAME
@@ -180,6 +187,13 @@ emit_chat_state_mismatch() {
   local pinned_url="${2:-none}"
   echo "E_CHAT_STATE_MISMATCH active_url=${active_url} pinned_url=${pinned_url} run_id=${RUN_ID}" >&2
   exit 72
+}
+
+emit_prod_chat_protected() {
+  local got="${1:-none}"
+  local expected_not="${2:-none}"
+  echo "E_PROD_CHAT_PROTECTED got=${got} expected_not=${expected_not} run_id=${RUN_ID}" >&2
+  exit 77
 }
 
 log_action() {
@@ -311,6 +325,55 @@ for line in sys.stdin:
     if ("--user-data-dir=%s" % profile) in args:
         print(pid_str)
 ' "$PROFILE_DIR"
+}
+
+cleanup_runtime_artifacts() {
+  local killed=0
+  local pidfiles=()
+  local seen=""
+  local pf pid args
+
+  pidfiles+=("$ROOT/state/chrome_${CDP_PORT}.pid")
+  if [[ -n "${LOG_DIR:-}" ]]; then
+    pidfiles+=("${LOG_DIR}/cdp/chrome_${CDP_PORT}.pid")
+  fi
+
+  for pf in "${pidfiles[@]}"; do
+    [[ -n "${pf:-}" ]] || continue
+    if [[ "$seen" == *"|$pf|"* ]]; then
+      continue
+    fi
+    seen="${seen}|$pf|"
+    [[ -e "$pf" ]] || continue
+    pid="$(tr -d '[:space:]' <"$pf" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+      if [[ "$args" == *"--user-data-dir=${PROFILE_DIR}"* ]]; then
+        kill "$pid" 2>/dev/null || true
+        killed=$((killed+1))
+      fi
+    fi
+    rm -f "$pf" 2>/dev/null || true
+  done
+
+  # Remove stale pid files (empty, invalid, or dead) from local state roots.
+  while IFS= read -r pf; do
+    [[ -n "${pf:-}" ]] || continue
+    pid="$(tr -d '[:space:]' <"$pf" 2>/dev/null || true)"
+    if [[ -z "${pid:-}" ]] || [[ ! "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$pf" 2>/dev/null || true
+    fi
+  done < <(
+    {
+      find "$ROOT/state" -type f -name 'chrome_*.pid' 2>/dev/null || true
+      if [[ -n "${LOG_DIR:-}" ]]; then
+        find "${LOG_DIR}/cdp" -type f -name 'chrome_*.pid' 2>/dev/null || true
+      fi
+    } | sort -u
+  )
+
+  echo "CLEANUP_KILLED_TOTAL=${killed} run_id=${RUN_ID}" >&2
+  echo "CLEANUP_DONE run_id=${RUN_ID}" >&2
 }
 
 chats_db_read() {
@@ -1213,6 +1276,8 @@ while [[ $# -gt 0 ]]; do
     --cdp-port) CDP_PORT="$2"; shift 2;;
     --list-chats) LIST_CHATS=1; shift;;
     --doctor) DOCTOR=1; shift;;
+    --json) DOCTOR_JSON=1; shift;;
+    --cleanup) DO_CLEANUP=1; shift;;
     --save-chat) SAVE_CHAT_NAME="$2"; shift 2;;
     --use-chat) USE_CHAT_NAME="$2"; shift 2;;
     --delete-chat) DELETE_CHAT_NAME="$2"; shift 2;;
@@ -1280,31 +1345,113 @@ if [[ $LIST_CHATS -eq 1 ]]; then
 fi
 
 if [[ $DOCTOR -eq 1 ]]; then
-  echo "chatgpt_send doctor"
-  echo "  root: $ROOT"
-  echo "  cdp_port: $CDP_PORT"
+  echo "DOCTOR start run_id=${RUN_ID}" >&2
+  cdp_ok=0
   if cdp_is_up; then
-    echo "  cdp: OK"
-  else
-    echo "  cdp: DOWN"
+    cdp_ok=1
   fi
-
   pinned=""
   if [[ -f "$CHATGPT_URL_FILE" ]]; then
     pinned="$(cat "$CHATGPT_URL_FILE" | head -n 1 || true)"
   fi
-  echo "  pinned_url: ${pinned:-"(none)"}"
-
   active="$(chats_db_get_active_name | head -n 1 || true)"
-  echo "  active_session: ${active:-"(none)"}"
-
-  if [[ -n "${active:-}" ]]; then
-    (chats_db_loop_status 2>/dev/null | sed 's/^/  /') || true
+  active_url="$(chats_db_get_active_url | head -n 1 || true)"
+  fail_count=0
+  fail_keys=()
+  doctor_fail() {
+    local key="$1"
+    local expected="$2"
+    local got="$3"
+    echo "E_DOCTOR_INVARIANT_FAIL key=${key} expected=${expected} got=${got} run_id=${RUN_ID}" >&2
+    fail_keys+=("$key")
+    fail_count=$((fail_count+1))
+  }
+  if [[ -n "${PROTECT_CHAT_URL//[[:space:]]/}" ]] && ! is_chat_conversation_url "${PROTECT_CHAT_URL}"; then
+    doctor_fail "protect_url_format" "conversation_url" "${PROTECT_CHAT_URL}"
+  fi
+  if [[ -n "${CHATGPT_SEND_FORCE_CHAT_URL:-}" ]] && ! is_chat_conversation_url "${CHATGPT_SEND_FORCE_CHAT_URL}"; then
+    doctor_fail "force_url_format" "conversation_url" "${CHATGPT_SEND_FORCE_CHAT_URL}"
+  fi
+  if [[ -n "${PROTECT_CHAT_URL//[[:space:]]/}" ]] && [[ -n "${CHATGPT_SEND_FORCE_CHAT_URL:-}" ]] \
+    && [[ "${PROTECT_CHAT_URL}" == "${CHATGPT_SEND_FORCE_CHAT_URL}" ]]; then
+    doctor_fail "force_equals_protect" "different_urls" "${CHATGPT_SEND_FORCE_CHAT_URL}"
+  fi
+  invariants_ok=1
+  if (( fail_count > 0 )); then
+    invariants_ok=0
   fi
 
-  if cdp_is_up; then
-    echo "  open_chat_tabs:"
-    curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+  if [[ $DOCTOR_JSON -eq 1 ]]; then
+    python3 - "$ROOT" "$CDP_PORT" "$cdp_ok" "$pinned" "$active" "$active_url" \
+      "${CHATGPT_SEND_FORCE_CHAT_URL:-}" "${PROTECT_CHAT_URL:-}" "$PROFILE_DIR" \
+      "${AUTO_WAIT_ON_GENERATION}" "${AUTO_WAIT_MAX_SEC}" "${AUTO_WAIT_POLL_MS}" \
+      "${REPLY_POLLING}" "${REPLY_POLL_MS}" "${REPLY_MAX_SEC}" \
+      "${CDP_RECOVER_BUDGET}" "${CDP_RECOVER_COOLDOWN_SEC}" \
+      "${SHARED_BROWSER_LOCK_FILE:-${LOCK_FILE:-}}" "$invariants_ok" "$fail_count" <<'PY'
+import json,sys,time
+(
+root, cdp_port, cdp_ok, pinned, active, active_url,
+force_url, protect_url, profile_dir,
+auto_wait_on, auto_wait_max, auto_wait_poll,
+reply_polling, reply_poll_ms, reply_max_sec,
+recover_budget, recover_cooldown, lock_file,
+invariants_ok, fail_count
+) = sys.argv[1:]
+obj = {
+    "ts": int(time.time()),
+    "root": root,
+    "cdp_port": int(cdp_port or 0),
+    "cdp_ok": int(cdp_ok or 0),
+    "pinned_url": pinned,
+    "active_session": active,
+    "active_url": active_url,
+    "force_chat_url": force_url,
+    "protect_chat_url": protect_url,
+    "profile_dir": profile_dir,
+    "profile_dir_used": int(bool(profile_dir)),
+    "force_chat_url_set": int(bool(force_url)),
+    "auto_wait_on_generation": int(auto_wait_on or 0),
+    "auto_wait_max_sec": int(auto_wait_max or 0),
+    "auto_wait_poll_ms": int(auto_wait_poll or 0),
+    "reply_polling": int(reply_polling or 0),
+    "reply_poll_ms": int(reply_poll_ms or 0),
+    "reply_max_sec": int(reply_max_sec or 0),
+    "recover_budget": int(recover_budget or 0),
+    "recover_cooldown_sec": int(recover_cooldown or 0),
+    "lock_file": lock_file,
+    "invariants_ok": int(invariants_ok or 0),
+    "invariant_fail_count": int(fail_count or 0),
+}
+print(json.dumps(obj, ensure_ascii=False, sort_keys=True))
+PY
+  else
+    echo "chatgpt_send doctor"
+    echo "  root: $ROOT"
+    echo "  cdp_port: $CDP_PORT"
+    if (( cdp_ok == 1 )); then
+      echo "  cdp: OK"
+    else
+      echo "  cdp: DOWN"
+    fi
+    echo "  pinned_url: ${pinned:-"(none)"}"
+    echo "  active_session: ${active:-"(none)"}"
+    echo "  active_url: ${active_url:-"(none)"}"
+    echo "  force_chat_url: ${CHATGPT_SEND_FORCE_CHAT_URL:-"(none)"}"
+    echo "  protect_chat_url: ${PROTECT_CHAT_URL:-"(none)"}"
+    echo "  profile_dir: ${PROFILE_DIR}"
+    echo "  invariants_ok: ${invariants_ok}"
+    if (( fail_count > 0 )); then
+      echo "  invariant_fail_count: ${fail_count}"
+      echo "  invariant_fail_keys: ${fail_keys[*]}"
+    fi
+
+    if [[ -n "${active:-}" ]]; then
+      (chats_db_loop_status 2>/dev/null | sed 's/^/  /') || true
+    fi
+
+    if (( cdp_ok == 1 )); then
+      echo "  open_chat_tabs:"
+      curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
 import json,re,sys
 try:
     tabs=json.load(sys.stdin)
@@ -1319,7 +1466,17 @@ for tid,u,title in hits[:12]:
     print("   -", tid, u, ("(" + title + ")") if title else "")
 print("   total:", len(hits))
 '
+    fi
   fi
+  echo "DOCTOR done invariants_ok=${invariants_ok} fail_count=${fail_count} run_id=${RUN_ID}" >&2
+  if [[ "${CHATGPT_SEND_STRICT_DOCTOR:-0}" == "1" ]] && (( fail_count > 0 )); then
+    exit 1
+  fi
+  exit 0
+fi
+
+if [[ $DO_CLEANUP -eq 1 ]]; then
+  cleanup_runtime_artifacts
   exit 0
 fi
 
@@ -1587,6 +1744,8 @@ if [[ -z "${PROMPT//[[:space:]]/}" ]]; then
   exit 2
 fi
 
+echo "PROFILE_DIR path=${PROFILE_DIR} run_id=${RUN_ID}" >&2
+
 # If no explicit/default chat URL is configured, try to auto-capture it from the
 # already-open shared Chrome instance. This enables the UX:
 # "open browser" -> user creates chat -> first send auto-pins that chat.
@@ -1617,6 +1776,15 @@ fi
 # Hard send guard: prevent "wrong chat" drift by requiring a conversation URL
 # and consistent active/pinned metadata before every normal prompt send.
 if [[ $INIT_SPECIALIST -eq 0 ]]; then
+  if [[ -n "${PROTECT_CHAT_URL//[[:space:]]/}" ]] && is_chat_conversation_url "${PROTECT_CHAT_URL}"; then
+    if [[ -n "${CHATGPT_SEND_FORCE_CHAT_URL:-}" ]] && [[ "${CHATGPT_SEND_FORCE_CHAT_URL}" == "${PROTECT_CHAT_URL}" ]]; then
+      emit_prod_chat_protected "${CHATGPT_SEND_FORCE_CHAT_URL}" "${PROTECT_CHAT_URL}"
+    fi
+    if [[ "${CHATGPT_URL:-}" == "${PROTECT_CHAT_URL}" ]]; then
+      emit_prod_chat_protected "${CHATGPT_URL}" "${PROTECT_CHAT_URL}"
+    fi
+  fi
+
   pinned_url_current=""
   if [[ -f "$CHATGPT_URL_FILE" ]]; then
     pinned_url_current="$(cat "$CHATGPT_URL_FILE" | head -n 1 || true)"
@@ -1786,6 +1954,17 @@ reply_ready_probe_via_cdp() {
     --reply-ready-probe >/dev/null
 }
 
+soft_reset_via_cdp() {
+  local reason="${1:-status4_timeout}"
+  python3 "$ROOT/bin/cdp_chatgpt.py" \
+    --cdp-port "$CDP_PORT" \
+    --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
+    --timeout "120" \
+    --prompt "$PROMPT" \
+    --soft-reset-only \
+    --soft-reset-reason "$reason" >/dev/null
+}
+
 reply_wait_collect_via_probe() {
   local max_sec poll_ms poll_s start_ms now elapsed_ms max_ms probe_status fetch_status
   max_sec="$REPLY_MAX_SEC"
@@ -1951,12 +2130,19 @@ fi
 
 if [[ $status -eq 4 ]]; then
   # Controlled one-shot retry for transient Runtime.evaluate/CDP method timeouts.
-  echo "E_CDP_TIMEOUT_RETRY attempt=1" >&2
-  if [[ -n "${CHATGPT_URL:-}" ]] && is_chat_conversation_url "$CHATGPT_URL"; then
-    cdp_activate_or_open_url "$CHATGPT_URL" || maybe_cdp_recover "status4_timeout_convo_target" "$CHATGPT_URL" || exit 1
-  else
-    maybe_cdp_recover "status4_timeout_home_target" "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+  echo "RETRY_CLASS class=soft_reset reason=status4_timeout run_id=${RUN_ID}" >&2
+  set +e
+  soft_reset_via_cdp "status4_timeout"
+  soft_reset_st=$?
+  set -e
+  if [[ $soft_reset_st -ne 0 ]]; then
+    if [[ -n "${CHATGPT_URL:-}" ]] && is_chat_conversation_url "$CHATGPT_URL"; then
+      cdp_activate_or_open_url "$CHATGPT_URL" || maybe_cdp_recover "status4_timeout_convo_target" "$CHATGPT_URL" || exit 1
+    else
+      maybe_cdp_recover "status4_timeout_home_target" "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+    fi
   fi
+  echo "E_CDP_TIMEOUT_RETRY attempt=1" >&2
   sleep 0.2
   set +e
   run_send_checked "retry_status4_timeout"
