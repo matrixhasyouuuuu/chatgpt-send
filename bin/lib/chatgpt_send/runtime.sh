@@ -10,7 +10,8 @@ precheck_via_cdp() {
 }
 
 fetch_last_via_cdp() {
-  local fetch_n fetch_out st fields fetch_url target_id actual_id checkpoint_id_write
+  local fetch_n fetch_out st fields diag_fields fetch_url target_id actual_id checkpoint_id_write
+  local prev_ckpt_fields prev_chat_url prev_chat_id prev_fingerprint prev_checkpoint_id prev_last_user_text_sig
   fetch_n="$FETCH_LAST_N"
   fetch_out="$(mktemp)"
   echo "FETCH_LAST start n=${fetch_n} run_id=${RUN_ID}" >&2
@@ -38,7 +39,22 @@ fetch_last_via_cdp() {
     echo "FETCH_LAST fail status=parse_empty run_id=${RUN_ID}" >&2
     return 79
   fi
-  IFS=$'\t' read -r fetch_url FETCH_LAST_USER_TAIL_HASH FETCH_LAST_ASSISTANT_TAIL_HASH FETCH_LAST_CHECKPOINT_ID FETCH_LAST_LAST_USER_HASH FETCH_LAST_ASSISTANT_AFTER_LAST_USER <<<"$fields"
+  IFS=$'\x1f' read -r fetch_url FETCH_LAST_USER_TAIL_HASH FETCH_LAST_ASSISTANT_TAIL_HASH FETCH_LAST_CHECKPOINT_ID FETCH_LAST_LAST_USER_HASH FETCH_LAST_ASSISTANT_AFTER_LAST_USER <<<"$fields"
+  diag_fields="$(fetch_last_extract_diag_fields "$fetch_out" || true)"
+  if [[ -n "${diag_fields:-}" ]]; then
+    IFS=$'\x1f' read -r FETCH_LAST_TOTAL_MESSAGES FETCH_LAST_STOP_VISIBLE FETCH_LAST_LAST_USER_SIG FETCH_LAST_LAST_ASSISTANT_SIG FETCH_LAST_CHAT_ID FETCH_LAST_UI_CONTRACT_SIG FETCH_LAST_FINGERPRINT_V1 FETCH_LAST_LAST_USER_TEXT_SIG FETCH_LAST_LAST_ASSISTANT_TEXT_SIG FETCH_LAST_UI_STATE FETCH_LAST_NORM_VERSION <<<"$diag_fields"
+  fi
+  [[ -n "${FETCH_LAST_TOTAL_MESSAGES:-}" ]] || FETCH_LAST_TOTAL_MESSAGES="0"
+  [[ -n "${FETCH_LAST_STOP_VISIBLE:-}" ]] || FETCH_LAST_STOP_VISIBLE="0"
+  [[ -n "${FETCH_LAST_LAST_USER_SIG:-}" ]] || FETCH_LAST_LAST_USER_SIG=""
+  [[ -n "${FETCH_LAST_LAST_ASSISTANT_SIG:-}" ]] || FETCH_LAST_LAST_ASSISTANT_SIG=""
+  [[ -n "${FETCH_LAST_CHAT_ID:-}" ]] || FETCH_LAST_CHAT_ID=""
+  [[ -n "${FETCH_LAST_UI_CONTRACT_SIG:-}" ]] || FETCH_LAST_UI_CONTRACT_SIG=""
+  [[ -n "${FETCH_LAST_FINGERPRINT_V1:-}" ]] || FETCH_LAST_FINGERPRINT_V1=""
+  [[ -n "${FETCH_LAST_LAST_USER_TEXT_SIG:-}" ]] || FETCH_LAST_LAST_USER_TEXT_SIG=""
+  [[ -n "${FETCH_LAST_LAST_ASSISTANT_TEXT_SIG:-}" ]] || FETCH_LAST_LAST_ASSISTANT_TEXT_SIG=""
+  [[ -n "${FETCH_LAST_UI_STATE:-}" ]] || FETCH_LAST_UI_STATE=""
+  [[ -n "${FETCH_LAST_NORM_VERSION:-}" ]] || FETCH_LAST_NORM_VERSION="${NORM_VERSION:-v1}"
 
   target_id="$(chat_id_from_url "${CHATGPT_URL:-}" 2>/dev/null || true)"
   actual_id="$(chat_id_from_url "${fetch_url:-}" 2>/dev/null || true)"
@@ -52,19 +68,117 @@ fetch_last_via_cdp() {
     rm -f "$fetch_out"
     return 72
   fi
+  if [[ -z "${FETCH_LAST_CHAT_ID:-}" ]]; then
+    FETCH_LAST_CHAT_ID="${actual_id:-}"
+  fi
+  if [[ -n "${FETCH_LAST_UI_STATE:-}" ]] && [[ "${FETCH_LAST_UI_STATE}" != "ok" ]]; then
+    echo "E_UI_NOT_READY ui_state=${FETCH_LAST_UI_STATE} run_id=${RUN_ID}" >&2
+    protocol_append_event "FETCH_LAST" "fail" "$PROMPT_HASH" "$(read_last_specialist_checkpoint_id | head -n 1 || true)" "ui_state=${FETCH_LAST_UI_STATE}"
+    rm -f "$fetch_out"
+    return 79
+  fi
+
+  prev_ckpt_fields="$(read_last_specialist_checkpoint_fields | head -n 1 || true)"
+  IFS=$'\x1f' read -r prev_chat_url prev_chat_id prev_fingerprint prev_checkpoint_id prev_last_user_text_sig <<<"$prev_ckpt_fields"
+  if [[ -n "${prev_fingerprint:-}" ]] && [[ -n "${FETCH_LAST_FINGERPRINT_V1:-}" ]] && [[ "${prev_fingerprint}" != "${FETCH_LAST_FINGERPRINT_V1}" ]]; then
+    echo "E_CHAT_FINGERPRINT_MISMATCH prev_fingerprint=${prev_fingerprint} current_fingerprint=${FETCH_LAST_FINGERPRINT_V1} prev_checkpoint=${prev_checkpoint_id:-none} run_id=${RUN_ID}" >&2
+    if [[ "${PROTO_ENFORCE_FINGERPRINT:-0}" == "1" ]]; then
+      protocol_append_event "FETCH_LAST" "fail" "$PROMPT_HASH" "$(read_last_specialist_checkpoint_id | head -n 1 || true)" "fingerprint_mismatch prev=${prev_fingerprint} current=${FETCH_LAST_FINGERPRINT_V1}"
+      rm -f "$fetch_out"
+      return 77
+    fi
+    echo "W_CHAT_FINGERPRINT_MISMATCH enforce=0 prev_fingerprint=${prev_fingerprint} current_fingerprint=${FETCH_LAST_FINGERPRINT_V1} run_id=${RUN_ID}" >&2
+  fi
 
   checkpoint_id_write="$(write_last_specialist_checkpoint_from_fetch "$fetch_out" 2>/dev/null | head -n 1 || true)"
   if [[ -n "${checkpoint_id_write:-}" ]]; then
     FETCH_LAST_CHECKPOINT_ID="$checkpoint_id_write"
+    echo "CHECKPOINT_UPDATE ok checkpoint_id=${FETCH_LAST_CHECKPOINT_ID} fingerprint_v1=${FETCH_LAST_FINGERPRINT_V1:-none} run_id=${RUN_ID}" >&2
   fi
   if [[ -z "${FETCH_LAST_CHECKPOINT_ID:-}" ]]; then
     FETCH_LAST_CHECKPOINT_ID="$(read_last_specialist_checkpoint_id | head -n 1 || true)"
   fi
-  protocol_append_event "FETCH_LAST" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "user_tail_hash=${FETCH_LAST_USER_TAIL_HASH:-none} asst_tail_hash=${FETCH_LAST_ASSISTANT_TAIL_HASH:-none}"
-  echo "FETCH_LAST done user_tail_hash=${FETCH_LAST_USER_TAIL_HASH:-none} asst_tail_hash=${FETCH_LAST_ASSISTANT_TAIL_HASH:-none} run_id=${RUN_ID}" >&2
+  protocol_append_event "FETCH_LAST" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "chat_id=${FETCH_LAST_CHAT_ID:-none} user_tail_hash=${FETCH_LAST_USER_TAIL_HASH:-none} asst_tail_hash=${FETCH_LAST_ASSISTANT_TAIL_HASH:-none} messages=${FETCH_LAST_TOTAL_MESSAGES:-0} stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} last_user_sig=${FETCH_LAST_LAST_USER_SIG:-none} last_asst_sig=${FETCH_LAST_LAST_ASSISTANT_SIG:-none} last_user_text_sig=${FETCH_LAST_LAST_USER_TEXT_SIG:-none} ui_state=${FETCH_LAST_UI_STATE:-ok} ui_contract_sig=${FETCH_LAST_UI_CONTRACT_SIG:-none} fingerprint_v1=${FETCH_LAST_FINGERPRINT_V1:-none} norm_version=${FETCH_LAST_NORM_VERSION:-none}"
+  echo "FETCH_LAST done chat_id=${FETCH_LAST_CHAT_ID:-none} user_tail_hash=${FETCH_LAST_USER_TAIL_HASH:-none} asst_tail_hash=${FETCH_LAST_ASSISTANT_TAIL_HASH:-none} messages=${FETCH_LAST_TOTAL_MESSAGES:-0} stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} last_user_sig=${FETCH_LAST_LAST_USER_SIG:-none} last_asst_sig=${FETCH_LAST_LAST_ASSISTANT_SIG:-none} last_user_text_sig=${FETCH_LAST_LAST_USER_TEXT_SIG:-none} ui_state=${FETCH_LAST_UI_STATE:-ok} ui_contract_sig=${FETCH_LAST_UI_CONTRACT_SIG:-none} fingerprint_v1=${FETCH_LAST_FINGERPRINT_V1:-none} norm_version=${FETCH_LAST_NORM_VERSION:-none} run_id=${RUN_ID}" >&2
 
   FETCH_LAST_JSON="$fetch_out"
   return 0
+}
+
+postsend_verify_latest_user() {
+  local verify_n verify_out st fields diag_fields fetch_url target_id actual_id
+  local v_total v_stop v_last_user_sig v_last_asst_sig v_chat_id v_ui_contract v_fingerprint v_last_user_text_sig v_last_asst_text_sig
+  local v_user_tail v_asst_tail v_checkpoint_id v_last_user_hash v_after_anchor
+  local verify_timeout_sec verify_poll_ms verify_poll_s verify_deadline
+  local last_seen_user_hash last_seen_user_sig
+  local had_errexit=0
+  case "$-" in
+    *e*) had_errexit=1 ;;
+  esac
+  verify_n="${POSTSEND_VERIFY_FETCH_LAST_N:-4}"
+  [[ "$verify_n" =~ ^[0-9]+$ ]] || verify_n=4
+  (( verify_n < 2 )) && verify_n=2
+  verify_timeout_sec="${POSTSEND_VERIFY_TIMEOUT_SEC:-8}"
+  verify_poll_ms="${POSTSEND_VERIFY_POLL_MS:-400}"
+  [[ "$verify_timeout_sec" =~ ^[0-9]+$ ]] || verify_timeout_sec=8
+  [[ "$verify_poll_ms" =~ ^[0-9]+$ ]] || verify_poll_ms=400
+  (( verify_timeout_sec < 1 )) && verify_timeout_sec=1
+  (( verify_poll_ms < 100 )) && verify_poll_ms=100
+  verify_poll_s="$(awk -v ms="$verify_poll_ms" 'BEGIN { printf "%.3f", ms/1000 }')"
+  verify_deadline=$(( $(date +%s) + verify_timeout_sec ))
+  last_seen_user_hash=""
+  last_seen_user_sig=""
+  echo "POSTSEND_VERIFY start n=${verify_n} timeout_sec=${verify_timeout_sec} poll_ms=${verify_poll_ms} run_id=${RUN_ID}" >&2
+
+  while true; do
+    verify_out="$(mktemp)"
+    set +e
+    python3 "$ROOT/bin/cdp_chatgpt.py" \
+      --cdp-port "$CDP_PORT" \
+      --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
+      --timeout "$timeout_s" \
+      --prompt "$PROMPT" \
+      --fetch-last \
+      --fetch-last-n "$verify_n" >"$verify_out"
+    st=$?
+    if [[ $had_errexit -eq 1 ]]; then
+      set -e
+    else
+      set +e
+    fi
+    if [[ $st -eq 0 ]]; then
+      fields="$(fetch_last_extract_fields "$verify_out" || true)"
+      if [[ -n "${fields:-}" ]]; then
+        IFS=$'\x1f' read -r fetch_url v_user_tail v_asst_tail v_checkpoint_id v_last_user_hash v_after_anchor <<<"$fields"
+        diag_fields="$(fetch_last_extract_diag_fields "$verify_out" || true)"
+        if [[ -n "${diag_fields:-}" ]]; then
+          IFS=$'\x1f' read -r v_total v_stop v_last_user_sig v_last_asst_sig v_chat_id v_ui_contract v_fingerprint v_last_user_text_sig v_last_asst_text_sig _v_ui_state _v_norm_version <<<"$diag_fields"
+        fi
+        target_id="$(chat_id_from_url "${CHATGPT_URL:-}" 2>/dev/null || true)"
+        actual_id="$(chat_id_from_url "${fetch_url:-}" 2>/dev/null || true)"
+        if [[ -n "${target_id:-}" ]] && [[ -n "${actual_id:-}" ]] && [[ "${target_id}" != "${actual_id}" ]]; then
+          rm -f "$verify_out"
+          echo "E_POSTSEND_ROUTE_MISMATCH expected=${target_id} got=${actual_id} run_id=${RUN_ID}" >&2
+          return 2
+        fi
+        last_seen_user_hash="${v_last_user_hash:-}"
+        last_seen_user_sig="${v_last_user_text_sig:-}"
+        if [[ "${v_last_user_hash:-}" == "${PROMPT_HASH:-}" ]] && [[ "${v_last_user_text_sig:-}" == "${PROMPT_SIG:-}" ]]; then
+          echo "POSTSEND_VERIFY last_user_sig=${v_last_user_text_sig:-none} expect_prompt_sig=${PROMPT_SIG:-none} result=OK run_id=${RUN_ID}" >&2
+          rm -f "$verify_out"
+          return 0
+        fi
+      fi
+    fi
+    rm -f "$verify_out"
+    if (( $(date +%s) >= verify_deadline )); then
+      break
+    fi
+    sleep "$verify_poll_s"
+  done
+
+  echo "W_POSTSEND_LAST_USER_MISMATCH expected_prompt_hash=${PROMPT_HASH:-none} got_last_user_hash=${last_seen_user_hash:-none} expected_prompt_sig=${PROMPT_SIG:-none} got_last_user_sig=${last_seen_user_sig:-none} run_id=${RUN_ID}" >&2
+  return 80
 }
 
 late_reply_recover_via_fetch_last() {
@@ -73,18 +187,21 @@ late_reply_recover_via_fetch_last() {
   local timeout_class="${1:-unknown}"
   local elapsed_ms="${2:-0}"
   local trigger="${3:-unknown}"
-  local grace_sec poll_ms stable_need poll_s start_ms now_ms max_ms
+  local grace_sec max_sec poll_ms stable_need poll_s start_ms now_ms max_ms hard_max_ms soft_deadline_ms
   local tmp st fields f_url f_user_tail f_asst_tail f_ckpt f_user_hash f_after_anchor
   local candidate stable_ticks prev_hash checkpoint_id_write
 
   grace_sec="${LATE_REPLY_GRACE_SEC:-30}"
+  max_sec="${LATE_REPLY_MAX_SEC:-120}"
   poll_ms="${LATE_REPLY_POLL_MS:-1500}"
   stable_need="${LATE_REPLY_STABLE_TICKS:-2}"
 
   [[ "$grace_sec" =~ ^[0-9]+$ ]] || grace_sec=30
+  [[ "$max_sec" =~ ^[0-9]+$ ]] || max_sec=120
   [[ "$poll_ms" =~ ^[0-9]+$ ]] || poll_ms=1500
   [[ "$stable_need" =~ ^[0-9]+$ ]] || stable_need=2
   (( grace_sec < 0 )) && grace_sec=0
+  (( max_sec < 1 )) && max_sec=1
   (( poll_ms < 100 )) && poll_ms=100
   (( stable_need < 1 )) && stable_need=1
 
@@ -96,13 +213,18 @@ late_reply_recover_via_fetch_last() {
   poll_s="$(awk -v ms="$poll_ms" 'BEGIN { printf "%.3f", ms/1000 }')"
   start_ms="$(now_ms)"
   max_ms=$((grace_sec * 1000))
+  hard_max_ms=$((max_sec * 1000))
+  soft_deadline_ms=$((start_ms + max_ms))
   stable_ticks=0
   prev_hash=""
 
-  echo "REPLY_LATE_RECOVERY start class=${timeout_class} grace_sec=${grace_sec} poll_ms=${poll_ms} stable_need=${stable_need} run_id=${RUN_ID}" >&2
+  echo "REPLY_LATE_RECOVERY start class=${timeout_class} grace_sec=${grace_sec} max_sec=${max_sec} poll_ms=${poll_ms} stable_need=${stable_need} run_id=${RUN_ID}" >&2
   while true; do
     now_ms="$(now_ms)"
-    if (( now_ms - start_ms >= max_ms )); then
+    if (( now_ms - start_ms >= hard_max_ms )); then
+      break
+    fi
+    if (( now_ms >= soft_deadline_ms )); then
       break
     fi
 
@@ -132,7 +254,7 @@ late_reply_recover_via_fetch_last() {
       sleep "$poll_s"
       continue
     fi
-    IFS=$'\t' read -r f_url f_user_tail f_asst_tail f_ckpt f_user_hash f_after_anchor <<<"$fields"
+    IFS=$'\x1f' read -r f_url f_user_tail f_asst_tail f_ckpt f_user_hash f_after_anchor <<<"$fields"
 
     candidate=0
     if [[ "${f_after_anchor}" == "1" ]] && [[ -n "${f_asst_tail:-}" ]] && [[ "${f_user_hash:-}" == "${PROMPT_HASH:-}" ]]; then
@@ -142,6 +264,9 @@ late_reply_recover_via_fetch_last() {
       else
         stable_ticks=1
         prev_hash="${f_asst_tail}"
+        if (( max_ms > 0 )); then
+          soft_deadline_ms=$((now_ms + max_ms))
+        fi
       fi
     else
       stable_ticks=0
@@ -279,6 +404,45 @@ RUN_SUMMARY_ENABLED=0
 RUN_SUMMARY_WRITTEN=0
 RUN_OUTCOME="unknown"
 RUN_STARTED_MS=0
+RUN_EVIDENCE_CAPTURED=0
+
+emit_iter_result_marker() {
+  local st="$1"
+  local outcome reason send reuse evidence run_dir
+  reason="${RUN_OUTCOME:-unknown}"
+  outcome="FAIL"
+  send=0
+  reuse=0
+  evidence=0
+
+  if [[ "$reason" == reuse_* ]]; then
+    outcome="PASS"
+    reuse=1
+  elif [[ "$reason" == "ok" ]]; then
+    outcome="PASS"
+    send=1
+  elif [[ "$reason" == *"route_mismatch"* ]] \
+    || [[ "$reason" == *"blocked"* ]] \
+    || [[ "$reason" == "no_blind_resend_pending" ]] \
+    || [[ "$reason" == "no_blind_resend_ledger_ready" ]] \
+    || [[ "$reason" == "fetch_last_failed" ]]; then
+    outcome="BLOCK"
+  elif [[ "$st" -eq 0 ]]; then
+    outcome="PASS"
+    send=1
+  fi
+
+  run_dir="$(current_run_dir)"
+  if [[ "${RUN_EVIDENCE_CAPTURED}" == "1" ]]; then
+    evidence=1
+  elif [[ -d "${run_dir}/evidence" ]]; then
+    if find "${run_dir}/evidence" -type f | head -n 1 | grep -q .; then
+      evidence=1
+    fi
+  fi
+
+  echo "ITER_RESULT outcome=${outcome} reason=${reason} send=${send} reuse=${reuse} evidence=${evidence} run_id=${RUN_ID}" >&2
+}
 
 write_run_manifest() {
   local run_dir manifest_path ts_start
@@ -341,6 +505,7 @@ PY
 
 run_summary_finalize_on_exit() {
   local st="$?"
+  local auto_reason=""
   if [[ "${RUN_SUMMARY_ENABLED}" != "1" ]]; then
     return
   fi
@@ -354,9 +519,20 @@ run_summary_finalize_on_exit() {
       RUN_OUTCOME="exit_${st}"
     fi
   fi
+  if [[ "$st" -ne 0 ]] && [[ "${CAPTURE_EVIDENCE}" == "1" ]] && [[ "${RUN_EVIDENCE_CAPTURED}" != "1" ]]; then
+    auto_reason="E_EXIT_${st}"
+    if [[ -n "${RUN_OUTCOME:-}" ]] && [[ "${RUN_OUTCOME}" != "unknown" ]]; then
+      auto_reason="${auto_reason}_${RUN_OUTCOME}"
+    fi
+    set +e
+    capture_evidence_snapshot "${auto_reason}"
+    set -e
+    echo "EVIDENCE_AUTOCAPTURE reason=${auto_reason} exit_status=${st} run_id=${RUN_ID}" >&2
+  fi
   set +e
   write_run_summary "$st"
   RUN_SUMMARY_WRITTEN=1
+  emit_iter_result_marker "$st"
   set -e
 }
 
@@ -364,6 +540,7 @@ capture_evidence_snapshot() {
   local reason="${1:-unknown}"
   local probe_log="${2:-}"
   local run_dir ev_dir ts tabs_json version_json chrome_pid
+  local ops_json ps_txt net_txt env_json cdp_ok
   local contract_tmp contract_status contract_line contract_fail_line
   local probe_reason progress_line progress_after_anchor progress_tail_len progress_tail_hash progress_stop_visible
   local had_errexit=0
@@ -380,8 +557,17 @@ capture_evidence_snapshot() {
 
   tabs_json="$ev_dir/tabs.json"
   version_json="$ev_dir/version.json"
-  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" >"$tabs_json" 2>/dev/null || printf '%s\n' '[]' >"$tabs_json"
-  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/version" >"$version_json" 2>/dev/null || printf '%s\n' '{}' >"$version_json"
+  cdp_ok=0
+  if curl -fsS "http://127.0.0.1:${CDP_PORT}/json/version" >"$version_json" 2>/dev/null; then
+    cdp_ok=1
+  else
+    printf '%s\n' '{}' >"$version_json"
+  fi
+  if [[ "$cdp_ok" == "1" ]]; then
+    curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" >"$tabs_json" 2>/dev/null || printf '%s\n' '[]' >"$tabs_json"
+  else
+    printf '%s\n' '[]' >"$tabs_json"
+  fi
 
   contract_tmp="$(mktemp)"
   set +e
@@ -486,13 +672,64 @@ with open(out, "w", encoding="utf-8") as f:
     f.write(json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n")
 PY
 
+  ops_json="$ev_dir/ops_snapshot.json"
+  ps_txt="$ev_dir/ps.txt"
+  net_txt="$ev_dir/net.txt"
+  env_json="$ev_dir/env.json"
+
+  if [[ -x "$ROOT/bin/ops_snapshot" ]]; then
+    CHATGPT_SEND_CDP_PORT="$CDP_PORT" CHATGPT_SEND_STRICT_SINGLE_CHAT="${STRICT_SINGLE_CHAT:-0}" \
+      "$ROOT/bin/ops_snapshot" --json >"$ops_json" 2>/dev/null || printf '%s\n' '{}' >"$ops_json"
+  else
+    printf '%s\n' '{}' >"$ops_json"
+  fi
+  ps -ef >"$ps_txt" 2>/dev/null || printf '%s\n' 'ps_unavailable' >"$ps_txt"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp >"$net_txt" 2>/dev/null || printf '%s\n' 'ss_failed' >"$net_txt"
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltnp >"$net_txt" 2>/dev/null || printf '%s\n' 'netstat_failed' >"$net_txt"
+  else
+    printf '%s\n' 'net_unavailable' >"$net_txt"
+  fi
+  python3 - "$env_json" "$ts" "$RUN_ID" "$CDP_PORT" "${CHATGPT_URL:-}" "${WORK_CHAT_URL:-}" "$cdp_ok" <<'PY'
+import json,os,sys
+out, ts, run_id, cdp_port, chat_url, work_chat_url, cdp_ok = sys.argv[1:]
+keys = [
+    "CHATGPT_SEND_ROOT",
+    "CHATGPT_SEND_PROFILE_DIR",
+    "CHATGPT_SEND_STRICT_SINGLE_CHAT",
+    "CHATGPT_SEND_AUTO_TAB_HYGIENE",
+    "CHATGPT_SEND_PROTO_ENFORCE_FINGERPRINT",
+    "CHATGPT_SEND_PROTO_ENFORCE_POSTSEND_VERIFY",
+]
+obj = {
+    "ts": int(ts),
+    "run_id": run_id,
+    "cdp_port": int(cdp_port or 0),
+    "chatgpt_url": chat_url,
+    "work_chat_url": work_chat_url,
+    "cdp_ok": int(cdp_ok or 0),
+    "env": {k: os.environ.get(k, "") for k in keys},
+}
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(obj, f, ensure_ascii=False, sort_keys=True)
+PY
+
   sanitize_file_inplace "$tabs_json"
   sanitize_file_inplace "$version_json"
   sanitize_file_inplace "$ev_dir/contract.json"
   sanitize_file_inplace "$ev_dir/probe_last.json"
   sanitize_file_inplace "$ev_dir/process.json"
   sanitize_file_inplace "$ev_dir/doctor.jsonl"
+  sanitize_file_inplace "$ops_json"
+  sanitize_file_inplace "$ps_txt"
+  sanitize_file_inplace "$net_txt"
+  sanitize_file_inplace "$env_json"
 
+  RUN_EVIDENCE_CAPTURED=1
+  if [[ "$cdp_ok" != "1" ]]; then
+    echo "EVIDENCE_PARTIAL cdp_ok=0 reason=${reason} dir=${ev_dir} run_id=${RUN_ID}" >&2
+  fi
   echo "EVIDENCE_CAPTURED reason=${reason} dir=${ev_dir} run_id=${RUN_ID}" >&2
 }
 

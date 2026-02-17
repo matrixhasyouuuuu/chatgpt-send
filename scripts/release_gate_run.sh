@@ -47,6 +47,10 @@ export CHATGPT_SEND_ROOT="$RUNTIME_ROOT"
 export CHATGPT_SEND_PROFILE_DIR="${CHATGPT_SEND_PROFILE_DIR:-$ROOT/state/manual-login-profile}"
 export CHATGPT_SEND_RUN_ID="$RUN_ID"
 export CHATGPT_SEND_LOG_DIR="$RUN_DIR"
+export CHATGPT_SEND_PROTO_ENFORCE_FINGERPRINT=1
+export CHATGPT_SEND_PROTO_ENFORCE_POSTSEND_VERIFY=1
+export CHATGPT_SEND_STRICT_SINGLE_CHAT=1
+export CHATGPT_SEND_AUTO_TAB_HYGIENE=1
 
 echo "RUN_ID=$RUN_ID" | tee "$SUMMARY_FILE"
 echo "RUN_DIR=$RUN_DIR" | tee -a "$SUMMARY_FILE"
@@ -96,6 +100,9 @@ run_one "test_doctor_invariants" "bash test/test_doctor_invariants.sh" || true
 run_one "test_run_manifest_summary" "bash test/test_run_manifest_summary.sh" || true
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
+run_one "test_iter_result_marker" "bash test/test_iter_result_marker.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
 run_one "test_restart_not_allowed_by_default" "bash test/test_restart_not_allowed_by_default.sh" || true
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
@@ -117,6 +124,9 @@ run_one "test_ui_contract_probe" "bash test/test_ui_contract_probe.sh" || true
 run_one "test_evidence_bundle_on_timeout" "bash test/test_evidence_bundle_on_timeout.sh" || true
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
+run_one "test_evidence_partial_cdp_down" "bash test/test_evidence_partial_cdp_down.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
 run_one "test_evidence_sanitizer" "bash test/test_evidence_sanitizer.sh" || true
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
@@ -135,6 +145,9 @@ run_one "test_set_chatgpt_url_protect_mismatch" "bash test/test_set_chatgpt_url_
 run_one "test_strict_single_chat_block" "bash test/test_strict_single_chat_block.sh" || true
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
+run_one "test_tab_hygiene_protects_pinned_active" "bash test/test_tab_hygiene_protects_pinned_active.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
 run_one "test_work_chat_url_priority" "bash test/test_work_chat_url_priority.sh" || true
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
@@ -148,6 +161,9 @@ run_one "test_auto_wait_on_generation" "bash test/test_auto_wait_on_generation.s
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
 run_one "test_reply_wait_polling" "bash test/test_reply_wait_polling.sh" || true
+[[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
+
+run_one "test_postsend_verify_blocks_mismatch" "bash test/test_postsend_verify_blocks_mismatch.sh" || true
 [[ "$RUN_ONE_STATUS" -ne 0 ]] && failed=$((failed+1))
 
 run_one "test_soft_reset_runtime_eval_timeout" "bash test/test_soft_reset_runtime_eval_timeout.sh" || true

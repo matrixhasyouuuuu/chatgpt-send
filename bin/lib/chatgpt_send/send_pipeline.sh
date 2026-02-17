@@ -129,7 +129,7 @@ if [[ $DO_ACK -eq 1 ]]; then
     emit_target_chat_required "${CHATGPT_URL:-none}"
   fi
   ack_fields="$(ack_db_get_fields "$ack_chat_id" || true)"
-  IFS=$'\t' read -r ack_last_fp ack_consumed_fp ack_last_prompt_hash ack_last_anchor <<<"$ack_fields"
+  IFS=$'\x1f' read -r ack_last_fp ack_consumed_fp ack_last_prompt_hash ack_last_anchor <<<"$ack_fields"
   ack_target_fp="${ack_last_fp:-}"
   ack_db_mark_consumed "$ack_chat_id" "$ack_target_fp"
   echo "ACK_WRITE chat_id=${ack_chat_id} reply_fingerprint=${ack_target_fp:-none} consumed_prev=${ack_consumed_fp:-none} run_id=${RUN_ID}" >&2
@@ -172,6 +172,27 @@ if [[ -z "${PROMPT//[[:space:]]/}" ]]; then
   echo "Prompt is empty" >&2
   exit 2
 fi
+
+if [[ "${ENFORCE_ITERATION_PREFIX:-1}" == "1" ]]; then
+  prompt_iter_fields="$(printf '%s' "$PROMPT" | extract_prompt_iteration_prefix | head -n 1 || true)"
+  if [[ -n "${prompt_iter_fields:-}" ]]; then
+    read -r prompt_iter prompt_max <<<"${prompt_iter_fields}"
+    loop_fields="$(chats_db_loop_expected_iteration | head -n 1 || true)"
+    if [[ -n "${loop_fields:-}" ]]; then
+      read -r expected_iter expected_max loop_done <<<"${loop_fields}"
+      if [[ "${prompt_iter:-}" != "${expected_iter:-}" ]] || [[ "${prompt_max:-}" != "${expected_max:-}" ]]; then
+        echo "E_ITERATION_PREFIX_MISMATCH prompt_iter=${prompt_iter:-none}/${prompt_max:-none} expected_iter=${expected_iter:-none}/${expected_max:-none} loop_done=${loop_done:-none} run_id=${RUN_ID}" >&2
+        exit 82
+      fi
+      echo "ITERATION_PREFIX_OK prompt_iter=${prompt_iter}/${prompt_max} expected_iter=${expected_iter}/${expected_max} loop_done=${loop_done} run_id=${RUN_ID}" >&2
+    else
+      echo "W_ITERATION_PREFIX_LOOP_UNSET prompt_iter=${prompt_iter:-none}/${prompt_max:-none} run_id=${RUN_ID}" >&2
+    fi
+  fi
+fi
+
+PROMPT_SIG="$(text_signature "$PROMPT")"
+echo "PROMPT_META prompt_sig=${PROMPT_SIG:-none} norm_version=${NORM_VERSION:-v1} run_id=${RUN_ID}" >&2
 
 echo "PROFILE_DIR path=${PROFILE_DIR} run_id=${RUN_ID}" >&2
 
@@ -241,7 +262,17 @@ fi
 WORK_CHAT_ID="$(chat_id_from_url "${CHATGPT_URL:-}" 2>/dev/null || true)"
 echo "WORK_CHAT url=${CHATGPT_URL:-none} chat_id=${WORK_CHAT_ID:-none} source=${CHAT_URL_SOURCE:-unknown} strict_single_chat=${STRICT_SINGLE_CHAT} run_id=${RUN_ID}" >&2
 
+set +e
+acquire_chat_single_flight_lock "${CHATGPT_URL:-}"
+chat_lock_st=$?
+set -e
+if [[ $chat_lock_st -ne 0 ]]; then
+  RUN_OUTCOME="chat_single_flight_lock_failed"
+  exit "$chat_lock_st"
+fi
+
 PROMPT_HASH="$(printf '%s' "$PROMPT" | stable_hash)"
+LEDGER_LOOKUP_KEY="$(ledger_key_for "${CHATGPT_URL:-}" "${PROMPT_HASH:-}" | head -n 1 || true)"
 ACK_CHAT_ID="$(chat_id_from_url "${CHATGPT_URL:-}" 2>/dev/null || true)"
 ACK_LAST_REPLY_FP=""
 ACK_LAST_CONSUMED_FP=""
@@ -250,12 +281,14 @@ ACK_LAST_ANCHOR_ID=""
 ACK_PENDING_UNACKED=0
 if [[ -n "${ACK_CHAT_ID:-}" ]]; then
   ack_fields="$(ack_db_get_fields "$ACK_CHAT_ID" || true)"
-  IFS=$'\t' read -r ACK_LAST_REPLY_FP ACK_LAST_CONSUMED_FP ACK_LAST_PROMPT_HASH ACK_LAST_ANCHOR_ID <<<"$ack_fields"
+  IFS=$'\x1f' read -r ACK_LAST_REPLY_FP ACK_LAST_CONSUMED_FP ACK_LAST_PROMPT_HASH ACK_LAST_ANCHOR_ID <<<"$ack_fields"
   if [[ -n "${ACK_LAST_REPLY_FP:-}" ]] && [[ "${ACK_LAST_REPLY_FP}" != "${ACK_LAST_CONSUMED_FP:-}" ]]; then
     ACK_PENDING_UNACKED=1
   fi
   if [[ "$ACK_PENDING_UNACKED" -eq 1 ]] && [[ "${PROMPT_HASH:-}" != "${ACK_LAST_PROMPT_HASH:-}" ]]; then
     echo "E_REPLY_UNACKED_BLOCK_SEND chat_id=${ACK_CHAT_ID} reply_fingerprint=${ACK_LAST_REPLY_FP} consumed=${ACK_LAST_CONSUMED_FP:-none} run_id=${RUN_ID}" >&2
+    capture_evidence_snapshot "E_REPLY_UNACKED_BLOCK_SEND" || true
+    echo "ITER_RESULT outcome=BLOCK reason=reply_unacked_block_send send=0 reuse=0 evidence=1 run_id=${RUN_ID}" >&2
     exit 12
   fi
 fi
@@ -320,6 +353,17 @@ FETCH_LAST_LAST_USER_HASH=""
 FETCH_LAST_ASSISTANT_AFTER_LAST_USER="0"
 FETCH_LAST_ASSISTANT_TAIL_HASH=""
 FETCH_LAST_USER_TAIL_HASH=""
+FETCH_LAST_TOTAL_MESSAGES="0"
+FETCH_LAST_STOP_VISIBLE="0"
+FETCH_LAST_LAST_USER_SIG=""
+FETCH_LAST_LAST_ASSISTANT_SIG=""
+FETCH_LAST_CHAT_ID=""
+FETCH_LAST_UI_CONTRACT_SIG=""
+FETCH_LAST_FINGERPRINT_V1=""
+FETCH_LAST_LAST_USER_TEXT_SIG=""
+FETCH_LAST_LAST_ASSISTANT_TEXT_SIG=""
+FETCH_LAST_UI_STATE=""
+FETCH_LAST_NORM_VERSION=""
 
 
 RUN_SUMMARY_ENABLED=1
@@ -344,22 +388,110 @@ if [[ "${STRICT_UI_CONTRACT}" == "1" ]]; then
   fi
 fi
 
+echo "RECOVERY_START run_id=${RUN_ID} chat_url=${CHATGPT_URL:-none}" >&2
 if ! fetch_last_via_cdp; then
+  echo "RECOVERY_DONE fail run_id=${RUN_ID}" >&2
   RUN_OUTCOME="fetch_last_failed"
   if [[ "${FETCH_LAST_REQUIRED}" == "1" ]]; then
     echo "E_FETCH_LAST_FAILED required=1 run_id=${RUN_ID}" >&2
     exit 79
   fi
   echo "W_FETCH_LAST_FAILED required=0 run_id=${RUN_ID}" >&2
+else
+  echo "RECOVERY_DONE ok run_id=${RUN_ID}" >&2
 fi
 
 if [[ -z "${FETCH_LAST_CHECKPOINT_ID:-}" ]]; then
   FETCH_LAST_CHECKPOINT_ID="$(read_last_specialist_checkpoint_id | head -n 1 || true)"
 fi
 
-LEDGER_PROMPT_STATE="$(protocol_prompt_state "${PROMPT_HASH:-}" "${CHATGPT_URL:-}" | head -n 1 || true)"
+# Hard no-duplicate guard:
+# if latest user message already equals this prompt hash, do not resend.
+if [[ -n "${FETCH_LAST_LAST_USER_HASH:-}" ]] && [[ -n "${PROMPT_HASH:-}" ]] \
+  && [[ "${FETCH_LAST_LAST_USER_HASH}" == "${PROMPT_HASH}" ]] \
+  && [[ "${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0}" == "1" ]] \
+  && { [[ -n "${FETCH_LAST_ASSISTANT_TAIL_HASH:-}" ]] || [[ -n "${FETCH_LAST_LAST_ASSISTANT_SIG:-}" ]]; }; then
+  echo "NO_RESEND_PROMPT_ALREADY_PRESENT prompt_hash=${PROMPT_HASH} run_id=${RUN_ID}" >&2
+  if [[ -n "${FETCH_LAST_JSON:-}" ]] && fetch_last_reuse_text_for_prompt "$FETCH_LAST_JSON" "${PROMPT_HASH:-}" >"$out"; then
+    echo "REUSE_EXISTING reason=prompt_already_present run_id=${RUN_ID}" >&2
+    protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=prompt_already_present"
+    protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=prompt_already_present"
+    record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+    RUN_OUTCOME="reuse_existing_prompt_already_present"
+    cat "$out"
+    exit 0
+  fi
+  if [[ "${REPLY_POLLING}" == "1" ]]; then
+    set +e
+    reply_wait_collect_via_probe
+    reply_status=$?
+    set -e
+    if [[ $reply_status -eq 0 ]]; then
+      echo "REUSE_EXISTING reason=prompt_already_present_wait run_id=${RUN_ID}" >&2
+      protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=prompt_already_present_wait"
+      protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=prompt_already_present_wait"
+      record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+      RUN_OUTCOME="reuse_existing_prompt_already_present_wait"
+      cat "$out"
+      exit 0
+    fi
+    if [[ $reply_status -eq 2 ]]; then
+      protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=prompt_already_present_wait route_mismatch"
+      RUN_OUTCOME="prompt_already_present_wait_route_mismatch"
+      echo "chatgpt_send failed (prompt-already-present wait route mismatch)." >&2
+      exit 2
+    fi
+    if [[ $reply_status -eq 76 ]]; then
+      protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=prompt_already_present_wait timeout"
+      RUN_OUTCOME="prompt_already_present_wait_timeout"
+      exit 76
+    fi
+  fi
+  echo "E_NO_BLIND_RESEND ledger_state=none reason=prompt_already_present_no_reply run_id=${RUN_ID}" >&2
+  protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=no_blind_resend_prompt_already_present"
+  capture_evidence_snapshot "E_NO_BLIND_RESEND_PROMPT_ALREADY_PRESENT" || true
+  RUN_OUTCOME="no_blind_resend_prompt_already_present"
+  exit 14
+fi
+
+LEDGER_LAST_EVENT="none"
+LEDGER_LAST_TS=""
+ledger_info="$(protocol_prompt_state_info "${PROMPT_HASH:-}" "${CHATGPT_URL:-}" | head -n 1 || true)"
+IFS=$'\t' read -r LEDGER_PROMPT_STATE LEDGER_LOOKUP_KEY LEDGER_LAST_EVENT LEDGER_LAST_TS <<<"$ledger_info"
 [[ -n "${LEDGER_PROMPT_STATE:-}" ]] || LEDGER_PROMPT_STATE="none"
-echo "LEDGER_CHECK prompt_hash=${PROMPT_HASH:-none} state=${LEDGER_PROMPT_STATE} run_id=${RUN_ID}" >&2
+echo "LEDGER_LOOKUP key=${LEDGER_LOOKUP_KEY:-none} result=${LEDGER_PROMPT_STATE} last_event=${LEDGER_LAST_EVENT:-none} last_ts=${LEDGER_LAST_TS:-none} run_id=${RUN_ID}" >&2
+
+pending_auto_heal_reuse() {
+  # Usage: pending_auto_heal_reuse <trigger> <refresh_fetch_last:0|1>
+  local trigger="${1:-unknown}"
+  local refresh_fetch_last="${2:-0}"
+  local st
+  if [[ "${NO_BLIND_RESEND}" != "1" ]] || [[ "${LEDGER_PROMPT_STATE}" != "pending" ]]; then
+    return 1
+  fi
+  echo "LEDGER_PENDING_AUTO_HEAL start trigger=${trigger} refresh=${refresh_fetch_last} run_id=${RUN_ID}" >&2
+  if [[ "${refresh_fetch_last}" == "1" ]]; then
+    set +e
+    fetch_last_via_cdp
+    st=$?
+    set -e
+    if [[ $st -ne 0 ]]; then
+      echo "LEDGER_PENDING_AUTO_HEAL fetch_last_status=${st} trigger=${trigger} run_id=${RUN_ID}" >&2
+      return 1
+    fi
+  fi
+  if [[ -n "${FETCH_LAST_JSON:-}" ]] && fetch_last_reuse_text_for_prompt "$FETCH_LAST_JSON" "${PROMPT_HASH:-}" >"$out"; then
+    protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=pending_auto_heal trigger=${trigger}"
+    protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=pending_auto_heal trigger=${trigger}"
+    record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+    RUN_OUTCOME="reuse_existing_pending_auto_heal"
+    echo "LEDGER_PENDING_AUTO_HEAL done outcome=ready trigger=${trigger} run_id=${RUN_ID}" >&2
+    cat "$out"
+    exit 0
+  fi
+  echo "LEDGER_PENDING_AUTO_HEAL done outcome=still_pending trigger=${trigger} run_id=${RUN_ID}" >&2
+  return 1
+}
 
 if [[ "${NO_BLIND_RESEND}" == "1" ]] && [[ "${LEDGER_PROMPT_STATE}" == "ready" ]]; then
   if [[ -n "${FETCH_LAST_JSON:-}" ]] && fetch_last_reuse_text_for_prompt "$FETCH_LAST_JSON" "${PROMPT_HASH:-}" >"$out"; then
@@ -377,10 +509,13 @@ if [[ "${NO_BLIND_RESEND}" == "1" ]] && [[ "${LEDGER_PROMPT_STATE}" == "ready" ]
   exit 14
 fi
 
+pending_auto_heal_reuse "post_lookup" "0" || true
+
 if [[ "${SKIP_PRECHECK}" == "1" ]]; then
   PRECHECK_DONE=1
   log_action "precheck" "result=skipped debug=1"
   if [[ "${NO_BLIND_RESEND}" == "1" ]] && [[ "${LEDGER_PROMPT_STATE}" == "pending" ]]; then
+    pending_auto_heal_reuse "skip_precheck_block" "1" || true
     echo "E_NO_BLIND_RESEND ledger_state=pending reason=send_without_reply run_id=${RUN_ID}" >&2
     protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=no_blind_resend_pending_skip_precheck"
     RUN_OUTCOME="no_blind_resend_pending"
@@ -417,6 +552,7 @@ else
     PRECHECK_DONE=1
     log_action "precheck" "result=no_new_reply"
     if [[ "${NO_BLIND_RESEND}" == "1" ]] && [[ "${LEDGER_PROMPT_STATE}" == "pending" ]]; then
+      pending_auto_heal_reuse "precheck_no_new_reply_block" "1" || true
       echo "E_NO_BLIND_RESEND ledger_state=pending reason=send_without_reply run_id=${RUN_ID}" >&2
       protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=no_blind_resend_pending"
       RUN_OUTCOME="no_blind_resend_pending"
@@ -444,6 +580,9 @@ if [[ -n "${ACK_CHAT_ID:-}" ]] && [[ -n "${PROMPT_HASH:-}" ]]; then
   ack_db_mark_prompt "$ACK_CHAT_ID" "$PROMPT_HASH"
 fi
 
+echo "SEND_BASELINE last_user_hash=${FETCH_LAST_LAST_USER_HASH:-none} last_user_sig=${FETCH_LAST_LAST_USER_TEXT_SIG:-none} run_id=${RUN_ID}" >&2
+echo "SEND_START prompt_sig=${PROMPT_SIG:-none} prompt_hash=${PROMPT_HASH:-none} ledger_key=${LEDGER_LOOKUP_KEY:-none} norm_version=${NORM_VERSION:-v1} run_id=${RUN_ID}" >&2
+echo "SEND_DISPATCH attempt=1 run_id=${RUN_ID}" >&2
 set +e
 run_send_checked "initial"
 status=$?
@@ -559,7 +698,34 @@ if [[ $status -ne 0 ]]; then
   fi
   exit $status
 fi
-protocol_append_event "SEND" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=dispatch_ok"
+
+send_confirm_mode="skip_verify"
+if [[ "${PROTO_ENFORCE_POSTSEND_VERIFY:-1}" == "1" ]]; then
+  set +e
+  postsend_verify_latest_user
+  postsend_status=$?
+  set -e
+  if [[ $postsend_status -eq 0 ]]; then
+    send_confirm_mode="fetch_last"
+    echo "SEND_CONFIRMED mode=fetch_last_verify attempt=1 run_id=${RUN_ID}" >&2
+  elif [[ $postsend_status -eq 2 ]]; then
+    protocol_append_event "SEND" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=confirm_route_mismatch status=${postsend_status}"
+    protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=postsend_verify route_mismatch"
+    RUN_OUTCOME="send_confirm_route_mismatch"
+    echo "chatgpt_send failed (postsend route mismatch)." >&2
+    exit 2
+  else
+    echo "E_SEND_NOT_CONFIRMED status=${postsend_status} mode=fetch_last_verify run_id=${RUN_ID}" >&2
+    capture_evidence_snapshot "E_SEND_NOT_CONFIRMED" || true
+    protocol_append_event "SEND" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=confirm_missing status=${postsend_status}"
+    protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=send_confirm status=${postsend_status}"
+    RUN_OUTCOME="send_not_confirmed"
+    exit 81
+  fi
+else
+  echo "SEND_CONFIRMED mode=skip_verify attempt=1 run_id=${RUN_ID}" >&2
+fi
+protocol_append_event "SEND" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=dispatch_confirmed mode=${send_confirm_mode}"
 
 if [[ "${REPLY_POLLING}" == "1" ]]; then
   set +e

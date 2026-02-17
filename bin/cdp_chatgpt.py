@@ -23,6 +23,7 @@ ASSISTANT_STABILITY_SEC = float(os.environ.get("CHATGPT_SEND_ASSISTANT_STABILITY
 ASSISTANT_PROBE_STABILITY_SEC = float(os.environ.get("CHATGPT_SEND_ASSISTANT_PROBE_STABILITY_SEC", "0.4"))
 ASSISTANT_STABILITY_POLL_SEC = float(os.environ.get("CHATGPT_SEND_ASSISTANT_STABILITY_POLL_SEC", "0.2"))
 UI_CONTRACT_SCHEMA_VERSION = "v1"
+NORM_VERSION = "v1"
 
 
 def progress(msg: str) -> None:
@@ -243,6 +244,39 @@ def js_fetch_last_expr(limit: int) -> str:
   const text = (el) => (el && (el.innerText || el.textContent)) ? (el.innerText || el.textContent) : "";
 
   const stop = q('button[data-testid="stop-button"], button[aria-label*="Stop"]');
+  const composer =
+    q('#prompt-textarea[contenteditable="true"]') ||
+    q('#prompt-textarea') ||
+    q('[contenteditable="true"].ProseMirror');
+  const form = composer ? (composer.closest('form') || document) : document;
+  const sendBtn =
+    form.querySelector('button[data-testid="send-button"]') ||
+    form.querySelector('button[aria-label="Send prompt"]') ||
+    form.querySelector('button[aria-label*="Send"]') ||
+    form.querySelector('button[type="submit"]');
+  const bodyText = ((document.body && (document.body.innerText || document.body.textContent)) || '').toLowerCase();
+  const hasLoginText = /\\b(log in|sign in)\\b/.test(bodyText);
+  const hasCaptchaText = /(verify you are human|captcha|cloudflare|checking your browser)/.test(bodyText);
+  const hasOfflineText = /(you\\s*'?re offline|offline|check your internet connection|network error)/.test(bodyText);
+  const hasErrorBanner = /(something went wrong|try again|an error occurred|unable to load conversation)/.test(bodyText);
+  const hasCaptchaMarker =
+    !!q('#challenge-running, #cf-challenge-running, [id*=\"cf-challenge\"]') ||
+    !!q('iframe[src*=\"challenges.cloudflare.com\"], iframe[src*=\"captcha\"]');
+  const hasLoginForm =
+    !!q('input[type=\"password\"]') ||
+    !!q('form[action*=\"login\"], form[action*=\"signin\"]');
+  let uiState = 'ok';
+  if (!composer && (hasCaptchaMarker || hasCaptchaText)) {{
+    uiState = 'captcha';
+  }} else if (!composer && (hasLoginForm || hasLoginText)) {{
+    uiState = 'login';
+  }} else if (!composer && hasOfflineText) {{
+    uiState = 'offline';
+  }} else if (!composer && hasErrorBanner) {{
+    uiState = 'error_banner';
+  }} else if (!composer) {{
+    uiState = 'composer_missing';
+  }}
   const all = Array.from(document.querySelectorAll('[data-message-author-role]'))
     .map((el) => {{
       const role = (el.getAttribute('data-message-author-role') || '').trim();
@@ -270,6 +304,9 @@ def js_fetch_last_expr(limit: int) -> str:
   return {{
     url: location.href,
     stopVisible: !!stop,
+    hasComposer: !!composer,
+    hasSendButton: !!sendBtn,
+    ui_state_hint: uiState,
     total: all.length,
     limit: lim,
     messages: selected,
@@ -309,13 +346,33 @@ def js_send_expr(prompt: str) -> str:
     return f"""
 (() => {{
   const text = {p};
+  const norm = (s) => (s || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
   const q = (sel) => document.querySelector(sel);
   const ed =
     q('#prompt-textarea[contenteditable="true"]') ||
     q('#prompt-textarea') ||
     q('[contenteditable="true"].ProseMirror');
   if (!ed) return {{ok:false, error:'prompt editor not found'}};
-  // Clear + insert text in a way ProseMirror/React will notice.
+  // Hard clear first: prevents accidental send of stale editor content.
+  const before = norm(ed.innerText || ed.textContent || '');
+  if (before) {{
+    try {{
+      ed.focus();
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(ed);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      document.execCommand('insertText', false, '');
+    }} catch (e) {{
+      ed.textContent = '';
+      ed.dispatchEvent(new Event('input', {{bubbles:true}}));
+    }}
+    const afterClear = norm(ed.innerText || ed.textContent || '');
+    if (afterClear) return {{ok:false, error:'composer_not_cleared', beforeLen: before.length, afterClearLen: afterClear.length}};
+  }}
+
+  // Insert text in a way ProseMirror/React will notice.
   try {{
     ed.focus();
     const sel = window.getSelection();
@@ -329,8 +386,10 @@ def js_send_expr(prompt: str) -> str:
     ed.textContent = text;
     ed.dispatchEvent(new Event('input', {{bubbles:true}}));
   }}
-  const inserted = (ed.innerText || '').trim();
+  const inserted = norm(ed.innerText || ed.textContent || '');
+  const expected = norm(text);
   if (!inserted) return {{ok:false, error:'failed to insert prompt text'}};
+  if (inserted !== expected) return {{ok:false, error:'prompt_insert_mismatch', insertedPreview: inserted.slice(0, 80), expectedPreview: expected.slice(0, 80)}};
 
   const form = ed.closest('form') || document;
   const btn =
@@ -434,14 +493,19 @@ def js_click_stop_expr() -> str:
 
 def normalize_assistant_text(s: str) -> str:
     # Normalize whitespace and strip transient typing cursor glyphs.
-    txt = re.sub(r"\s+", " ", (s or "").strip())
+    txt = canonical_normalize_text(s)
     txt = re.sub(r"[▍▋▌]+\s*$", "", txt).strip()
     return txt
 
 
-def normalize_text_for_compare(s: str) -> str:
+def canonical_normalize_text(s: str) -> str:
     txt = (s or "").replace("\u00a0", " ")
+    txt = txt.replace("\r\n", "\n").replace("\r", "\n")
     return re.sub(r"\s+", " ", txt.strip())
+
+
+def normalize_text_for_compare(s: str) -> str:
+    return canonical_normalize_text(s)
 
 
 def stable_text_hash(s: str) -> str:
@@ -449,6 +513,14 @@ def stable_text_hash(s: str) -> str:
     if not norm:
         return ""
     return hashlib.sha256(norm.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def text_signature(s: str) -> str:
+    norm = normalize_text_for_compare(s)
+    if not norm:
+        return ""
+    h = hashlib.sha256(norm.encode("utf-8", errors="ignore")).hexdigest()
+    return f"{h[:12]}:{len(norm)}"
 
 
 def reply_fingerprint_and_anchor(prompt: str, st: dict) -> tuple[str, str]:
@@ -947,6 +1019,7 @@ def fetch_last_messages(cdp: CDP, target_url: str, limit: int = 6) -> dict:
     sys.stderr.flush()
 
     st = cdp.eval(js_fetch_last_expr(n), timeout=20.0) or {}
+    ready = cdp.eval(js_send_ready_expr(), timeout=10.0) or {}
     messages = st.get("messages") or []
 
     clean_msgs: list[dict] = []
@@ -972,19 +1045,69 @@ def fetch_last_messages(cdp: CDP, target_url: str, limit: int = 6) -> dict:
     last_assistant = ""
     last_user_idx = -1
     last_assistant_idx = -1
+    last_user_sig = ""
+    last_assistant_sig = ""
     for i, m in enumerate(clean_msgs):
         if m.get("role") == "user":
             last_user_idx = i
             last_user = m.get("text") or ""
+            last_user_sig = (m.get("sig") or "").strip()
         elif m.get("role") == "assistant":
             last_assistant_idx = i
             last_assistant = m.get("text") or ""
+            last_assistant_sig = (m.get("sig") or "").strip()
 
     assistant_after_last_user = last_assistant_idx > last_user_idx >= 0
+    chat_url = normalize_url(st.get("url") or target_url)
+    chat_id = chat_id_from_url(chat_url) or ""
+    total_messages = int(st.get("total") or len(clean_msgs))
+    stop_visible = bool(st.get("stopVisible"))
+    has_composer = bool(st.get("hasComposer")) or bool(ready.get("hasEditor"))
+    has_send_button = bool(st.get("hasSendButton")) or bool(ready.get("hasSend"))
+    ui_state = str(st.get("ui_state_hint") or "unknown").strip() or "unknown"
+    if ui_state == "composer_missing" and has_composer:
+        ui_state = "ok"
+    if ui_state == "ok" and (not has_composer) and (not stop_visible):
+        ui_state = "composer_missing"
+    sys.stderr.write(
+        "FETCH_LAST ui_state="
+        f"{ui_state}"
+        f" has_composer={1 if has_composer else 0}"
+        f" has_send_button={1 if has_send_button else 0}"
+        f" stop_visible={1 if stop_visible else 0}\n"
+    )
+    sys.stderr.flush()
+    if ui_state != "ok":
+        error_marker("E_UI_NOT_READY", f"ui_state={ui_state}")
+        raise RuntimeError(f"UI not ready: ui_state={ui_state}")
+    has_editor = bool(ready.get("hasEditor"))
+    has_send = bool(ready.get("hasSend"))
+    ui_contract_sig = (
+        f"schema={UI_CONTRACT_SCHEMA_VERSION}"
+        f"|composer={1 if has_editor else 0}"
+        f"|send={1 if has_send else 0}"
+        f"|stop={1 if stop_visible else 0}"
+        f"|assistant_after_anchor={1 if assistant_after_last_user else 0}"
+    )
+    # Keep chat fingerprint stable across normal conversation growth.
+    # Route correctness is guarded by chat_id/url checks; fingerprint is for
+    # chat identity + UI schema invariants, not per-message content.
+    fingerprint_payload = "\n".join(
+        [
+            chat_id,
+            f"schema={UI_CONTRACT_SCHEMA_VERSION}",
+            f"editor={1 if has_editor else 0}",
+        ]
+    )
+    fingerprint_v1 = hashlib.sha256(
+        fingerprint_payload.encode("utf-8", errors="ignore")
+    ).hexdigest()
     user_tail = normalize_text_for_compare(last_user)[-500:]
     assistant_tail = normalize_text_for_compare(last_assistant)[-500:]
     user_tail_hash = stable_text_hash(user_tail) if user_tail else ""
     assistant_tail_hash = stable_text_hash(assistant_tail) if assistant_tail else ""
+    last_user_text_sig = text_signature(last_user)
+    assistant_text_sig = text_signature(last_assistant)
     checkpoint_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     checkpoint_id = f"SPC-{checkpoint_ts}-{(assistant_tail_hash[:8] if assistant_tail_hash else 'none')}"
 
@@ -996,18 +1119,28 @@ def fetch_last_messages(cdp: CDP, target_url: str, limit: int = 6) -> dict:
     sys.stderr.flush()
 
     return {
-        "url": normalize_url(st.get("url") or target_url),
-        "stop_visible": bool(st.get("stopVisible")),
-        "total_messages": int(st.get("total") or len(clean_msgs)),
+        "url": chat_url,
+        "chat_id": chat_id,
+        "stop_visible": stop_visible,
+        "total_messages": total_messages,
         "limit": n,
         "assistant_after_last_user": bool(assistant_after_last_user),
         "last_user_text": last_user,
+        "last_user_text_sig": last_user_text_sig,
+        "last_user_sig": last_user_sig,
         "last_user_hash": stable_text_hash(last_user),
         "assistant_text": last_assistant,
+        "assistant_text_sig": assistant_text_sig,
+        "last_assistant_sig": last_assistant_sig,
         "assistant_tail_hash": assistant_tail_hash,
         "assistant_tail_len": len(assistant_tail),
         "assistant_preview": normalize_text_for_compare(last_assistant)[:220],
         "user_tail_hash": user_tail_hash,
+        "ui_state": ui_state,
+        "ui_contract_sig": ui_contract_sig,
+        "ui_contract_schema_version": UI_CONTRACT_SCHEMA_VERSION,
+        "norm_version": NORM_VERSION,
+        "fingerprint_v1": fingerprint_v1,
         "checkpoint_id": checkpoint_id,
         "ts": checkpoint_ts,
         "messages": clean_msgs,

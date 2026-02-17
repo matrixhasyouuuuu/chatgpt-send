@@ -125,6 +125,58 @@ log_action() {
   fi
 }
 
+extract_prompt_iteration_prefix() {
+  # Prints: "<iter> <max>" if prompt starts with "Iteration X/Y", else empty.
+  python3 -c '
+import re,sys
+text=sys.stdin.read()
+line=""
+if text:
+    line=(text.splitlines() or [""])[0]
+m=re.match(r"^\s*Iteration\s+(\d+)\s*/\s*(\d+)\b", line, flags=re.IGNORECASE)
+if not m:
+    raise SystemExit(0)
+print(f"{int(m.group(1))} {int(m.group(2))}")
+'
+}
+
+chats_db_loop_expected_iteration() {
+  # Prints: "<expected_iter> <loop_max> <loop_done>" for active session, else empty.
+  local active
+  active="$(chats_db_get_active_name | head -n 1 || true)"
+  [[ -n "${active:-}" ]] || return 0
+  chats_db_read | python3 -c '
+import json,sys
+active=sys.argv[1]
+try:
+    db=json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+c=(db.get("chats") or {}).get(active) or {}
+lm=c.get("loop_max")
+if lm is None:
+    raise SystemExit(0)
+try:
+    lm=int(lm)
+except Exception:
+    raise SystemExit(0)
+if lm <= 0:
+    raise SystemExit(0)
+try:
+    ld=int(c.get("loop_done") or 0)
+except Exception:
+    ld=0
+if ld < 0:
+    ld=0
+if ld > lm:
+    ld=lm
+expected=ld + 1
+if expected > lm:
+    expected = lm
+print(f"{expected} {lm} {ld}")
+' "$active"
+}
+
 now_ms() {
   date +%s%3N 2>/dev/null || python3 - <<'PY'
 import time
@@ -544,6 +596,7 @@ stable_hash() {
   python3 -c '
 import hashlib, re, sys
 text = sys.stdin.read()
+text = text.replace("\u00a0", " ").replace("\r\n", "\n").replace("\r", "\n")
 norm = re.sub(r"\s+", " ", text.strip())
 if not norm:
     print("")
@@ -552,19 +605,188 @@ else:
 '
 }
 
+text_signature() {
+  # Usage: text_signature <text>
+  # stdout: <sha256_prefix12>:<normalized_len> (or empty)
+  python3 - "${1:-}" <<'PY'
+import hashlib
+import re
+import sys
+
+text = (sys.argv[1] or "")
+text = text.replace("\u00a0", " ").replace("\r\n", "\n").replace("\r", "\n")
+norm = re.sub(r"\s+", " ", text.strip())
+if not norm:
+    print("")
+else:
+    h = hashlib.sha256(norm.encode("utf-8", errors="ignore")).hexdigest()
+    print(f"{h[:12]}:{len(norm)}")
+PY
+}
+
+ledger_key_for() {
+  # Usage: ledger_key_for <chat_url> <prompt_hash>
+  local chat_url="${1:-}"
+  local prompt_hash="${2:-}"
+  if [[ -z "${chat_url//[[:space:]]/}" ]] || [[ -z "${prompt_hash//[[:space:]]/}" ]]; then
+    printf '%s\n' ""
+    return 0
+  fi
+  python3 - "$chat_url" "$prompt_hash" <<'PY'
+import hashlib
+import sys
+chat_url = (sys.argv[1] or "").strip()
+prompt_hash = (sys.argv[2] or "").strip()
+if not chat_url or not prompt_hash:
+    print("")
+else:
+    print(hashlib.sha256((chat_url + "\n" + prompt_hash).encode("utf-8", errors="ignore")).hexdigest())
+PY
+}
+
+acquire_chat_single_flight_lock() {
+  # Usage: acquire_chat_single_flight_lock <chat_url>
+  # Returns non-zero only when lock acquisition fails.
+  local chat_url="${1:-}"
+  local key lock_file timeout_s st
+  CHAT_SINGLE_FLIGHT_HELD=0
+  CHAT_SINGLE_FLIGHT_FILE=""
+  CHAT_SINGLE_FLIGHT_KEY=""
+  if [[ "${CHAT_SINGLE_FLIGHT}" != "1" ]]; then
+    return 0
+  fi
+  if ! is_chat_conversation_url "${chat_url:-}"; then
+    return 0
+  fi
+  timeout_s="${CHAT_SINGLE_FLIGHT_TIMEOUT_SEC:-20}"
+  [[ "$timeout_s" =~ ^[0-9]+$ ]] || timeout_s=20
+  (( timeout_s < 1 )) && timeout_s=1
+  key="$(printf '%s' "$chat_url" | stable_hash | cut -c1-16)"
+  [[ -n "${key:-}" ]] || key="none"
+  mkdir -p "${CHAT_SINGLE_FLIGHT_LOCK_DIR}" >/dev/null 2>&1 || true
+  lock_file="${CHAT_SINGLE_FLIGHT_LOCK_DIR}/chat_${key}.lock"
+  CHAT_SINGLE_FLIGHT_FILE="$lock_file"
+  CHAT_SINGLE_FLIGHT_KEY="$key"
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "W_CHAT_SINGLE_FLIGHT_NO_FLOCK key=${key} chat_url=${chat_url} run_id=${RUN_ID}" >&2
+    return 0
+  fi
+  exec {CHAT_SINGLE_FLIGHT_FD}>"$lock_file"
+  set +e
+  flock -x -w "$timeout_s" -E 75 "$CHAT_SINGLE_FLIGHT_FD"
+  st=$?
+  set -e
+  if [[ $st -ne 0 ]]; then
+    exec {CHAT_SINGLE_FLIGHT_FD}>&- || true
+    CHAT_SINGLE_FLIGHT_FILE=""
+    CHAT_SINGLE_FLIGHT_KEY=""
+    if [[ $st -eq 75 ]]; then
+      echo "E_CHAT_SINGLE_FLIGHT_TIMEOUT key=${key} timeout_sec=${timeout_s} chat_url=${chat_url} run_id=${RUN_ID}" >&2
+      return 75
+    fi
+    echo "E_CHAT_SINGLE_FLIGHT_FAIL key=${key} status=${st} chat_url=${chat_url} run_id=${RUN_ID}" >&2
+    return "$st"
+  fi
+  CHAT_SINGLE_FLIGHT_HELD=1
+  echo "CHAT_SINGLE_FLIGHT acquired key=${key} lock_file=${lock_file} chat_url=${chat_url} run_id=${RUN_ID}" >&2
+  return 0
+}
+
 read_last_specialist_checkpoint_id() {
   if [[ -f "$LAST_SPECIALIST_CHECKPOINT_FILE" ]]; then
-    python3 - "$LAST_SPECIALIST_CHECKPOINT_FILE" <<'PY'
-import json,sys
-path=sys.argv[1]
+    python3 - "$LAST_SPECIALIST_CHECKPOINT_FILE" "$CHECKPOINT_LOCK_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
 try:
-    with open(path,"r",encoding="utf-8") as f:
-        obj=json.load(f)
+    import fcntl
 except Exception:
-    raise SystemExit(0)
-cid=(obj.get("checkpoint_id") or "").strip()
-if cid:
-    print(cid)
+    fcntl = None
+
+path = pathlib.Path(sys.argv[1])
+lock_path = pathlib.Path(sys.argv[2])
+try:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+try:
+    lockf = lock_path.open("a+", encoding="utf-8")
+except Exception:
+    lockf = None
+try:
+    if lockf and fcntl:
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_SH)
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        raise SystemExit(0)
+    cid = (obj.get("checkpoint_id") or "").strip()
+    if cid:
+        print(cid)
+finally:
+    if lockf and fcntl:
+        try:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+    if lockf:
+        lockf.close()
+PY
+  fi
+}
+
+read_last_specialist_checkpoint_fields() {
+  # Usage: read_last_specialist_checkpoint_fields
+  # stdout (US-delimited): chat_url \x1f chat_id \x1f fingerprint_v1 \x1f checkpoint_id \x1f last_user_text_sig
+  if [[ -f "$LAST_SPECIALIST_CHECKPOINT_FILE" ]]; then
+    python3 - "$LAST_SPECIALIST_CHECKPOINT_FILE" "$CHECKPOINT_LOCK_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    import fcntl
+except Exception:
+    fcntl = None
+
+path = pathlib.Path(sys.argv[1])
+lock_path = pathlib.Path(sys.argv[2])
+try:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+try:
+    lockf = lock_path.open("a+", encoding="utf-8")
+except Exception:
+    lockf = None
+try:
+    if lockf and fcntl:
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_SH)
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        raise SystemExit(0)
+    vals = [
+        str(obj.get("chat_url") or "").strip(),
+        str(obj.get("chat_id") or "").strip(),
+        str(obj.get("fingerprint_v1") or "").strip(),
+        str(obj.get("checkpoint_id") or "").strip(),
+        str(obj.get("last_user_text_sig") or "").strip(),
+    ]
+    sep = "\x1f"
+    vals = [v.replace(sep, " ").replace("\n", " ") for v in vals]
+    print(sep.join(vals))
+finally:
+    if lockf and fcntl:
+        try:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+    if lockf:
+        lockf.close()
 PY
   fi
 }
@@ -603,19 +825,32 @@ protocol_append_event() {
   local iter
   iter="$(protocol_iter_value | head -n 1 || true)"
   mkdir -p "$(dirname "$PROTOCOL_LOG")" >/dev/null 2>&1 || true
-  python3 - "$PROTOCOL_LOG" "$RUN_ID" "${CHATGPT_URL:-}" "$prompt_hash" "$checkpoint_id" "$action" "$status" "$meta" "$iter" <<'PY'
+  python3 - "$PROTOCOL_LOG" "$PROTOCOL_LOCK_FILE" "$RUN_ID" "${CHATGPT_URL:-}" "$prompt_hash" "$checkpoint_id" "$action" "$status" "$meta" "$iter" <<'PY'
 import datetime as dt
+import hashlib
 import json
+import os
 import pathlib
 import sys
 
-path, run_id, chat_url, prompt_hash, checkpoint_id, action, status, meta, iter_value = sys.argv[1:]
+try:
+    import fcntl
+except Exception:
+    fcntl = None
+
+path, lock_path, run_id, chat_url, prompt_hash, checkpoint_id, action, status, meta, iter_value = sys.argv[1:]
+chat_url = (chat_url or "").strip()
+prompt_hash = (prompt_hash or "").strip()
+ledger_key = ""
+if chat_url and prompt_hash:
+    ledger_key = hashlib.sha256((chat_url + "\n" + prompt_hash).encode("utf-8", errors="ignore")).hexdigest()
 obj = {
     "ts": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "run_id": run_id,
     "iter": iter_value,
     "chat_url": chat_url,
     "prompt_hash": prompt_hash,
+    "ledger_key": ledger_key,
     "specialist_checkpoint_id": checkpoint_id,
     "action": action,
     "status": status,
@@ -623,8 +858,107 @@ obj = {
 }
 p = pathlib.Path(path)
 p.parent.mkdir(parents=True, exist_ok=True)
-with p.open("a", encoding="utf-8") as f:
-    f.write(json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n")
+lp = pathlib.Path(lock_path)
+lp.parent.mkdir(parents=True, exist_ok=True)
+with lp.open("a+", encoding="utf-8") as lf:
+    if fcntl:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    if fcntl:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+PY
+}
+
+protocol_prompt_state_info() {
+  # Usage: protocol_prompt_state_info <prompt_hash> <chat_url>
+  # stdout: state \t ledger_key \t last_event \t last_ts
+  local prompt_hash="${1:-}"
+  local chat_url="${2:-}"
+  python3 - "$PROTOCOL_LOG" "$PROTOCOL_LOCK_FILE" "$prompt_hash" "$chat_url" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+try:
+    import fcntl
+except Exception:
+    fcntl = None
+
+path, lock_path, prompt_hash, chat_url = sys.argv[1], sys.argv[2], (sys.argv[3] or "").strip(), (sys.argv[4] or "").strip()
+ledger_key = ""
+if prompt_hash and chat_url:
+    ledger_key = hashlib.sha256((chat_url + "\n" + prompt_hash).encode("utf-8", errors="ignore")).hexdigest()
+p = pathlib.Path(path)
+if not p.exists() or not prompt_hash or not chat_url:
+    print(f"none\t{ledger_key}\tnone\t")
+    raise SystemExit(0)
+
+lp = pathlib.Path(lock_path)
+lp.parent.mkdir(parents=True, exist_ok=True)
+lockf = lp.open("a+", encoding="utf-8")
+if fcntl:
+    fcntl.flock(lockf.fileno(), fcntl.LOCK_SH)
+
+last_send = -1
+last_ready = -1
+last_event = "none"
+last_ts = ""
+idx = 0
+try:
+    with p.open("r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            idx += 1
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                sys.stderr.write(f"W_LEDGER_CORRUPT_LINE_SKIPPED line={idx}\n")
+                continue
+            obj_chat = (obj.get("chat_url") or "").strip()
+            obj_hash = (obj.get("prompt_hash") or "").strip()
+            obj_key = (obj.get("ledger_key") or "").strip()
+            matched = False
+            if ledger_key and obj_key:
+                matched = obj_key == ledger_key
+            elif obj_chat and obj_hash:
+                matched = (obj_chat == chat_url and obj_hash == prompt_hash)
+            if not matched:
+                continue
+            action = (obj.get("action") or "").strip()
+            status = (obj.get("status") or "").strip()
+            ts = (obj.get("ts") or "").strip()
+            if action == "SEND" and status == "ok":
+                last_send = idx
+                last_event = "SEND"
+                last_ts = ts
+            if action in ("REPLY_READY", "REUSE_EXISTING") and status == "ok":
+                last_ready = idx
+                last_event = action
+                last_ts = ts
+finally:
+    if fcntl:
+        try:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+    lockf.close()
+
+if last_send < 0:
+    state = "none"
+elif last_ready > last_send:
+    state = "ready"
+else:
+    state = "pending"
+print(f"{state}\t{ledger_key}\t{last_event}\t{last_ts}")
 PY
 }
 
@@ -633,50 +967,26 @@ protocol_prompt_state() {
   # stdout: one of none|pending|ready
   local prompt_hash="${1:-}"
   local chat_url="${2:-}"
-  python3 - "$PROTOCOL_LOG" "$prompt_hash" "$chat_url" <<'PY'
-import json,sys,pathlib
-path,prompt_hash,chat_url=sys.argv[1],sys.argv[2],sys.argv[3]
-p=pathlib.Path(path)
-if not p.exists() or not prompt_hash or not chat_url:
-    print("none")
-    raise SystemExit(0)
-last_send=-1
-last_ready=-1
-idx=0
-for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-    idx += 1
-    line=line.strip()
-    if not line:
-      continue
-    try:
-      obj=json.loads(line)
-    except Exception:
-      continue
-    if (obj.get("chat_url") or "") != chat_url:
-      continue
-    if (obj.get("prompt_hash") or "") != prompt_hash:
-      continue
-    action=(obj.get("action") or "").strip()
-    status=(obj.get("status") or "").strip()
-    if action == "SEND" and status == "ok":
-      last_send=idx
-    if action in ("REPLY_READY","REUSE_EXISTING") and status == "ok":
-      last_ready=idx
-if last_send < 0:
-    print("none")
-elif last_ready > last_send:
-    print("ready")
-else:
-    print("pending")
-PY
+  protocol_prompt_state_info "$prompt_hash" "$chat_url" | awk -F'\t' '{print $1}'
 }
 
 write_last_specialist_checkpoint_from_fetch() {
   # Usage: write_last_specialist_checkpoint_from_fetch <fetch_json_path>
   local fetch_json="$1"
-  python3 - "$fetch_json" "$LAST_SPECIALIST_CHECKPOINT_FILE" <<'PY'
-import json, pathlib, re, sys
-src, dst = sys.argv[1], sys.argv[2]
+  python3 - "$fetch_json" "$LAST_SPECIALIST_CHECKPOINT_FILE" "$CHECKPOINT_LOCK_FILE" <<'PY'
+import json
+import os
+import pathlib
+import re
+import sys
+import tempfile
+
+try:
+    import fcntl
+except Exception:
+    fcntl = None
+
+src, dst, lock_path = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     with open(src, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -691,24 +1001,83 @@ if not assistant_hash:
     raise SystemExit(0)
 assistant_len = int(data.get("assistant_tail_len") or 0)
 summary = norm(data.get("assistant_preview") or data.get("assistant_text") or "")[:220]
+messages = data.get("messages") or []
+last_user_sig = (data.get("last_user_sig") or "").strip()
+last_assistant_sig = (data.get("last_assistant_sig") or "").strip()
+last_user_text_sig = (data.get("last_user_text_sig") or "").strip()
+assistant_text_sig = (data.get("assistant_text_sig") or "").strip()
+if not last_user_sig or not last_assistant_sig:
+    for m in messages:
+        role = (m.get("role") or "").strip()
+        sig = (m.get("sig") or "").strip()
+        if role == "user" and sig:
+            last_user_sig = sig
+        if role == "assistant" and sig:
+            last_assistant_sig = sig
+if not last_user_text_sig:
+    user_text = (data.get("last_user_text") or "").strip()
+    if user_text:
+        import hashlib
+        user_norm = norm(user_text)
+        if user_norm:
+            last_user_text_sig = hashlib.sha256(user_norm.encode("utf-8", errors="ignore")).hexdigest()[:12] + ":" + str(len(user_norm))
+if not assistant_text_sig:
+    assistant_text = (data.get("assistant_text") or "").strip()
+    if assistant_text:
+        import hashlib
+        assistant_norm = norm(assistant_text)
+        if assistant_norm:
+            assistant_text_sig = hashlib.sha256(assistant_norm.encode("utf-8", errors="ignore")).hexdigest()[:12] + ":" + str(len(assistant_norm))
 obj = {
     "chat_url": (data.get("url") or "").strip(),
+    "chat_id": (data.get("chat_id") or "").strip(),
     "checkpoint_id": (data.get("checkpoint_id") or "").strip(),
     "assistant_tail_hash": assistant_hash,
     "assistant_tail_len": assistant_len,
+    "last_user_sig": last_user_sig,
+    "last_user_text_sig": last_user_text_sig,
+    "last_assistant_sig": last_assistant_sig,
+    "assistant_text_sig": assistant_text_sig,
+    "total_messages": int(data.get("total_messages") or data.get("total") or len(messages)),
+    "ui_state": (data.get("ui_state") or "").strip(),
+    "ui_contract_sig": (data.get("ui_contract_sig") or "").strip(),
+    "fingerprint_v1": (data.get("fingerprint_v1") or "").strip(),
+    "norm_version": (data.get("norm_version") or "").strip(),
     "summary": summary,
     "ts": (data.get("ts") or "").strip(),
 }
 p = pathlib.Path(dst)
 p.parent.mkdir(parents=True, exist_ok=True)
-p.write_text(json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+lp = pathlib.Path(lock_path)
+lp.parent.mkdir(parents=True, exist_ok=True)
+with lp.open("a+", encoding="utf-8") as lf:
+    if fcntl:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.tmp-", dir=str(p.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_name, p)
+    finally:
+        if os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except Exception:
+                pass
+    if fcntl:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 print(obj.get("checkpoint_id") or "")
 PY
 }
 
 fetch_last_extract_fields() {
   # Usage: fetch_last_extract_fields <fetch_json_path>
-  # stdout: url \t user_tail_hash \t assistant_tail_hash \t checkpoint_id \t last_user_hash \t assistant_after_last_user
+  # stdout (US-delimited): url \x1f user_tail_hash \x1f assistant_tail_hash \x1f checkpoint_id \x1f last_user_hash \x1f assistant_after_last_user
   local fetch_json="$1"
   python3 - "$fetch_json" <<'PY'
 import json,sys
@@ -723,8 +1092,50 @@ vals=[
   (d.get("last_user_hash") or "").strip(),
   "1" if d.get("assistant_after_last_user") else "0",
 ]
-vals=[v.replace("\t"," ").replace("\n"," ") for v in vals]
-print("\t".join(vals))
+sep="\x1f"
+vals=[v.replace(sep," ").replace("\n"," ") for v in vals]
+print(sep.join(vals))
+PY
+}
+
+fetch_last_extract_diag_fields() {
+  # Usage: fetch_last_extract_diag_fields <fetch_json_path>
+  # stdout (US-delimited): total_messages \x1f stop_visible \x1f last_user_sig \x1f last_assistant_sig \x1f chat_id \x1f ui_contract_sig \x1f fingerprint_v1 \x1f last_user_text_sig \x1f assistant_text_sig \x1f ui_state \x1f norm_version
+  local fetch_json="$1"
+  python3 - "$fetch_json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    d = json.load(f)
+messages = d.get("messages") or []
+last_user_sig = (d.get("last_user_sig") or "").strip()
+last_assistant_sig = (d.get("last_assistant_sig") or "").strip()
+if not last_user_sig or not last_assistant_sig:
+    for m in messages:
+        role = (m.get("role") or "").strip()
+        sig = (m.get("sig") or "").strip()
+        if role == "user" and sig:
+            last_user_sig = sig
+        if role == "assistant" and sig:
+            last_assistant_sig = sig
+vals = [
+    str(int(d.get("total_messages") or d.get("total") or len(messages))),
+    "1" if d.get("stop_visible") else "0",
+    last_user_sig,
+    last_assistant_sig,
+    str(d.get("chat_id") or "").strip(),
+    str(d.get("ui_contract_sig") or "").strip(),
+    str(d.get("fingerprint_v1") or "").strip(),
+    str(d.get("last_user_text_sig") or "").strip(),
+    str(d.get("assistant_text_sig") or "").strip(),
+    str(d.get("ui_state") or "").strip(),
+    str(d.get("norm_version") or "").strip(),
+]
+sep = "\x1f"
+vals = [v.replace(sep, " ").replace("\n", " ") for v in vals]
+print(sep.join(vals))
 PY
 }
 
@@ -793,7 +1204,7 @@ ack_db_write() {
 
 ack_db_get_fields() {
   # Usage: ack_db_get_fields <chat_id>
-  # stdout: last_reply_fingerprint \t consumed_fingerprint \t last_prompt_hash \t last_anchor_id
+  # stdout (US-delimited): last_reply_fingerprint \x1f consumed_fingerprint \x1f last_prompt_hash \x1f last_anchor_id
   local chat_id="$1"
   ack_db_read | python3 -c '
 import json,sys
@@ -809,8 +1220,9 @@ vals=[
   ch.get("last_prompt_hash_sent",""),
   ch.get("last_user_anchor_id",""),
 ]
-vals=[str(v).replace("\t"," ") for v in vals]
-print("\t".join(vals))
+sep="\x1f"
+vals=[str(v).replace(sep," ").replace("\n"," ") for v in vals]
+print(sep.join(vals))
 ' "$chat_id"
 }
 
@@ -1372,17 +1784,40 @@ for t in tabs:
 
 cdp_cleanup_chat_tabs() {
   # Close extra ChatGPT conversation tabs so the user doesn't end up with a pile
-  # of /c/... tabs. Keeps exactly one tab for the target chat id.
+  # of /c/... tabs.
+  # - legacy mode: keep one target tab, close all other /c/... tabs
+  # - safe mode (CHATGPT_SEND_AUTO_TAB_HYGIENE=1): never close target/pinned/active chat ids
   local target_url="$1"
-  local target_id
+  local target_id pinned_url active_url pinned_id active_id protect_pinned protect_active
+  local mode close_count tab_ids
   target_id="$(chat_id_from_url "$target_url" 2>/dev/null || true)"
   if [[ -z "${target_id:-}" ]] || ! cdp_is_up; then
     return 0
   fi
+  pinned_url=""
+  if [[ -f "${CHATGPT_URL_FILE:-}" ]]; then
+    pinned_url="$(cat "${CHATGPT_URL_FILE}" | head -n 1 || true)"
+  fi
+  active_url="$(chats_db_get_active_url | head -n 1 || true)"
+  pinned_id="$(chat_id_from_url "${pinned_url:-}" 2>/dev/null || true)"
+  active_id="$(chat_id_from_url "${active_url:-}" 2>/dev/null || true)"
+  protect_pinned=0
+  protect_active=0
+  [[ -n "${pinned_id:-}" ]] && protect_pinned=1
+  [[ -n "${active_id:-}" ]] && protect_active=1
+  mode="legacy"
+  if [[ "${AUTO_TAB_HYGIENE:-0}" == "1" ]]; then
+    mode="safe"
+  fi
+  echo "TAB_HYGIENE start mode=${mode} target_id=${target_id:-none} pinned_id=${pinned_id:-none} active_id=${active_id:-none} pinned_tab_protect=${protect_pinned} active_tab_protect=${protect_active} run_id=${RUN_ID}" >&2
 
-  curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+  close_count=0
+  tab_ids="$(curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
 import json,re,sys,urllib.parse
 target_id=sys.argv[1]
+safe_mode=(sys.argv[2] == "1")
+pinned_id=sys.argv[3]
+active_id=sys.argv[4]
 raw=sys.stdin.read()
 try:
     tabs=json.loads(raw)
@@ -1390,32 +1825,46 @@ except Exception:
     sys.exit(0)
 
 def chat_id(u:str):
-    m=re.match(r"^https://chatgpt\\.com/c/([0-9a-fA-F-]{16,})", u or "")
+    m=re.match(r"^https://chatgpt\.com/c/([0-9a-fA-F-]{16,})", u or "")
     return m.group(1) if m else None
 
-keep=None
 to_close=[]
+protected_ids={target_id}
+if safe_mode:
+    if pinned_id:
+        protected_ids.add(pinned_id)
+    if active_id:
+        protected_ids.add(active_id)
+
+keep_target=None
 for t in tabs:
     tid=(t.get("id") or "").strip()
     u=(t.get("url") or "").split("#",1)[0].strip()
     cid=chat_id(u)
     if not cid:
         continue
-    if cid==target_id:
-        if keep is None:
-            keep=tid
-        else:
-            to_close.append(tid)
+
+    if safe_mode and cid in protected_ids:
+        continue
+
+    if cid == target_id:
+        if keep_target is None:
+            keep_target=tid
+            continue
+        to_close.append(tid)
     else:
         to_close.append(tid)
 
 for tid in to_close:
     if tid:
         print(tid)
-' "$target_id" | while read -r tab_id; do
+' "$target_id" "${AUTO_TAB_HYGIENE:-0}" "${pinned_id:-}" "${active_id:-}" || true)"
+  while read -r tab_id; do
     [[ -z "${tab_id:-}" ]] && continue
     curl -fsS "http://127.0.0.1:${CDP_PORT}/json/close/${tab_id}" >/dev/null 2>&1 || true
-  done
+    close_count=$((close_count + 1))
+  done <<<"${tab_ids:-}"
+  echo "TAB_HYGIENE done mode=${mode} closed=${close_count} target_id=${target_id:-none} pinned_tab_protect=${protect_pinned} active_tab_protect=${protect_active} run_id=${RUN_ID}" >&2
 }
 
 cdp_close_all_conversation_tabs() {

@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  _dir="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$_dir/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+JSON_MODE=0
+CDP_PORT="${CHATGPT_SEND_CDP_PORT:-9222}"
+STRICT_SINGLE_CHAT="${CHATGPT_SEND_STRICT_SINGLE_CHAT:-1}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) JSON_MODE=1; shift ;;
+    --cdp-port) CDP_PORT="$2"; shift 2 ;;
+    -h|--help)
+      cat <<'EOF'
+Usage:
+  bin/ops_snapshot [--json] [--cdp-port PORT]
+EOF
+      exit 0
+      ;;
+    *)
+      echo "Unknown arg: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+python3 - "$ROOT" "$CDP_PORT" "$JSON_MODE" "$STRICT_SINGLE_CHAT" <<'PY'
+import datetime as dt
+import json
+import pathlib
+import re
+import sys
+import urllib.request
+
+root = pathlib.Path(sys.argv[1])
+cdp_port = int(sys.argv[2])
+json_mode = int(sys.argv[3])
+strict_single_chat = 1 if str(sys.argv[4]).strip() == "1" else 0
+
+state = root / "state"
+
+def read_text(path: pathlib.Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+def read_json(path: pathlib.Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def chat_id(url: str) -> str:
+    m = re.match(r"^https://chatgpt\.com/c/([0-9a-fA-F-]{16,})", (url or "").strip())
+    return m.group(1) if m else ""
+
+def cdp_get(path: str):
+    url = f"http://127.0.0.1:{cdp_port}{path}"
+    req = urllib.request.Request(url, headers={"User-Agent": "ops-snapshot"})
+    with urllib.request.urlopen(req, timeout=2.0) as r:
+        return json.loads(r.read().decode("utf-8", errors="ignore"))
+
+pinned_url = read_text(state / "chatgpt_url.txt")
+work_url = read_text(state / "work_chat_url.txt")
+chats = read_json(state / "chats.json")
+active_name = (chats.get("active") or "").strip()
+active_url = ""
+if active_name:
+    active_url = str(((chats.get("chats") or {}).get(active_name) or {}).get("url") or "").strip()
+
+checkpoint = read_json(state / "last_specialist_checkpoint.json")
+checkpoint_id = str(checkpoint.get("checkpoint_id") or "").strip()
+checkpoint_fp = str(checkpoint.get("fingerprint_v1") or "").strip()
+checkpoint_ts = str(checkpoint.get("ts") or "").strip()
+checkpoint_last_asst_sig = str(checkpoint.get("last_assistant_sig") or "").strip()
+checkpoint_last_user_sig = str(checkpoint.get("last_user_sig") or "").strip()
+
+target_url = work_url or pinned_url or active_url
+target_chat_id = chat_id(target_url)
+
+ack = read_json(state / "ack.json")
+ack_chat = ((ack.get("chats") or {}).get(target_chat_id) or {}) if target_chat_id else {}
+last_prompt_hash = str(ack_chat.get("last_prompt_hash_sent") or "").strip()
+last_reply_fp = str(ack_chat.get("last_reply_fingerprint") or "").strip()
+last_reply_consumed = str(ack_chat.get("last_reply_consumed_fingerprint") or "").strip()
+pending_unacked = int(bool(last_reply_fp and last_reply_fp != last_reply_consumed))
+
+protocol_path = state / "protocol.jsonl"
+ledger_state = "none"
+ledger_last_event = "none"
+ledger_last_ts = ""
+last_protocol_event = {}
+if protocol_path.exists():
+    last_send = -1
+    last_ready = -1
+    idx = 0
+    for raw in protocol_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        idx += 1
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if (obj.get("chat_url") or "").strip() == target_url:
+            last_protocol_event = obj
+        if not target_url or not last_prompt_hash:
+            continue
+        if (obj.get("chat_url") or "").strip() != target_url:
+            continue
+        if (obj.get("prompt_hash") or "").strip() != last_prompt_hash:
+            continue
+        action = (obj.get("action") or "").strip()
+        status = (obj.get("status") or "").strip()
+        if action == "SEND" and status == "ok":
+            last_send = idx
+            ledger_last_event = "SEND"
+            ledger_last_ts = str(obj.get("ts") or "")
+        if action in ("REPLY_READY", "REUSE_EXISTING") and status == "ok":
+            last_ready = idx
+            ledger_last_event = action
+            ledger_last_ts = str(obj.get("ts") or "")
+    if target_url and last_prompt_hash:
+        if last_send < 0:
+            ledger_state = "none"
+        elif last_ready > last_send:
+            ledger_state = "ready"
+        else:
+            ledger_state = "pending"
+
+cdp_ok = 0
+tab_count = 0
+actual_chat_url = ""
+actual_chat_id = ""
+browser_pid = read_text(state / f"chrome_{cdp_port}.pid")
+try:
+    cdp_get("/json/version")
+    tabs = cdp_get("/json/list")
+    cdp_ok = 1
+    conv_tabs = []
+    for t in tabs:
+        url = str(t.get("url") or "").split("#", 1)[0].strip()
+        if chat_id(url):
+            conv_tabs.append(url)
+    tab_count = len(conv_tabs)
+    if target_chat_id:
+        for u in conv_tabs:
+            if chat_id(u) == target_chat_id:
+                actual_chat_url = u
+                break
+    if not actual_chat_url and conv_tabs:
+        actual_chat_url = conv_tabs[-1]
+    actual_chat_id = chat_id(actual_chat_url)
+except Exception:
+    pass
+
+route_ok = int(bool(target_chat_id and actual_chat_id and target_chat_id == actual_chat_id))
+
+obj = {
+    "time": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    "root": str(root),
+    "cdp_port": cdp_port,
+    "cdp_ok": cdp_ok,
+    "browser_pid": browser_pid,
+    "target_chat_url": target_url,
+    "target_chat_id": target_chat_id,
+    "pinned_chat_url": pinned_url,
+    "work_chat_url": work_url,
+    "active_chat_name": active_name,
+    "active_chat_url": active_url,
+    "actual_chat_url": actual_chat_url,
+    "actual_chat_id": actual_chat_id,
+    "chat_route_ok": route_ok,
+    "strict_single_chat": strict_single_chat,
+    "tab_count": tab_count,
+    "last_checkpoint": {
+        "checkpoint_id": checkpoint_id,
+        "ts": checkpoint_ts,
+        "fingerprint_v1": checkpoint_fp,
+        "last_asst_sig": checkpoint_last_asst_sig,
+        "last_user_sig": checkpoint_last_user_sig,
+    },
+    "ledger_last": {
+        "prompt_hash": last_prompt_hash,
+        "state": ledger_state,
+        "last_event": ledger_last_event,
+        "last_ts": ledger_last_ts,
+    },
+    "pending_details": {
+        "pending_unacked": pending_unacked,
+        "last_reply_fingerprint": last_reply_fp,
+        "last_reply_consumed_fingerprint": last_reply_consumed,
+    },
+    "last_protocol_event": last_protocol_event,
+}
+
+if json_mode == 1:
+    print(json.dumps(obj, ensure_ascii=False, sort_keys=True))
+else:
+    ckpt_short = (checkpoint_id or "none")
+    fp_short = (checkpoint_fp[:8] if checkpoint_fp else "none")
+    prompt_short = (last_prompt_hash[:8] if last_prompt_hash else "none")
+    print(
+        f"OPS cdp={cdp_ok} tabs={tab_count} route={'OK' if route_ok else 'MISMATCH'} "
+        f"chat={target_chat_id or 'none'} ckpt={ckpt_short} fp={fp_short} "
+        f"ledger={ledger_state} prompt={prompt_short} pending_unacked={pending_unacked}"
+    )
+    print(json.dumps(obj, ensure_ascii=False, sort_keys=True))
+PY

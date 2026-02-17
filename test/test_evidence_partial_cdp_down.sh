@@ -10,24 +10,29 @@ fake_bin="$tmp/fake-bin"
 root="$tmp/root"
 mkdir -p "$fake_bin" "$root/bin" "$root/docs" "$root/state"
 
-cat >"$fake_bin/curl" <<'EOF'
+cdp_down_flag="$tmp/cdp_down.flag"
+
+cat >"$fake_bin/curl" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 url=""
-for a in "$@"; do
-  if [[ "$a" == http://127.0.0.1:* ]]; then
-    url="$a"
+for a in "\$@"; do
+  if [[ "\$a" == http://127.0.0.1:* ]]; then
+    url="\$a"
   fi
 done
-if [[ "$url" == *"/json/version"* ]]; then
+if [[ "\$url" == *"/json/version"* ]]; then
+  if [[ -f "$cdp_down_flag" ]]; then
+    exit 1
+  fi
   printf '%s\n' '{"Browser":"fake"}'
   exit 0
 fi
-if [[ "$url" == *"/json/list"* ]]; then
+if [[ "\$url" == *"/json/list"* ]]; then
   printf '%s\n' '[{"id":"tab1","url":"https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","title":"Fake chat","webSocketDebuggerUrl":"ws://fake"}]'
   exit 0
 fi
-if [[ "$url" == *"/json/activate/"* ]] || [[ "$url" == *"/json/close/"* ]]; then
+if [[ "\$url" == *"/json/activate/"* ]] || [[ "\$url" == *"/json/close/"* ]]; then
   printf '%s\n' '{}'
   exit 0
 fi
@@ -39,6 +44,10 @@ chmod +x "$fake_bin/curl"
 cat >"$root/bin/cdp_chatgpt.py" <<'EOF'
 #!/usr/bin/env python3
 import argparse
+import hashlib
+import json
+import os
+import re
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--precheck-only", action="store_true")
@@ -51,14 +60,9 @@ ap.add_argument("--probe-contract", action="store_true")
 ap.add_argument("--soft-reset-reason")
 ap.add_argument("--prompt")
 ap.add_argument("--chatgpt-url")
-ap.add_argument("--cdp-port")
-ap.add_argument("--timeout")
-args = ap.parse_args()
+args, _ = ap.parse_known_args()
 
 if args.fetch_last:
-    import hashlib
-    import json
-    import re
     norm = re.sub(r"\s+", " ", (args.prompt or "").strip())
     prompt_hash = hashlib.sha256(norm.encode("utf-8", errors="ignore")).hexdigest() if norm else ""
     assistant_text = f"assistant fetch-last for {norm}" if norm else "assistant fetch-last"
@@ -101,6 +105,13 @@ if args.send_no_wait:
     raise SystemExit(0)
 
 if args.reply_ready_probe:
+    flag = os.environ.get("FAKE_CDP_DOWN_FLAG", "")
+    if flag:
+        try:
+            with open(flag, "w", encoding="utf-8") as f:
+                f.write("1")
+        except Exception:
+            pass
     print("REPLY_PROGRESS assistant_after_anchor=0 assistant_tail_len=0 assistant_tail_hash=none stop_visible=1", flush=True)
     print("REPLY_READY: 0 reason=stop_visible", flush=True)
     raise SystemExit(10)
@@ -124,31 +135,22 @@ export CHATGPT_SEND_REPLY_MAX_SEC=1
 export CHATGPT_SEND_REPLY_NO_PROGRESS_MAX_MS=200
 export CHATGPT_SEND_LATE_REPLY_GRACE_SEC=0
 export CHATGPT_SEND_CAPTURE_EVIDENCE=1
-export CHATGPT_SEND_RUN_ID="run-test-evidence-$RANDOM"
+export CHATGPT_SEND_RUN_ID="run-test-evidence-partial-$RANDOM"
+export FAKE_CDP_DOWN_FLAG="$cdp_down_flag"
 
 set +e
-out="$(
-  "$SCRIPT" --chatgpt-url "https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" --prompt "evidence timeout" 2>&1
-)"
+out="$("$SCRIPT" --chatgpt-url "https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" --prompt "evidence partial cdp down" 2>&1)"
 st=$?
 set -e
 [[ "$st" -eq 76 ]]
-echo "$out" | rg -q -- 'E_REPLY_WAIT_TIMEOUT_STOP_VISIBLE'
+echo "$out" | rg -q -- 'EVIDENCE_PARTIAL cdp_ok=0'
 echo "$out" | rg -q -- 'EVIDENCE_CAPTURED'
 
 ev_dir="$root/state/runs/$CHATGPT_SEND_RUN_ID/evidence"
 [[ -d "$ev_dir" ]]
-[[ -f "$ev_dir/contract.json" ]]
-[[ -f "$ev_dir/tabs.json" ]]
-[[ -f "$ev_dir/version.json" ]]
-[[ -f "$ev_dir/probe_last.json" ]]
-[[ -f "$ev_dir/process.json" ]]
-[[ -f "$ev_dir/doctor.jsonl" ]]
-
-bundle_path="$("$SCRIPT" --bundle "$CHATGPT_SEND_RUN_ID")"
-[[ -f "$bundle_path" ]]
-bundle_list="$tmp/bundle_list.txt"
-tar -tzf "$bundle_path" >"$bundle_list"
-rg -q '^evidence/contract.json$' "$bundle_list"
+[[ -f "$ev_dir/ops_snapshot.json" ]]
+[[ -f "$ev_dir/ps.txt" ]]
+[[ -f "$ev_dir/net.txt" ]]
+[[ -f "$ev_dir/env.json" ]]
 
 echo "OK"
