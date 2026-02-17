@@ -582,11 +582,26 @@ fi
 
 echo "SEND_BASELINE last_user_hash=${FETCH_LAST_LAST_USER_HASH:-none} last_user_sig=${FETCH_LAST_LAST_USER_TEXT_SIG:-none} run_id=${RUN_ID}" >&2
 echo "SEND_START prompt_sig=${PROMPT_SIG:-none} prompt_hash=${PROMPT_HASH:-none} ledger_key=${LEDGER_LOOKUP_KEY:-none} norm_version=${NORM_VERSION:-v1} run_id=${RUN_ID}" >&2
-echo "SEND_DISPATCH attempt=1 run_id=${RUN_ID}" >&2
+dispatch_preferred="${CHATGPT_SEND_DISPATCH_PREFERRED:-enter}"
+if [[ "${dispatch_preferred}" != "enter" ]] && [[ "${dispatch_preferred}" != "click" ]] && [[ "${dispatch_preferred}" != "button" ]]; then
+  dispatch_preferred="enter"
+fi
+export CHATGPT_SEND_DISPATCH_PREFERRED="${dispatch_preferred}"
+echo "SEND_DISPATCH attempt=1 method=${dispatch_preferred} run_id=${RUN_ID}" >&2
 set +e
 run_send_checked "initial"
 status=$?
 set -e
+
+if [[ $status -eq 3 ]] && [[ "${dispatch_preferred}" == "enter" ]]; then
+  echo "SEND_DISPATCH attempt=2 method=click run_id=${RUN_ID}" >&2
+  export CHATGPT_SEND_DISPATCH_PREFERRED="click"
+  set +e
+  run_send_checked "retry_dispatch_click"
+  status=$?
+  set -e
+  export CHATGPT_SEND_DISPATCH_PREFERRED="${dispatch_preferred}"
+fi
 
 if [[ $status -eq 6 ]]; then
   # Chrome may be running without --remote-allow-origins; restart our automation

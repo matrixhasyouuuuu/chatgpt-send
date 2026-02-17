@@ -330,22 +330,28 @@ def js_send_ready_expr() -> str:
     form.querySelector('button[aria-label*="Send"]') ||
     form.querySelector('button[type="submit"]');
   const stop = q('button[data-testid="stop-button"], button[aria-label*="Stop"]');
+  const composerRaw = (ed && (ed.innerText || ed.textContent)) ? (ed.innerText || ed.textContent) : '';
+  const composerNorm = (composerRaw || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
   return {
     hasEditor: !!ed,
     hasSend: !!btn,
+    sendEnabled: !!(btn && !btn.disabled),
+    composerLen: composerNorm.length,
     stopVisible: !!stop,
   };
 })()
 """.strip()
 
 
-def js_send_expr(prompt: str) -> str:
+def js_send_expr(prompt: str, preferred_method: str = "button") -> str:
     # Use JSON encoding to avoid quoting issues.
     # ChatGPT composer uses a ProseMirror contenteditable div (#prompt-textarea).
     p = json.dumps(prompt)
+    preferred = json.dumps((preferred_method or "button").strip().lower())
     return f"""
 (() => {{
   const text = {p};
+  const preferred = {preferred};
   const norm = (s) => (s || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
   const q = (sel) => document.querySelector(sel);
   const ed =
@@ -397,21 +403,40 @@ def js_send_expr(prompt: str) -> str:
     form.querySelector('button[aria-label="Send prompt"]') ||
     form.querySelector('button[aria-label*="Send"]') ||
     form.querySelector('button[type="submit"]');
+
+  const sendByEnter = () => {{
+    try {{
+      ed.focus();
+      ed.dispatchEvent(new KeyboardEvent('keydown', {{key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}}));
+      ed.dispatchEvent(new KeyboardEvent('keypress', {{key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}}));
+      ed.dispatchEvent(new KeyboardEvent('keyup', {{key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}}));
+      return {{ok:true, method:'enter'}};
+    }} catch (e) {{
+      return {{ok:false, error:'enter-dispatch-failed'}};
+    }}
+  }};
+
+  if (preferred === 'enter') {{
+    const enterRes = sendByEnter();
+    if (enterRes.ok) {{
+      return {{ok:true, insertedPreview: inserted.slice(0, 60), method:'enter'}};
+    }}
+    if (btn) {{
+      btn.click();
+      return {{ok:true, insertedPreview: inserted.slice(0, 60), method:'button_fallback'}};
+    }}
+    return {{ok:false, error:'send_unavailable_after_enter'}};
+  }}
+
   if (btn) {{
     btn.click();
     return {{ok:true, insertedPreview: inserted.slice(0, 60), method:'button'}};
   }}
-
-  // Fallback: when ChatGPT UI hides/renames send button, try Enter send.
-  try {{
-    ed.focus();
-    ed.dispatchEvent(new KeyboardEvent('keydown', {{key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}}));
-    ed.dispatchEvent(new KeyboardEvent('keypress', {{key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}}));
-    ed.dispatchEvent(new KeyboardEvent('keyup', {{key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}}));
-    return {{ok:true, insertedPreview: inserted.slice(0, 60), method:'enter'}};
-  }} catch (e) {{
-    return {{ok:false, error:'send button not found'}};
+  const enterRes = sendByEnter();
+  if (enterRes.ok) {{
+    return {{ok:true, insertedPreview: inserted.slice(0, 60), method:'enter_fallback'}};
   }}
+  return {{ok:false, error:'send_unavailable_no_button_no_enter'}};
 }})()
 """.strip()
 
@@ -1531,30 +1556,41 @@ def main() -> int:
         anchor_state = None
         last_dispatch_state = None
         echo_miss_escalated = False
-        max_send_attempts = 2
-        for attempt in range(1, max_send_attempts + 1):
-            send_res = cdp.eval(js_send_expr(args.prompt), timeout=10.0) or {}
+        dispatch_pref = (os.environ.get("CHATGPT_SEND_DISPATCH_PREFERRED", "enter") or "enter").strip().lower()
+        if dispatch_pref in ("click", "button"):
+            dispatch_order = ["button", "enter"]
+        else:
+            dispatch_order = ["enter", "button"]
+        max_send_attempts = len(dispatch_order)
+        for attempt, preferred_method in enumerate(dispatch_order, start=1):
+            send_res = cdp.eval(js_send_expr(args.prompt, preferred_method), timeout=10.0) or {}
             if isinstance(send_res, dict) and send_res.get("ok"):
                 method = send_res.get("method", "unknown")
                 progress(f"phase=send event=ok method={method} attempt={attempt}")
                 dispatched = False
+                dispatch_reason = "no_dispatch_signal"
                 if wait_for_dispatch_signal(cdp, baseline, max_wait_s=8.0):
                     progress("phase=send event=dispatched")
                     dispatched = True
-                else:
-                    progress("phase=send event=no_dispatch_after_send retry=enter")
-                    enter_res = cdp.eval(js_press_enter_expr(), timeout=10.0) or {}
-                    if isinstance(enter_res, dict) and enter_res.get("ok"):
-                        if wait_for_dispatch_signal(cdp, baseline, max_wait_s=8.0):
-                            progress("phase=send event=dispatched_via_enter")
-                            dispatched = True
+                    dispatch_reason = "dispatch_signal"
                 if not dispatched:
+                    progress("phase=send event=no_dispatch_after_send")
+                    dispatch_reason = "no_dispatch_signal"
                     time.sleep(0.15)
-                    continue
                 try:
                     last_dispatch_state = cdp.eval(js_state_expr(), timeout=10.0) or {}
                 except Exception:
                     last_dispatch_state = None
+                diag = cdp.eval(js_send_ready_expr(), timeout=10.0) or {}
+                diag_stop = 1 if bool(diag.get("stopVisible")) else 0
+                diag_len = int(diag.get("composerLen") or 0)
+                diag_enabled = 1 if bool(diag.get("sendEnabled")) else 0
+                error_marker(
+                    "SEND_DISPATCH_RESULT",
+                    f"ok={1 if dispatched else 0} reason={dispatch_reason} stop_visible={diag_stop} composer_len={diag_len} send_enabled={diag_enabled} method={method} attempt={attempt}",
+                )
+                if not dispatched:
+                    continue
 
                 # Phase-1 post-verify: the new prompt must be echoed as the latest user turn.
                 anchor_state = wait_for_user_echo(cdp, baseline, args.prompt, timeout_s=8.0)

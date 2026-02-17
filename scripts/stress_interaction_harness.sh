@@ -5,9 +5,79 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLAN_FILE="$ROOT/scripts/stress_plan_v1.json"
 ITERS=30
 CHAT_URL=""
-OUT_DIR="${TMPDIR:-/tmp}/chatgpt_send_stress"
+OUT_DIR=""
 FAULT_HOOK=""
 PROMPT_PREFIX="T_stress_interaction"
+TEST_ID=""
+HARNESS_INTERRUPTED=0
+DONE_ITERS=0
+HARNESS_FINALIZED=0
+pass_count=0
+fail_count=0
+unexpected_fail_count=0
+summary_csv=""
+
+on_int_term() {
+  HARNESS_INTERRUPTED=1
+  echo "HARNESS_SIGNAL received=1 interrupted=1 done_iters=${DONE_ITERS}" >&2
+}
+
+finalize_harness() {
+  local original_exit="${1:-0}"
+  local final_exit="$original_exit"
+  local score_output=""
+  local score_status=0
+  local harness_end_line=""
+  local summary_line=""
+
+  if [[ "$HARNESS_FINALIZED" == "1" ]]; then
+    return "$final_exit"
+  fi
+  HARNESS_FINALIZED=1
+
+  set +e
+  if compgen -G "$OUT_DIR"/iter_*.markers > /dev/null; then
+    score_output="$("$ROOT/scripts/score_stress_run.sh" "$OUT_DIR"/iter_*.markers 2>/dev/null)"
+    score_status=$?
+    if [[ $score_status -eq 0 ]] && [[ -n "${score_output:-}" ]]; then
+      printf '%s\n' "$score_output" | tee "$OUT_DIR/score.txt"
+    else
+      echo "W_SCORE_UNAVAILABLE out_dir=${OUT_DIR}" | tee "$OUT_DIR/score.txt"
+    fi
+  elif compgen -G "$OUT_DIR"/iter_*.log > /dev/null; then
+    score_output="$("$ROOT/scripts/score_stress_run.sh" "$OUT_DIR"/iter_*.log 2>/dev/null)"
+    score_status=$?
+    if [[ $score_status -eq 0 ]] && [[ -n "${score_output:-}" ]]; then
+      printf '%s\n' "$score_output" | tee "$OUT_DIR/score.txt"
+    else
+      echo "W_SCORE_UNAVAILABLE out_dir=${OUT_DIR}" | tee "$OUT_DIR/score.txt"
+    fi
+  else
+    echo "W_SCORE_UNAVAILABLE out_dir=${OUT_DIR} reason=no_iter_logs" | tee "$OUT_DIR/score.txt"
+  fi
+
+  harness_end_line="HARNESS_END interrupted=${HARNESS_INTERRUPTED} done_iters=${DONE_ITERS} total_iters=${ITERS} test_id=${TEST_ID} out_dir=${OUT_DIR} summary=${summary_csv}"
+  summary_line="STRESS_SUMMARY pass=${pass_count} fail=${fail_count} unexpected_fail=${unexpected_fail_count} test_id=${TEST_ID} out_dir=${OUT_DIR} summary=${summary_csv}"
+  echo "$harness_end_line" | tee "$OUT_DIR/harness_end.txt"
+  echo "$summary_line" | tee "$OUT_DIR/stress_summary.txt"
+  set -e
+
+  if [[ "${HARNESS_INTERRUPTED}" == "1" ]]; then
+    final_exit=130
+  elif [[ "$unexpected_fail_count" -ne 0 ]]; then
+    final_exit=1
+  fi
+  return "$final_exit"
+}
+
+cleanup_on_exit() {
+  local original_exit="$?"
+  local final_exit=0
+  trap - EXIT
+  finalize_harness "$original_exit"
+  final_exit="$?"
+  exit "$final_exit"
+}
 
 usage() {
   cat <<'EOF'
@@ -18,6 +88,7 @@ Options:
   --iters N
   --plan PATH
   --chat-url URL
+  --test-id ID
   --out-dir DIR
   --fault-hook PATH
   --prompt-prefix TEXT
@@ -29,6 +100,7 @@ while [[ $# -gt 0 ]]; do
     --iters) ITERS="$2"; shift 2 ;;
     --plan) PLAN_FILE="$2"; shift 2 ;;
     --chat-url) CHAT_URL="$2"; shift 2 ;;
+    --test-id) TEST_ID="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --fault-hook) FAULT_HOOK="$2"; shift 2 ;;
     --prompt-prefix) PROMPT_PREFIX="$2"; shift 2 ;;
@@ -46,8 +118,17 @@ if [[ -z "${CHAT_URL:-}" ]] && [[ -f "$ROOT/state/work_chat_url.txt" ]]; then
 fi
 [[ -n "${CHAT_URL:-}" ]] || { echo "Missing --chat-url and state/work_chat_url.txt is empty" >&2; exit 2; }
 
+if [[ -z "${TEST_ID:-}" ]]; then
+  TEST_ID="${PROMPT_PREFIX}_$(date +%s)"
+fi
+
+if [[ -z "${OUT_DIR:-}" ]]; then
+  OUT_DIR="${TMPDIR:-/tmp}/chatgpt_send_stress/${TEST_ID}"
+fi
+
 mkdir -p "$OUT_DIR" >/dev/null 2>&1 || true
-rm -f "$OUT_DIR"/stress_iter_*.log "$OUT_DIR"/summary.csv >/dev/null 2>&1 || true
+rm -f "$OUT_DIR"/iter_*.log "$OUT_DIR"/iter_*.markers "$OUT_DIR"/summary.csv "$OUT_DIR"/score.txt "$OUT_DIR"/harness_end.txt "$OUT_DIR"/stress_summary.txt >/dev/null 2>&1 || true
+echo "HARNESS_START test_id=${TEST_ID} outdir=${OUT_DIR} iters=${ITERS} plan=${PLAN_FILE} chat_url=${CHAT_URL}"
 # Start each stress run with a fresh checkpoint to avoid stale fingerprint
 # mismatches after protocol/fingerprint migrations.
 rm -f "$ROOT/state/last_specialist_checkpoint.json" >/dev/null 2>&1 || true
@@ -90,16 +171,25 @@ fail_count=0
 unexpected_fail_count=0
 summary_csv="$OUT_DIR/summary.csv"
 printf '%s\n' "iter,scenario,expect,fault,run_status,assert_status,log" >"$summary_csv"
+trap 'on_int_term' INT TERM
+trap 'cleanup_on_exit' EXIT
 
 for ((iter=1; iter<=ITERS; iter++)); do
+  if [[ "$HARNESS_INTERRUPTED" == "1" ]]; then
+    echo "HARNESS_BREAK interrupted=1 before_iter=${iter}" >&2
+    break
+  fi
+
   idx=$(( (iter - 1) % ${#SCENARIOS[@]} ))
   IFS=$'\t' read -r sid expect fault note <<<"${SCENARIOS[$idx]}"
   run_ts="$(date +%s)"
-  log="$OUT_DIR/stress_iter_${iter}_${sid}.log"
+  log="$OUT_DIR/iter_${iter}.log"
   prompt="${PROMPT_PREFIX}_${sid}_${run_ts}"
 
   {
     echo "RUN_START iter=${iter} scenario=${sid} expect=${expect} fault=${fault} ts=${run_ts}"
+    echo "TEST_ID=${TEST_ID}"
+    echo "OUTDIR=${OUT_DIR}"
     echo "CHAT_TARGET_URL=${CHAT_URL}"
     echo "PROTO_ENFORCE fingerprint=1 postsend_verify=1 strict_single_chat=1"
     echo "TAB_HYGIENE_ENFORCE auto_tab_hygiene=${CHATGPT_SEND_AUTO_TAB_HYGIENE:-0}"
@@ -148,6 +238,11 @@ for ((iter=1; iter<=ITERS; iter++)); do
   idle_elapsed=$(( $(date +%s) - idle_start ))
   echo "PRE_IDLE status=${idle_status} elapsed_sec=${idle_elapsed}" >>"$log"
 
+  if [[ "$HARNESS_INTERRUPTED" == "1" ]]; then
+    echo "HARNESS_BREAK interrupted=1 before_send_iter=${iter}" >>"$log"
+    break
+  fi
+
   set +e
   "$ROOT/bin/chatgpt_send" --chatgpt-url "$CHAT_URL" --prompt "$prompt" >>"$log" 2>&1
   run_status=$?
@@ -173,20 +268,12 @@ for ((iter=1; iter<=ITERS; iter++)); do
 
   printf '%s\n' "${iter},${sid},${expect},${fault},${run_status},${assert_status},${log}" >>"$summary_csv"
   echo "RUN_END iter=${iter} scenario=${sid} result=${result} run_status=${run_status} assert_status=${assert_status} log=${log}"
+  markers="$OUT_DIR/iter_${iter}.markers"
+  rg --no-filename '^(HARNESS_|ITER_RESULT|RUN_(START|END)|ASSERT_|PROTO_ENFORCE|TAB_HYGIENE|CHAT_|ROUTE_|RECOVERY_|FETCH_LAST|SEND_|REPLY_|LEDGER_|E_|W_)' "$log" >"$markers" || true
+  DONE_ITERS=$iter
+
+  if [[ "$HARNESS_INTERRUPTED" == "1" ]]; then
+    echo "HARNESS_BREAK interrupted=1 after_iter=${DONE_ITERS}" >&2
+    break
+  fi
 done
-
-score_output=""
-set +e
-score_output="$("$ROOT/scripts/score_stress_run.sh" "$OUT_DIR"/stress_iter_*.log 2>/dev/null)"
-score_status=$?
-set -e
-if [[ $score_status -eq 0 ]] && [[ -n "${score_output:-}" ]]; then
-  printf '%s\n' "$score_output"
-else
-  echo "W_SCORE_UNAVAILABLE out_dir=${OUT_DIR}"
-fi
-
-echo "STRESS_SUMMARY pass=${pass_count} fail=${fail_count} unexpected_fail=${unexpected_fail_count} out_dir=${OUT_DIR} summary=${summary_csv}"
-if [[ $unexpected_fail_count -ne 0 ]]; then
-  exit 1
-fi

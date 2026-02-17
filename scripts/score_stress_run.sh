@@ -5,18 +5,34 @@ usage() {
   cat <<'EOF'
 Usage:
   scripts/score_stress_run.sh <stress_log1> [stress_log2 ...]
+  scripts/score_stress_run.sh            # defaults to iter_*.markers in cwd
 
 Example:
-  scripts/score_stress_run.sh /tmp/chatgpt_send_stress/stress_iter_*.log
+  scripts/score_stress_run.sh /tmp/chatgpt_send_stress/<TEST_ID>/iter_*.markers
 EOF
 }
 
 if [[ $# -lt 1 ]]; then
-  usage >&2
-  exit 2
+  set -- "iter_*.markers"
 fi
 
-python3 - "$@" <<'PY'
+expanded_args=()
+for raw in "$@"; do
+  if [[ "$raw" == *"*"* ]] || [[ "$raw" == *"?"* ]] || [[ "$raw" == *"["* ]]; then
+    shopt -s nullglob
+    matches=( $raw )
+    shopt -u nullglob
+    if [[ ${#matches[@]} -gt 0 ]]; then
+      expanded_args+=( "${matches[@]}" )
+    else
+      expanded_args+=( "$raw" )
+    fi
+  else
+    expanded_args+=( "$raw" )
+  fi
+done
+
+python3 - "${expanded_args[@]}" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -31,14 +47,18 @@ if not paths:
     print("No stress log files found", file=sys.stderr)
     raise SystemExit(2)
 
-re_send = re.compile(r"phase=send event=dispatched|action=send")
-re_route_error = re.compile(r"E_ROUTE_MISMATCH|CHAT_ROUTE=E_ROUTE_MISMATCH|E_MULTIPLE_CHAT_TABS_BLOCKED|E_CHAT_FINGERPRINT_MISMATCH|E_UI_NOT_READY")
-re_unconfirmed_send = re.compile(r"E_POSTSEND_LAST_USER_MISMATCH|E_SEND_NOT_CONFIRMED")
-re_no_blind = re.compile(r"E_NO_BLIND_RESEND")
-re_fail = re.compile(r"RUN_END .*result=FAIL")
-re_pass = re.compile(r"RUN_END .*result=PASS|ASSERT_OK")
-re_evidence = re.compile(r"EVIDENCE_CAPTURED|EVIDENCE_AUTOCAPTURE|EVIDENCE_PARTIAL")
-re_any_error = re.compile(r"\bE_[A-Z0-9_]+")
+re_send = re.compile(r"^(SEND_START|SEND_DISPATCH|SEND_CONFIRMED)\b", re.MULTILINE)
+re_route_error = re.compile(r"^(E_ROUTE_MISMATCH|CHAT_ROUTE=E_ROUTE_MISMATCH|E_MULTIPLE_CHAT_TABS_BLOCKED|E_CHAT_FINGERPRINT_MISMATCH|E_UI_NOT_READY)\b", re.MULTILINE)
+re_unconfirmed_send = re.compile(r"^(E_POSTSEND_LAST_USER_MISMATCH|E_SEND_NOT_CONFIRMED)\b", re.MULTILINE)
+re_no_blind = re.compile(r"^E_NO_BLIND_RESEND\b", re.MULTILINE)
+re_fail = re.compile(r"^(RUN_END .*result=FAIL|ITER_RESULT outcome=FAIL|ITER_RESULT outcome=BLOCK)\b", re.MULTILINE)
+re_pass = re.compile(r"^(RUN_END .*result=PASS|ITER_RESULT outcome=PASS|ASSERT_OK)\b", re.MULTILINE)
+re_evidence = re.compile(r"^EVIDENCE_(CAPTURED|AUTOCAPTURE|PARTIAL)\b", re.MULTILINE)
+re_any_error = re.compile(r"^E_[A-Z0-9_]+\b", re.MULTILINE)
+re_critical_error = re.compile(
+    r"^(E_SEND_NOT_CONFIRMED|E_POSTSEND_LAST_USER_MISMATCH|E_ROUTE_MISMATCH|E_CHAT_FINGERPRINT_MISMATCH|E_UI_NOT_READY|E_REPLY_WAIT_TIMEOUT|E_REPLY_WAIT_TIMEOUT_NO_ACTIVITY|E_TAB_NOT_FOUND)\b",
+    re.MULTILINE,
+)
 
 total = 0
 passed = 0
@@ -59,6 +79,7 @@ for path in paths:
     has_pass = bool(re_pass.search(text))
     has_evidence = bool(re_evidence.search(text))
     has_error = bool(re_any_error.search(text))
+    has_critical_error = bool(re_critical_error.search(text))
 
     if has_fail:
         failed += 1
@@ -73,7 +94,7 @@ for path in paths:
         blind_resend += 1
     if has_unconfirmed_send:
         unexpected_send_unconfirmed += 1
-    if (has_fail or has_error) and not has_evidence:
+    if (has_fail or has_critical_error) and not has_evidence:
         fail_without_evidence += 1
 
 pass_rate = (passed / total) if total else 0.0

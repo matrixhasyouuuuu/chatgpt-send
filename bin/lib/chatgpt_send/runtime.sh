@@ -109,8 +109,9 @@ postsend_verify_latest_user() {
   local verify_n verify_out st fields diag_fields fetch_url target_id actual_id
   local v_total v_stop v_last_user_sig v_last_asst_sig v_chat_id v_ui_contract v_fingerprint v_last_user_text_sig v_last_asst_text_sig
   local v_user_tail v_asst_tail v_checkpoint_id v_last_user_hash v_after_anchor
-  local verify_timeout_sec verify_poll_ms verify_poll_s verify_deadline
+  local verify_timeout_sec verify_hard_sec verify_poll_ms verify_poll_s verify_soft_deadline verify_hard_deadline
   local last_seen_user_hash last_seen_user_sig
+  local saw_dispatch_signal now_sec candidate_deadline
   local had_errexit=0
   case "$-" in
     *e*) had_errexit=1 ;;
@@ -119,16 +120,21 @@ postsend_verify_latest_user() {
   [[ "$verify_n" =~ ^[0-9]+$ ]] || verify_n=4
   (( verify_n < 2 )) && verify_n=2
   verify_timeout_sec="${POSTSEND_VERIFY_TIMEOUT_SEC:-8}"
+  verify_hard_sec="${POSTSEND_VERIFY_HARD_SEC:-45}"
   verify_poll_ms="${POSTSEND_VERIFY_POLL_MS:-400}"
   [[ "$verify_timeout_sec" =~ ^[0-9]+$ ]] || verify_timeout_sec=8
+  [[ "$verify_hard_sec" =~ ^[0-9]+$ ]] || verify_hard_sec=45
   [[ "$verify_poll_ms" =~ ^[0-9]+$ ]] || verify_poll_ms=400
   (( verify_timeout_sec < 1 )) && verify_timeout_sec=1
+  (( verify_hard_sec < verify_timeout_sec )) && verify_hard_sec=$verify_timeout_sec
   (( verify_poll_ms < 100 )) && verify_poll_ms=100
   verify_poll_s="$(awk -v ms="$verify_poll_ms" 'BEGIN { printf "%.3f", ms/1000 }')"
-  verify_deadline=$(( $(date +%s) + verify_timeout_sec ))
+  verify_soft_deadline=$(( $(date +%s) + verify_timeout_sec ))
+  verify_hard_deadline=$(( $(date +%s) + verify_hard_sec ))
+  saw_dispatch_signal=0
   last_seen_user_hash=""
   last_seen_user_sig=""
-  echo "POSTSEND_VERIFY start n=${verify_n} timeout_sec=${verify_timeout_sec} poll_ms=${verify_poll_ms} run_id=${RUN_ID}" >&2
+  echo "POSTSEND_VERIFY start n=${verify_n} timeout_sec=${verify_timeout_sec} hard_sec=${verify_hard_sec} poll_ms=${verify_poll_ms} run_id=${RUN_ID}" >&2
 
   while true; do
     verify_out="$(mktemp)"
@@ -168,16 +174,36 @@ postsend_verify_latest_user() {
           rm -f "$verify_out"
           return 0
         fi
+        if [[ "${v_stop:-0}" == "1" ]]; then
+          if [[ "$saw_dispatch_signal" -eq 0 ]]; then
+            saw_dispatch_signal=1
+            echo "POSTSEND_VERIFY signal=stop_visible run_id=${RUN_ID}" >&2
+          fi
+          now_sec="$(date +%s)"
+          candidate_deadline=$(( now_sec + verify_timeout_sec ))
+          if (( candidate_deadline > verify_soft_deadline )); then
+            if (( candidate_deadline > verify_hard_deadline )); then
+              verify_soft_deadline=$verify_hard_deadline
+            else
+              verify_soft_deadline=$candidate_deadline
+            fi
+            echo "POSTSEND_VERIFY extend_soft_deadline deadline=${verify_soft_deadline} run_id=${RUN_ID}" >&2
+          fi
+        fi
       fi
     fi
     rm -f "$verify_out"
-    if (( $(date +%s) >= verify_deadline )); then
+    now_sec="$(date +%s)"
+    if (( now_sec >= verify_hard_deadline )); then
+      break
+    fi
+    if (( now_sec >= verify_soft_deadline )) && [[ "$saw_dispatch_signal" -eq 0 ]]; then
       break
     fi
     sleep "$verify_poll_s"
   done
 
-  echo "W_POSTSEND_LAST_USER_MISMATCH expected_prompt_hash=${PROMPT_HASH:-none} got_last_user_hash=${last_seen_user_hash:-none} expected_prompt_sig=${PROMPT_SIG:-none} got_last_user_sig=${last_seen_user_sig:-none} run_id=${RUN_ID}" >&2
+  echo "W_POSTSEND_LAST_USER_MISMATCH expected_prompt_hash=${PROMPT_HASH:-none} got_last_user_hash=${last_seen_user_hash:-none} expected_prompt_sig=${PROMPT_SIG:-none} got_last_user_sig=${last_seen_user_sig:-none} saw_dispatch_signal=${saw_dispatch_signal} run_id=${RUN_ID}" >&2
   return 80
 }
 

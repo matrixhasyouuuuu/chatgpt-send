@@ -1,0 +1,34 @@
+{
+  "scenarios": [
+    {
+      "id": "H01",
+      "expect": "PASS",
+      "fault": "none",
+      "note": "happy-path send/reply loop"
+    },
+    {
+      "id": "H02",
+      "expect": "PASS",
+      "fault": "none",
+      "note": "happy-path send/reply loop"
+    },
+    {
+      "id": "H03",
+      "expect": "PASS",
+      "fault": "none",
+      "note": "happy-path send/reply loop"
+    },
+    {
+      "id": "H04",
+      "expect": "PASS",
+      "fault": "none",
+      "note": "happy-path send/reply loop"
+    },
+    {
+      "id": "H05",
+      "expect": "PASS",
+      "fault": "none",
+      "note": "happy-path send/reply loop"
+    }
+  ]
+}
