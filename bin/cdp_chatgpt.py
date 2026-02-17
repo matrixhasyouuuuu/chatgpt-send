@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -8,6 +9,18 @@ import urllib.request
 
 import websocket
 from websocket._exceptions import WebSocketBadStatusException
+
+
+PROGRESS_ENABLED = os.environ.get("CHATGPT_SEND_PROGRESS", "1") != "0"
+HEARTBEAT_SEC = float(os.environ.get("CHATGPT_SEND_HEARTBEAT_SEC", "5"))
+ACTIVITY_TIMEOUT_SEC = float(os.environ.get("CHATGPT_SEND_ACTIVITY_TIMEOUT_SEC", "45"))
+
+
+def progress(msg: str) -> None:
+    if not PROGRESS_ENABLED:
+        return
+    sys.stderr.write(f"[cdp_chatgpt] {msg}\n")
+    sys.stderr.flush()
 
 
 def http_json(url: str, timeout: float = 5.0):
@@ -139,6 +152,18 @@ def js_state_expr() -> str:
   const assistants = qa('[data-message-author-role="assistant"]');
   const stop = q('button[data-testid="stop-button"], button[aria-label*="Stop"]');
 
+  const lastUserEl = users.length ? users[users.length - 1] : null;
+  const lastU = text(lastUserEl);
+  const up = lastUserEl ? lastUserEl.parentElement : null;
+  const uidx = (lastUserEl && up) ? Array.from(up.children).indexOf(lastUserEl) : -1;
+  const lastUserSig = lastUserEl ? [
+    lastUserEl.getAttribute('data-message-id') || '',
+    lastUserEl.getAttribute('data-testid') || '',
+    lastUserEl.getAttribute('id') || '',
+    String(uidx),
+    String((lastUserEl.textContent || '').length),
+  ].join('|') : "";
+
   const lastEl = assistants.length ? assistants[assistants.length - 1] : null;
   const lastA = text(lastEl);
   const parent = lastEl ? lastEl.parentElement : null;
@@ -153,6 +178,8 @@ def js_state_expr() -> str:
   return {
     url: location.href,
     userCount: users.length,
+    lastUser: lastU,
+    lastUserSig: lastUserSig,
     assistantCount: assistants.length,
     lastAssistant: lastA,
     lastAssistantSig: lastSig,
@@ -241,6 +268,28 @@ def js_send_expr(prompt: str) -> str:
 """.strip()
 
 
+def js_press_enter_expr() -> str:
+    return r"""
+(() => {
+  const q = (sel) => document.querySelector(sel);
+  const ed =
+    q('#prompt-textarea[contenteditable="true"]') ||
+    q('#prompt-textarea') ||
+    q('[contenteditable="true"].ProseMirror');
+  if (!ed) return {ok:false, error:'prompt editor not found'};
+  try {
+    ed.focus();
+    ed.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}));
+    ed.dispatchEvent(new KeyboardEvent('keypress', {key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}));
+    ed.dispatchEvent(new KeyboardEvent('keyup', {key:'Enter', code:'Enter', which:13, keyCode:13, bubbles:true}));
+    return {ok:true, method:'enter-only'};
+  } catch (e) {
+    return {ok:false, error:'enter-send failed'};
+  }
+})()
+""".strip()
+
+
 def normalize_assistant_text(s: str) -> str:
     # Normalize whitespace and strip transient typing cursor glyphs.
     txt = re.sub(r"\s+", " ", (s or "").strip())
@@ -248,11 +297,41 @@ def normalize_assistant_text(s: str) -> str:
     return txt
 
 
+def wait_for_dispatch_signal(cdp: CDP, baseline: dict, max_wait_s: float = 8.0) -> bool:
+    """Return True if UI indicates prompt was dispatched (stop/activity/user turn)."""
+    deadline = time.time() + max_wait_s
+    state_expr = js_state_expr()
+    b_user = int(baseline.get("userCount") or 0)
+    b_asst = int(baseline.get("assistantCount") or 0)
+    b_user_sig = (baseline.get("lastUserSig") or "").strip()
+    b_asst_sig = (baseline.get("lastAssistantSig") or "").strip()
+    while time.time() < deadline:
+        st = cdp.eval(state_expr, timeout=10.0) or {}
+        user_count = int(st.get("userCount") or 0)
+        asst_count = int(st.get("assistantCount") or 0)
+        user_sig = (st.get("lastUserSig") or "").strip()
+        asst_sig = (st.get("lastAssistantSig") or "").strip()
+        stop_visible = bool(st.get("stopVisible"))
+        if (
+            stop_visible
+            or user_count > b_user
+            or asst_count > b_asst
+            or (user_sig and user_sig != b_user_sig)
+            or (asst_sig and asst_sig != b_asst_sig)
+        ):
+            return True
+        time.sleep(0.2)
+    return False
+
+
 def wait_for_response(cdp: CDP, baseline: dict, timeout_s: float) -> str:
-    deadline = time.time() + timeout_s
+    t0 = time.time()
+    deadline = t0 + timeout_s
+    activity_deadline = t0 + min(timeout_s, max(15.0, ACTIVITY_TIMEOUT_SEC))
     state_expr = js_state_expr()
 
     b_user = int(baseline.get("userCount") or 0)
+    b_user_sig = (baseline.get("lastUserSig") or "").strip()
     b_asst = int(baseline.get("assistantCount") or 0)
     b_sig = (baseline.get("lastAssistantSig") or "").strip()
 
@@ -260,41 +339,76 @@ def wait_for_response(cdp: CDP, baseline: dict, timeout_s: float) -> str:
     # assistant/user counters do not always increase.
     saw_activity = False
     saw_stop = False
-    while time.time() < deadline:
+    next_heartbeat = t0
+    while time.time() < activity_deadline:
         st = cdp.eval(state_expr, timeout=10.0) or {}
         user_count = int(st.get("userCount") or 0)
+        user_sig = (st.get("lastUserSig") or "").strip()
         asst_count = int(st.get("assistantCount") or 0)
         sig = (st.get("lastAssistantSig") or "").strip()
         stop_visible = bool(st.get("stopVisible"))
+        if time.time() >= next_heartbeat:
+            progress(
+                "phase=wait_activity"
+                f" elapsed={time.time()-t0:.1f}s"
+                f" user={user_count}/{b_user}"
+                f" asst={asst_count}/{b_asst}"
+                f" stop={int(stop_visible)}"
+                f" user_sig_changed={int(bool(user_sig and user_sig != b_user_sig))}"
+                f" asst_sig_changed={int(bool(sig and sig != b_sig))}"
+            )
+            next_heartbeat = time.time() + HEARTBEAT_SEC
         if stop_visible:
             saw_stop = True
         if (
             user_count > b_user
+            or (user_sig and user_sig != b_user_sig)
             or asst_count > b_asst
             or (sig and sig != b_sig)
             or stop_visible
         ):
             saw_activity = True
+            progress(
+                "phase=wait_activity event=detected"
+                f" elapsed={time.time()-t0:.1f}s"
+                f" user={user_count} asst={asst_count} stop={int(stop_visible)}"
+            )
             break
         time.sleep(0.5)
     else:
-        raise TimeoutError("Timed out waiting for assistant response activity")
+        waited = time.time() - t0
+        raise TimeoutError(
+            f"Timed out waiting for assistant response activity "
+            f"(phase=wait_activity waited={waited:.1f}s limit={min(timeout_s, max(15.0, ACTIVITY_TIMEOUT_SEC)):.1f}s)"
+        )
 
     # Wait until generation is done: stop button hidden AND last assistant state stabilizes.
     last_marker = None
     last_raw_text = ""
     stable = 0
     changed_vs_baseline = False
+    next_heartbeat = time.time()
     while time.time() < deadline:
         st = cdp.eval(state_expr, timeout=10.0) or {}
         raw_txt = (st.get("lastAssistant") or "").strip()
         txt = normalize_assistant_text(raw_txt)
+        user_sig = (st.get("lastUserSig") or "").strip()
         sig = (st.get("lastAssistantSig") or "").strip()
         asst_count = int(st.get("assistantCount") or 0)
         stop_visible = bool(st.get("stopVisible"))
+        if time.time() >= next_heartbeat:
+            progress(
+                "phase=wait_finish"
+                f" elapsed={time.time()-t0:.1f}s"
+                f" asst={asst_count}/{b_asst}"
+                f" stop={int(stop_visible)}"
+                f" stable={stable}"
+                f" changed={int(changed_vs_baseline)}"
+            )
+            next_heartbeat = time.time() + HEARTBEAT_SEC
         if stop_visible:
             saw_stop = True
-        if asst_count > b_asst or (sig and sig != b_sig):
+        if asst_count > b_asst or (sig and sig != b_sig) or (user_sig and user_sig != b_user_sig):
             changed_vs_baseline = True
 
         marker = (sig, txt, asst_count)
@@ -314,13 +428,16 @@ def wait_for_response(cdp: CDP, baseline: dict, timeout_s: float) -> str:
             and (changed_vs_baseline or saw_stop or saw_activity)
             and (txt or last_raw_text)
         ):
+            progress(f"phase=wait_finish event=completed elapsed={time.time()-t0:.1f}s")
             return (raw_txt or last_raw_text).strip()
         time.sleep(0.5)
-    raise TimeoutError("Timed out waiting for assistant to finish")
+    raise TimeoutError(f"Timed out waiting for assistant to finish (phase=wait_finish waited={time.time()-t0:.1f}s)")
 
 
 def wait_for_composer(cdp: CDP, timeout_s: float = 30.0) -> None:
     deadline = time.time() + timeout_s
+    t0 = time.time()
+    next_heartbeat = t0
     expr = r"""
 (() => {
   const ed =
@@ -333,9 +450,13 @@ def wait_for_composer(cdp: CDP, timeout_s: float = 30.0) -> None:
     while time.time() < deadline:
         try:
             if cdp.eval(expr, timeout=10.0):
+                progress(f"phase=wait_composer event=ready elapsed={time.time()-t0:.1f}s")
                 return
         except Exception:
             pass
+        if time.time() >= next_heartbeat:
+            progress(f"phase=wait_composer elapsed={time.time()-t0:.1f}s")
+            next_heartbeat = time.time() + HEARTBEAT_SEC
         time.sleep(0.25)
     raise TimeoutError("Timed out waiting for ChatGPT composer to be ready")
 
@@ -348,14 +469,31 @@ def wait_until_send_ready(cdp: CDP, timeout_s: float = 180.0) -> None:
     and lead to false "hung" conclusions.
     """
     deadline = time.time() + timeout_s
+    t0 = time.time()
+    next_heartbeat = t0
     expr = js_send_ready_expr()
     while time.time() < deadline:
         st = cdp.eval(expr, timeout=10.0) or {}
         has_editor = bool(st.get("hasEditor"))
+        has_send = bool(st.get("hasSend"))
         stop_visible = bool(st.get("stopVisible"))
         # hasSend can be false on some UI variants; Enter fallback still works.
         if has_editor and not stop_visible:
+            progress(
+                "phase=wait_send_ready event=ready"
+                f" elapsed={time.time()-t0:.1f}s"
+                f" has_send={int(has_send)}"
+            )
             return
+        if time.time() >= next_heartbeat:
+            progress(
+                "phase=wait_send_ready"
+                f" elapsed={time.time()-t0:.1f}s"
+                f" has_editor={int(has_editor)}"
+                f" has_send={int(has_send)}"
+                f" stop={int(stop_visible)}"
+            )
+            next_heartbeat = time.time() + HEARTBEAT_SEC
         time.sleep(0.5)
     raise TimeoutError("Timed out waiting for ChatGPT to become ready for a new prompt")
 
@@ -368,6 +506,7 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=900.0)
     args = ap.parse_args()
 
+    progress(f"phase=start cdp_port={args.cdp_port} timeout={args.timeout}")
     tabs = http_json(f"http://127.0.0.1:{args.cdp_port}/json/list", timeout=5.0)
     target = find_target_tab(tabs, args.chatgpt_url)
     if not target:
@@ -375,12 +514,14 @@ def main() -> int:
         return 2
 
     ws_url = target.get("webSocketDebuggerUrl")
+    progress(f"phase=target_tab_found url={normalize_url(target.get('url') or '')}")
     if not ws_url:
         sys.stderr.write("Target tab is missing webSocketDebuggerUrl\n")
         return 2
 
     try:
         cdp = CDP(ws_url, timeout=15.0)
+        progress("phase=cdp_connect event=ok")
     except WebSocketBadStatusException as e:
         msg = str(e)
         if "remote-allow-origins" in msg or "Rejected an incoming WebSocket connection" in msg:
@@ -411,11 +552,28 @@ def main() -> int:
         wait_until_send_ready(cdp, timeout_s=min(float(args.timeout), 300.0))
 
         baseline = cdp.eval(js_state_expr(), timeout=10.0) or {}
+        progress(
+            "phase=baseline"
+            f" user={int(baseline.get('userCount') or 0)}"
+            f" asst={int(baseline.get('assistantCount') or 0)}"
+        )
         send_res = {}
         for _ in range(20):
             send_res = cdp.eval(js_send_expr(args.prompt), timeout=10.0) or {}
             if isinstance(send_res, dict) and send_res.get("ok"):
-                break
+                method = send_res.get("method", "unknown")
+                progress(f"phase=send event=ok method={method}")
+                if wait_for_dispatch_signal(cdp, baseline, max_wait_s=8.0):
+                    progress("phase=send event=dispatched")
+                    break
+                progress("phase=send event=no_dispatch_after_send retry=enter")
+                enter_res = cdp.eval(js_press_enter_expr(), timeout=10.0) or {}
+                if isinstance(enter_res, dict) and enter_res.get("ok"):
+                    if wait_for_dispatch_signal(cdp, baseline, max_wait_s=8.0):
+                        progress("phase=send event=dispatched_via_enter")
+                        break
+                time.sleep(0.15)
+                continue
             err = send_res.get("error") if isinstance(send_res, dict) else "unknown"
             if err in ("send button not found", "prompt editor not found"):
                 time.sleep(0.1)
@@ -427,6 +585,7 @@ def main() -> int:
             return 3
 
         answer = wait_for_response(cdp, baseline, timeout_s=float(args.timeout))
+        progress("phase=done event=answer_ready")
         sys.stdout.write(answer.strip() + "\n")
         return 0
     except TimeoutError as e:

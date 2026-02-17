@@ -45,7 +45,7 @@ Options:
   -h, --help                  Show help
 
 Output:
-  Prints child metadata (RUN_ID, LOG_FILE, LAST_FILE, EXIT_FILE, STATE_ROOT, CDP_PORT).
+  Prints child metadata (RUN_ID, LOG_FILE, LAST_FILE, EXIT_FILE, STATE_ROOT, CODEX_CHATGPT_SEND_ROOT, CDP_PORT).
   In --wait mode also prints CHILD_STATUS and CHILD_RESULT.
 EOF
 }
@@ -191,6 +191,11 @@ if (( STATE_ROOT_SET == 0 )); then
 fi
 mkdir -p "$STATE_ROOT/state"
 
+# Codex child runs in workspace-write sandbox (project path + /tmp), so
+# CHATGPT_SEND_ROOT used by commands inside child must be writable there.
+CODEX_CHATGPT_SEND_ROOT="${PROJECT_PATH}/.chatgpt_send_child_state/${run_id}"
+mkdir -p "$CODEX_CHATGPT_SEND_ROOT/state"
+
 if [[ "$BROWSER_MODE" == "shared" ]]; then
   CHILD_PROFILE_DIR="${chatgpt_tool_root}/state/manual-login-profile"
   CHATGPT_SEND_PRESERVE_TABS_VALUE="1"
@@ -199,24 +204,31 @@ if [[ "$BROWSER_MODE" == "shared" ]]; then
   elif [[ "${CHATGPT_SEND_LOCK_FILE+x}" == "x" ]]; then
     SHARED_BROWSER_LOCK_FILE="${CHATGPT_SEND_LOCK_FILE}"
   else
-    SHARED_BROWSER_LOCK_FILE="${chatgpt_tool_root}/state/shared-browser.lock"
+    # Keep lock writable from child sandbox.
+    SHARED_BROWSER_LOCK_FILE="/tmp/chatgpt-send-shared-browser.lock"
   fi
 else
   CHILD_PROFILE_DIR="${STATE_ROOT}/state/manual-login-profile"
   CHATGPT_SEND_PRESERVE_TABS_VALUE="0"
-  SHARED_BROWSER_LOCK_FILE="${STATE_ROOT}/state/browser.lock"
+  SHARED_BROWSER_LOCK_FILE="${CODEX_CHATGPT_SEND_ROOT}/state/browser.lock"
 fi
 if [[ -n "${SHARED_BROWSER_LOCK_FILE:-}" ]]; then
   mkdir -p "$(dirname "$SHARED_BROWSER_LOCK_FILE")"
 fi
 
 # chatgpt_send expects ROOT/bin and ROOT/docs to exist when CHATGPT_SEND_ROOT is overridden.
-# For isolated child roots, provide these as symlinks to the canonical tool root.
+# Provide these as symlinks to the canonical tool root for both roots.
 if [[ ! -e "$STATE_ROOT/bin" ]]; then
   ln -s "$chatgpt_tool_root/bin" "$STATE_ROOT/bin"
 fi
 if [[ ! -e "$STATE_ROOT/docs" ]]; then
   ln -s "$chatgpt_tool_root/docs" "$STATE_ROOT/docs"
+fi
+if [[ ! -e "$CODEX_CHATGPT_SEND_ROOT/bin" ]]; then
+  ln -s "$chatgpt_tool_root/bin" "$CODEX_CHATGPT_SEND_ROOT/bin"
+fi
+if [[ ! -e "$CODEX_CHATGPT_SEND_ROOT/docs" ]]; then
+  ln -s "$chatgpt_tool_root/docs" "$CODEX_CHATGPT_SEND_ROOT/docs"
 fi
 
 choose_port() {
@@ -286,7 +298,7 @@ EOF
 cat >"$runner_file" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-export CHATGPT_SEND_ROOT='${STATE_ROOT}'
+export CHATGPT_SEND_ROOT='${CODEX_CHATGPT_SEND_ROOT}'
 export CHATGPT_SEND_CDP_PORT='${CDP_PORT}'
 export CHATGPT_SEND_PROFILE_DIR='${CHILD_PROFILE_DIR}'
 export CHATGPT_SEND_PRESERVE_TABS='${CHATGPT_SEND_PRESERVE_TABS_VALUE}'
@@ -299,6 +311,7 @@ echo \$\$ > '${pid_file}'
   echo "[child] run_id=${run_id}"
   echo "[child] project=${PROJECT_PATH}"
   echo "[child] state_root=\${CHATGPT_SEND_ROOT}"
+  echo "[child] coordinator_state_root=${STATE_ROOT}"
   echo "[child] cdp_port=\${CHATGPT_SEND_CDP_PORT}"
   echo "[child] profile_dir=\${CHATGPT_SEND_PROFILE_DIR}"
   echo "[child] preserve_tabs=\${CHATGPT_SEND_PRESERVE_TABS}"
@@ -395,10 +408,16 @@ if [[ -f '${last_file}' ]]; then
 fi
 prompt_cmd_count="\$(grep -Ec 'chatgpt_send[^[:cntrl:]]*--prompt' '${log_file}' || true)"
 chat_url_line="\$(grep -Eo 'specialist_chat_url=https://chatgpt\\.com/c/[A-Za-z0-9-]+' '${log_file}' | tail -n 1 || true)"
+has_browser_evidence=0
+if [[ "\${browser_line}" =~ EVIDENCE:[[:space:]]*https://chatgpt\.com/c/ ]]; then
+  has_browser_evidence=1
+fi
 policy_fail_code=0
 
 if [[ '${BROWSER_POLICY}' == 'required' ]]; then
-  if [[ '${INIT_SPECIALIST_CHAT}' == '1' ]] && [[ -z "\${chat_url_line}" ]]; then
+  # Do not fail solely because early URL sync did not return /c/... .
+  # If child later proves real browser usage with chat evidence, policy is satisfied.
+  if [[ '${INIT_SPECIALIST_CHAT}' == '1' ]] && [[ -z "\${chat_url_line}" ]] && [[ "\${has_browser_evidence}" == "0" ]] && [[ "\${prompt_cmd_count}" == "0" ]]; then
     policy_fail_code=45
   fi
   if [[ "\${prompt_cmd_count}" == "0" ]]; then
@@ -425,6 +444,13 @@ fi
 if [[ "\${policy_fail_code}" != "0" ]]; then
   echo "[child] browser_policy_check=failed code=\${policy_fail_code} prompt_cmd_count=\${prompt_cmd_count} line=\${browser_line}" >> '${log_file}'
   st="\${policy_fail_code}"
+fi
+
+# Codex may return non-zero on rollout-recorder shutdown even after producing
+# a valid final CHILD_RESULT. Keep successful handoffs stable for coordinator.
+if [[ "\${st}" != "0" ]] && [[ "\${policy_fail_code}" == "0" ]] && [[ -f '${last_file}' ]] && grep -q '^CHILD_RESULT:' '${last_file}'; then
+  echo "[child] normalized_exit=0 reason=child_result_present original_exit=\${st}" >> '${log_file}'
+  st=0
 fi
 
 exit \$st
@@ -469,6 +495,7 @@ echo "OPEN_BROWSER_EFFECTIVE=${OPEN_BROWSER}"
 echo "INIT_SPECIALIST_CHAT=${INIT_SPECIALIST_CHAT}"
 echo "PROJECT_PATH=${PROJECT_PATH}"
 echo "STATE_ROOT=${STATE_ROOT}"
+echo "CODEX_CHATGPT_SEND_ROOT=${CODEX_CHATGPT_SEND_ROOT}"
 echo "PROFILE_DIR=${CHILD_PROFILE_DIR}"
 echo "CDP_PORT=${CDP_PORT}"
 echo "LOG_FILE=${log_file}"

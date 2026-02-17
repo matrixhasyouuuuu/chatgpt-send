@@ -31,9 +31,19 @@ done
 # consume stdin prompt (not used)
 cat >/dev/null || true
 if [[ -n "${out:-}" ]]; then
-  printf '%s\n' 'CHILD_RESULT: fake solved task' >"$out"
+  if [[ "${FAKE_CODEX_WITH_BROWSER_OK:-0}" == "1" ]]; then
+    printf '%s\n' 'CHILD_BROWSER_USED: yes ; REASON: test ; EVIDENCE: https://chatgpt.com/c/abcd-1234' >"$out"
+    printf '%s\n' 'CHILD_RESULT: fake solved task' >>"$out"
+  else
+    printf '%s\n' 'CHILD_RESULT: fake solved task' >"$out"
+  fi
+fi
+if [[ "${FAKE_CODEX_WITH_BROWSER_OK:-0}" == "1" ]]; then
+  printf '%s\n' 'chatgpt_send --prompt simulated'
+  printf '%s\n' 'CHILD_BROWSER_USED: yes ; REASON: test ; EVIDENCE: https://chatgpt.com/c/abcd-1234'
 fi
 printf '%s\n' 'CHILD_RESULT: fake solved task'
+exit "${FAKE_CODEX_EXIT:-0}"
 EOF
 chmod +x "$fake_codex"
 
@@ -71,6 +81,7 @@ out="$(FAKE_CODEX_ARGS_FILE="$codex_args_file" "$SPAWN" \
 
 echo "$out" | rg -q -- '^RUN_ID='
 echo "$out" | rg -q -- '^STATE_ROOT='
+echo "$out" | rg -q -- '^CODEX_CHATGPT_SEND_ROOT='
 echo "$out" | rg -q -- '^CDP_PORT='
 echo "$out" | rg -q -- '^BROWSER_POLICY=optional$'
 echo "$out" | rg -q -- '^INIT_SPECIALIST_CHAT=1$'
@@ -78,26 +89,29 @@ echo "$out" | rg -q -- '^CHILD_STATUS=0$'
 echo "$out" | rg -q -- '^CHILD_RESULT=CHILD_RESULT: fake solved task$'
 
 state_root="$(echo "$out" | sed -n 's/^STATE_ROOT=//p' | head -n 1)"
+codex_chatgpt_root="$(echo "$out" | sed -n 's/^CODEX_CHATGPT_SEND_ROOT=//p' | head -n 1)"
 cdp_port="$(echo "$out" | sed -n 's/^CDP_PORT=//p' | head -n 1)"
 browser_mode="$(echo "$out" | sed -n 's/^BROWSER_MODE=//p' | head -n 1)"
 last_file="$(echo "$out" | sed -n 's/^LAST_FILE=//p' | head -n 1)"
 
 [[ -d "$state_root" ]]
+[[ -d "$codex_chatgpt_root" ]]
 [[ -f "$last_file" ]]
 rg -q -- '^CHILD_RESULT: fake solved task$' "$last_file"
 [[ "$browser_mode" == "shared" ]]
 [[ "$state_root" == "$tool_root/state/child-agents-shared/"* ]]
+[[ "$codex_chatgpt_root" == "$proj/.chatgpt_send_child_state/"* ]]
 [[ "$cdp_port" == "9222" ]]
 
 # Verify default codex arg for non-trusted/non-git directories is passed.
 rg -q -- '--skip-git-repo-check' "$codex_args_file"
 
 # Verify browser helper received child env.
-rg -q -- "ROOT=$state_root" "$env_capture"
+rg -q -- "ROOT=$codex_chatgpt_root" "$env_capture"
 rg -q -- "PORT=$cdp_port" "$env_capture"
 rg -q -- "PROFILE=$tool_root/state/manual-login-profile" "$env_capture"
 rg -q -- "PRESERVE_TABS=1" "$env_capture"
-rg -q -- "LOCK_FILE=$tool_root/state/shared-browser.lock" "$env_capture"
+rg -q -- "LOCK_FILE=/tmp/chatgpt-send-shared-browser.lock" "$env_capture"
 rg -q -- "LOCK_TIMEOUT=180" "$env_capture"
 rg -q -- "AUTO_TIMEOUT=120" "$env_capture"
 rg -q -- "ARGS=--open-browser --chatgpt-url https://chatgpt.com/" "$env_capture"
@@ -140,6 +154,36 @@ set -e
 [[ "$st_required" -ne 0 ]]
 echo "$out_required" | rg -q -- '^BROWSER_POLICY=required$'
 echo "$out_required" | rg -q -- '^CHILD_STATUS_NOTE=browser_policy_failed$'
+
+# Verify browser-required passes when child provides valid browser evidence,
+# even if early specialist_chat_url sync is empty.
+out_required_ok="$(FAKE_CODEX_WITH_BROWSER_OK=1 FAKE_CODEX_ARGS_FILE="$codex_args_file" "$SPAWN" \
+  --project-path "$proj" \
+  --task "Browser required with proven evidence" \
+  --iterations 1 \
+  --launcher direct \
+  --wait \
+  --timeout-sec 30 \
+  --log-dir "$log_dir" \
+  --codex-bin "$fake_codex" \
+  --chatgpt-send-path "$fake_chatgpt_send" \
+  --browser-required 2>&1)"
+echo "$out_required_ok" | rg -q -- '^BROWSER_POLICY=required$'
+echo "$out_required_ok" | rg -q -- '^CHILD_STATUS=0$'
+
+# Verify non-zero codex exit is normalized when CHILD_RESULT is present.
+out_nonzero_ok="$(FAKE_CODEX_EXIT=1 FAKE_CODEX_ARGS_FILE="$codex_args_file" "$SPAWN" \
+  --project-path "$proj" \
+  --task "Codex non-zero but child result exists" \
+  --iterations 1 \
+  --launcher direct \
+  --wait \
+  --timeout-sec 30 \
+  --log-dir "$log_dir" \
+  --codex-bin "$fake_codex" \
+  --chatgpt-send-path "$fake_chatgpt_send" 2>&1)"
+echo "$out_nonzero_ok" | rg -q -- '^CHILD_STATUS=0$'
+echo "$out_nonzero_ok" | rg -q -- '^CHILD_RESULT=CHILD_RESULT: fake solved task$'
 
 # Verify early failure still writes exit metadata so coordinator won't hang.
 set +e

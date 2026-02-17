@@ -1267,6 +1267,21 @@ if [[ -z "$CHATGPT_URL" ]]; then
   fi
 fi
 
+# If caller passed generic home URL, prefer continuing active Specialist chat.
+# This preserves context by default and prevents accidental "new chat" sends.
+# Set CHATGPT_SEND_HOME_REUSES_ACTIVE=0 to disable.
+if [[ $INIT_SPECIALIST -eq 0 ]] && [[ "${CHATGPT_SEND_HOME_REUSES_ACTIVE:-1}" != "0" ]]; then
+  if [[ "${CHATGPT_URL:-}" == "https://chatgpt.com/" || "${CHATGPT_URL:-}" == "https://chatgpt.com" ]]; then
+    active_url="$(chats_db_get_active_url || true)"
+    if [[ -n "${active_url:-}" ]] && is_chat_conversation_url "$active_url"; then
+      CHATGPT_URL="$active_url"
+      if [[ $PRINT_URL -eq 1 ]]; then
+        echo "Reusing active Specialist chat: $CHATGPT_URL" >&2
+      fi
+    fi
+  fi
+fi
+
 if [[ $OPEN_BROWSER -eq 1 ]]; then
   url="${CHATGPT_URL:-https://chatgpt.com/}"
   open_browser_impl "$url" || exit 1
@@ -1434,6 +1449,20 @@ if [[ $status -eq 6 ]]; then
     sleep 0.8
   fi
   open_browser_impl "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+  set +e
+  send_via_cdp
+  status=$?
+  set -e
+fi
+
+if [[ $status -eq 1 ]]; then
+  # CDP HTTP endpoint may not be ready immediately after browser launch/focus.
+  # Wait briefly and retry once before failing hard.
+  echo "CDP connection failed (status=1). Waiting for browser CDP to become ready..." >&2
+  if ! wait_for_cdp; then
+    open_browser_impl "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+    wait_for_cdp || true
+  fi
   set +e
   send_via_cdp
   status=$?
