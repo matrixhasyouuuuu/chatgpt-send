@@ -87,6 +87,11 @@ AUTO_MONITOR_POLL_SEC="${SPAWN_AUTO_MONITOR_POLL_SEC:-2}"
 AUTO_MONITOR_HEARTBEAT_SEC="${SPAWN_AUTO_MONITOR_HEARTBEAT_SEC:-20}"
 AUTO_MONITOR_TIMEOUT_SEC="${SPAWN_AUTO_MONITOR_TIMEOUT_SEC:-0}"
 MONITOR_SCRIPT="${SPAWN_AUTO_MONITOR_SCRIPT:-$ROOT_DIR/scripts/child_run_monitor.sh}"
+FLEET_REGISTRY_FILE="${CHATGPT_SEND_FLEET_REGISTRY_FILE:-}"
+FLEET_AGENT_ID="${CHATGPT_SEND_FLEET_AGENT_ID:-}"
+FLEET_ATTEMPT="${CHATGPT_SEND_FLEET_ATTEMPT:-}"
+FLEET_ASSIGNED_CHAT_URL="${CHATGPT_SEND_FLEET_ASSIGNED_CHAT_URL:-}"
+FLEET_REGISTRY_LOCK_TIMEOUT_SEC="${CHATGPT_SEND_FLEET_REGISTRY_LOCK_TIMEOUT_SEC:-2}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -168,6 +173,10 @@ for n in "$AUTO_MONITOR_POLL_SEC" "$AUTO_MONITOR_HEARTBEAT_SEC" "$AUTO_MONITOR_T
     exit 2
   fi
 done
+if [[ ! "$FLEET_REGISTRY_LOCK_TIMEOUT_SEC" =~ ^[0-9]+$ ]]; then
+  echo "Error: CHATGPT_SEND_FLEET_REGISTRY_LOCK_TIMEOUT_SEC must be numeric, got: $FLEET_REGISTRY_LOCK_TIMEOUT_SEC" >&2
+  exit 2
+fi
 if (( AUTO_MONITOR_POLL_SEC < 1 )); then
   echo "Error: --auto-monitor-poll-sec must be >= 1." >&2
   exit 2
@@ -927,6 +936,58 @@ resolve_launcher() {
   echo "direct"
 }
 
+append_fleet_registry() {
+  local registry_file="${FLEET_REGISTRY_FILE:-}"
+  if [[ -z "$registry_file" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$registry_file")"
+  local assigned_chat="${FLEET_ASSIGNED_CHAT_URL:-${CHATGPT_SEND_FORCE_CHAT_URL:-}}"
+  local payload=""
+  payload="$(python3 - \
+    "$run_id" "$RUN_DIR" "$pid_file" "$exit_file" "$status_file" "$child_result_file" \
+    "$log_file" "$last_file" "$FLEET_AGENT_ID" "$FLEET_ATTEMPT" "$assigned_chat" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+run_id, run_dir, pid_file, exit_file, status_file, result_json, log_file, last_file, agent_id, attempt, assigned_chat = sys.argv[1:12]
+obj = {
+    "run_id": run_id,
+    "run_dir": run_dir,
+    "pid_file": pid_file,
+    "exit_file": exit_file,
+    "status_file": status_file,
+    "result_json": result_json,
+    "log_file": log_file,
+    "last_file": last_file,
+    "agent_id": agent_id or "",
+    "attempt": int(attempt) if attempt.isdigit() else None,
+    "assigned_chat_url": assigned_chat or "",
+    "ts": datetime.now(timezone.utc).isoformat(),
+}
+print(json.dumps(obj, ensure_ascii=False))
+PY
+)"
+  if [[ -z "$payload" ]]; then
+    return 0
+  fi
+  local registry_lock="${registry_file}.lock"
+  local reg_fd=""
+  exec {reg_fd}>>"$registry_lock" || true
+  if [[ -n "$reg_fd" ]]; then
+    if ! flock -w "$FLEET_REGISTRY_LOCK_TIMEOUT_SEC" "$reg_fd" >/dev/null 2>&1; then
+      echo "W_FLEET_REGISTRY_LOCK_TIMEOUT file=${registry_file} timeout_sec=${FLEET_REGISTRY_LOCK_TIMEOUT_SEC} run_id=${run_id}" >&2
+      exec {reg_fd}>&- || true
+      return 0
+    fi
+  fi
+  printf '%s\n' "$payload" >>"$registry_file"
+  if [[ -n "$reg_fd" ]]; then
+    exec {reg_fd}>&- || true
+  fi
+}
+
 launcher_mode="$(resolve_launcher)"
 if [[ "$launcher_mode" == "window" ]]; then
   if command -v gnome-terminal >/dev/null 2>&1; then
@@ -940,6 +1001,8 @@ if [[ "$launcher_mode" == "window" ]]; then
 else
   nohup "$runner_file" >/dev/null 2>&1 &
 fi
+
+append_fleet_registry
 
 auto_monitor_active=0
 monitor_log_file="$RUN_DIR/${run_id}.monitor.log"

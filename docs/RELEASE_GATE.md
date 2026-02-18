@@ -40,8 +40,14 @@ bash test/test_spawn_second_agent_e2e_mock_transport.sh
 bash test/test_multi_agent_parallel_e2e_mock_transport.sh
 bash test/test_spawn_second_agent.sh
 bash test/test_spawn_second_agent_auto_monitor.sh
+bash test/test_spawn_second_agent_registry.sh
+bash test/test_spawn_second_agent_registry_lock_timeout.sh
+bash test/test_child_fleet_monitor.sh
+bash test/test_child_fleet_monitor_offline.sh
+bash test/test_child_fleet_monitor_heartbeat.sh
 bash test/test_chat_pool_manager_check.sh
 bash test/test_agent_pool_mock_5_agents.sh
+bash test/test_agent_pool_auto_monitor_watchdog.sh
 bash test/test_cdp_chatgpt_wait.sh
 bash test/test_assistant_stability_guard.sh
 bash test/test_echo_miss_recover_no_resend.sh

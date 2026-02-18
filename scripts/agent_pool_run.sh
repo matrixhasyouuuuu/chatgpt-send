@@ -26,6 +26,22 @@ SKIP_GIT_REPO_CHECK=1
 CHAT_POOL_CHECK="${POOL_CHAT_POOL_CHECK:-1}"                # 1|0
 CHAT_POOL_PROBE="${POOL_CHAT_POOL_PROBE:-0}"                # 1|0
 CHAT_POOL_PROBE_NO_SEND="${POOL_CHAT_POOL_PROBE_NO_SEND:-1}" # 1|0
+FLEET_MONITOR_SCRIPT="${POOL_FLEET_MONITOR_SCRIPT:-$ROOT_DIR/scripts/child_fleet_monitor.sh}"
+FLEET_MONITOR_ENABLED="${POOL_FLEET_MONITOR_ENABLED:-1}"     # 1|0
+FLEET_MONITOR_POLL_SEC="${POOL_FLEET_MONITOR_POLL_SEC:-2}"
+FLEET_MONITOR_HEARTBEAT_SEC="${POOL_FLEET_MONITOR_HEARTBEAT_SEC:-20}"
+FLEET_MONITOR_TIMEOUT_SEC="${POOL_FLEET_MONITOR_TIMEOUT_SEC:-0}"
+FLEET_MONITOR_STUCK_AFTER_SEC="${POOL_FLEET_MONITOR_STUCK_AFTER_SEC:-240}"
+FLEET_MONITOR_STDOUT="${POOL_FLEET_MONITOR_STDOUT:-0}"       # 1|0
+FLEET_WATCHDOG_ENABLED="${POOL_FLEET_WATCHDOG_ENABLED:-1}"   # 1|0
+FLEET_WATCHDOG_COOLDOWN_SEC="${POOL_FLEET_WATCHDOG_COOLDOWN_SEC:-2}"
+FLEET_GATE_ENABLED="${POOL_FLEET_GATE_ENABLED:-1}"           # 1|0
+FLEET_GATE_TIMEOUT_SEC="${POOL_FLEET_GATE_TIMEOUT_SEC:-20}"
+FLEET_GATE_HEARTBEAT_SEC="${POOL_FLEET_GATE_HEARTBEAT_SEC:-0}"
+FLEET_REGISTRY_LOCK_TIMEOUT_SEC="${POOL_FLEET_REGISTRY_LOCK_TIMEOUT_SEC:-2}"
+POOL_LOCK_FILE="${POOL_LOCK_FILE:-/tmp/chatgpt-send-agent-pool.lock}"
+POOL_LOCK_TIMEOUT_SEC="${POOL_LOCK_TIMEOUT_SEC:-0}"
+POOL_KILL_GRACE_SEC="${POOL_KILL_GRACE_SEC:-5}"
 
 usage() {
   cat <<'USAGE'
@@ -112,19 +128,46 @@ if [[ ! "$BROWSER_POLICY" =~ ^(required|optional|disabled)$ ]]; then
   echo "invalid --browser-policy: $BROWSER_POLICY" >&2
   exit 6
 fi
-for n in "$CONCURRENCY" "$ITERATIONS" "$TIMEOUT_SEC" "$FAIL_FAST_AFTER" "$RETRY_MAX"; do
+for n in \
+  "$CONCURRENCY" "$ITERATIONS" "$TIMEOUT_SEC" "$FAIL_FAST_AFTER" "$RETRY_MAX" \
+  "$FLEET_MONITOR_POLL_SEC" "$FLEET_MONITOR_HEARTBEAT_SEC" "$FLEET_MONITOR_TIMEOUT_SEC" \
+  "$FLEET_MONITOR_STUCK_AFTER_SEC" "$FLEET_WATCHDOG_COOLDOWN_SEC" "$FLEET_GATE_TIMEOUT_SEC" \
+  "$FLEET_GATE_HEARTBEAT_SEC" "$FLEET_REGISTRY_LOCK_TIMEOUT_SEC" \
+  "$POOL_LOCK_TIMEOUT_SEC" "$POOL_KILL_GRACE_SEC"; do
   if [[ ! "$n" =~ ^[0-9]+$ ]]; then
     echo "numeric option expected, got: $n" >&2
     exit 7
   fi
 done
-if [[ ! "$CHAT_POOL_CHECK" =~ ^[01]$ ]] || [[ ! "$CHAT_POOL_PROBE" =~ ^[01]$ ]] || [[ ! "$CHAT_POOL_PROBE_NO_SEND" =~ ^[01]$ ]]; then
-  echo "chat pool switches must be 0 or 1" >&2
+if [[ ! "$CHAT_POOL_CHECK" =~ ^[01]$ ]] || [[ ! "$CHAT_POOL_PROBE" =~ ^[01]$ ]] || [[ ! "$CHAT_POOL_PROBE_NO_SEND" =~ ^[01]$ ]] \
+  || [[ ! "$FLEET_MONITOR_ENABLED" =~ ^[01]$ ]] || [[ ! "$FLEET_MONITOR_STDOUT" =~ ^[01]$ ]] \
+  || [[ ! "$FLEET_WATCHDOG_ENABLED" =~ ^[01]$ ]] || [[ ! "$FLEET_GATE_ENABLED" =~ ^[01]$ ]]; then
+  echo "switches must be 0 or 1" >&2
   exit 7
 fi
 if (( CONCURRENCY < 1 )); then
   echo "--concurrency must be >= 1" >&2
   exit 8
+fi
+if (( FLEET_MONITOR_ENABLED == 1 )) && [[ ! -x "$FLEET_MONITOR_SCRIPT" ]]; then
+  echo "fleet monitor script not executable: $FLEET_MONITOR_SCRIPT" >&2
+  exit 18
+fi
+if (( FLEET_MONITOR_POLL_SEC < 1 )); then
+  echo "POOL_FLEET_MONITOR_POLL_SEC must be >= 1" >&2
+  exit 19
+fi
+if (( FLEET_MONITOR_STUCK_AFTER_SEC < 1 )); then
+  echo "POOL_FLEET_MONITOR_STUCK_AFTER_SEC must be >= 1" >&2
+  exit 20
+fi
+if (( FLEET_GATE_ENABLED == 1 )) && (( FLEET_GATE_TIMEOUT_SEC < 1 )); then
+  echo "POOL_FLEET_GATE_TIMEOUT_SEC must be >= 1 when gate is enabled" >&2
+  exit 21
+fi
+if (( POOL_KILL_GRACE_SEC < 1 )); then
+  echo "POOL_KILL_GRACE_SEC must be >= 1" >&2
+  exit 22
 fi
 
 mapfile -t TASKS < <(sed -e 's/\r$//' "$TASKS_FILE" | sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d')
@@ -213,8 +256,20 @@ SUMMARY_JSONL="$POOL_RUN_DIR/summary.jsonl"
 SUMMARY_CSV="$POOL_RUN_DIR/summary.csv"
 FINAL_SUMMARY_JSONL="$POOL_RUN_DIR/summary.final.jsonl"
 FINAL_SUMMARY_CSV="$POOL_RUN_DIR/summary.final.csv"
+FLEET_REGISTRY_FILE="$POOL_RUN_DIR/fleet_registry.jsonl"
+FLEET_MONITOR_PID_FILE="$POOL_RUN_DIR/fleet.monitor.pid"
+FLEET_MONITOR_LOG="$POOL_RUN_DIR/fleet.monitor.log"
+FLEET_SUMMARY_JSON="$POOL_RUN_DIR/fleet.summary.json"
+FLEET_SUMMARY_CSV="$POOL_RUN_DIR/fleet.summary.csv"
+FLEET_HEARTBEAT_FILE="$POOL_RUN_DIR/fleet.heartbeat"
+FLEET_EVENTS_JSONL="$POOL_RUN_DIR/fleet.events.jsonl"
+FLEET_EVENTS_LOCK_FILE="$POOL_RUN_DIR/fleet.events.lock"
+FLEET_GATE_LOG="$POOL_RUN_DIR/fleet.gate.log"
+POOL_WATCHDOG_LOG="$POOL_RUN_DIR/pool.watchdog.log"
 printf 'agent,attempt,spawn_rc,child_run_id,status,exit_code,browser_used,duration_sec,chat_url,assigned_chat_url,observed_chat_url_before,observed_chat_url_after,chat_match,fail_kind,fail_reason,task_hash,task_nonce,result_json,stdout_file,task_file\n' >"$SUMMARY_CSV"
 : >"$SUMMARY_JSONL"
+: >"$FLEET_REGISTRY_FILE"
+: >"$POOL_WATCHDOG_LOG"
 
 declare -A TASK_FILE_BY_AGENT=()
 declare -A CHAT_BY_AGENT=()
@@ -255,6 +310,365 @@ fi
 declare -A FINAL_RC=()
 declare -A FINAL_OUT=()
 declare -A FINAL_ATTEMPT=()
+declare -a ACTIVE_SPAWN_PIDS=()
+FLEET_WATCHDOG_RESTARTS=0
+FLEET_WATCHDOG_LAST_RESTART_EPOCH=0
+FLEET_GATE_STATUS="SKIPPED"
+FLEET_GATE_REASON="disabled"
+FLEET_GATE_RC=0
+FLEET_GATE_COUNTS_JSON="{}"
+FLEET_GATE_DISK_STATUS="unknown"
+POOL_LOCK_FD=""
+POOL_ABORT=0
+POOL_ABORT_SIGNAL=""
+POOL_ABORT_RC=0
+POOL_ABORT_HANDLING=0
+POOL_ABORT_KILLED=0
+POOL_ABORT_REMAINING=0
+
+watchdog_log() {
+  local msg="$1"
+  printf '[pool-watchdog] ts=%s run_id=%s %s\n' "$(date -Iseconds)" "$POOL_RUN_ID" "$msg" >>"$POOL_WATCHDOG_LOG"
+}
+
+read_pid_file() {
+  local path="$1"
+  if [[ -f "$path" ]]; then
+    tr -d '[:space:]' <"$path" 2>/dev/null || true
+  fi
+}
+
+pid_is_alive() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1
+}
+
+acquire_pool_lock() {
+  mkdir -p "$(dirname "$POOL_LOCK_FILE")"
+  exec {POOL_LOCK_FD}>"$POOL_LOCK_FILE"
+  if [[ "$POOL_LOCK_TIMEOUT_SEC" == "0" ]]; then
+    if ! flock -n "$POOL_LOCK_FD"; then
+      echo "E_POOL_ALREADY_RUNNING lock_file=${POOL_LOCK_FILE} timeout_sec=${POOL_LOCK_TIMEOUT_SEC}" >&2
+      exit 2
+    fi
+  else
+    if ! flock -w "$POOL_LOCK_TIMEOUT_SEC" "$POOL_LOCK_FD"; then
+      echo "E_POOL_ALREADY_RUNNING lock_file=${POOL_LOCK_FILE} timeout_sec=${POOL_LOCK_TIMEOUT_SEC}" >&2
+      exit 2
+    fi
+  fi
+}
+
+release_pool_lock() {
+  if [[ -n "${POOL_LOCK_FD:-}" ]]; then
+    exec {POOL_LOCK_FD}>&- || true
+    POOL_LOCK_FD=""
+  fi
+}
+
+track_active_spawn_pid() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 0
+  ACTIVE_SPAWN_PIDS+=("$pid")
+}
+
+untrack_active_spawn_pid() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 0
+  local -a keep=()
+  local item=""
+  for item in "${ACTIVE_SPAWN_PIDS[@]:-}"; do
+    if [[ "$item" != "$pid" ]]; then
+      keep+=("$item")
+    fi
+  done
+  ACTIVE_SPAWN_PIDS=("${keep[@]}")
+}
+
+terminate_pids_with_grace() {
+  local grace_sec="$1"
+  shift
+  local -a pids=("$@")
+  local -a alive=()
+  local pid=""
+  for pid in "${pids[@]}"; do
+    if [[ -n "$pid" ]] && [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) && (( pid != $$ )) && kill -0 "$pid" >/dev/null 2>&1; then
+      alive+=("$pid")
+    fi
+  done
+  if (( ${#alive[@]} == 0 )); then
+    return 0
+  fi
+  POOL_ABORT_KILLED=$((POOL_ABORT_KILLED + ${#alive[@]}))
+  kill -TERM "${alive[@]}" >/dev/null 2>&1 || true
+  sleep "$grace_sec"
+  local -a still_alive=()
+  for pid in "${alive[@]}"; do
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      still_alive+=("$pid")
+    fi
+  done
+  if (( ${#still_alive[@]} > 0 )); then
+    POOL_ABORT_REMAINING=$((POOL_ABORT_REMAINING + ${#still_alive[@]}))
+    kill -KILL "${still_alive[@]}" >/dev/null 2>&1 || true
+  fi
+}
+
+collect_registry_child_pids() {
+  if [[ ! -f "$FLEET_REGISTRY_FILE" ]]; then
+    return 0
+  fi
+  python3 - "$FLEET_REGISTRY_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+registry = pathlib.Path(sys.argv[1])
+seen = set()
+for raw in registry.read_text(encoding="utf-8", errors="replace").splitlines():
+    line = raw.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    pid_file = str(obj.get("pid_file", "")).strip()
+    if not pid_file:
+        continue
+    p = pathlib.Path(pid_file)
+    if not p.exists():
+        continue
+    try:
+        pid = p.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        continue
+    if pid.isdigit() and pid not in seen:
+        seen.add(pid)
+        print(pid)
+PY
+}
+
+terminate_active_children() {
+  local -a child_pids=()
+  if mapfile -t child_pids < <(collect_registry_child_pids); then
+    terminate_pids_with_grace "$POOL_KILL_GRACE_SEC" "${child_pids[@]}"
+  fi
+}
+
+terminate_active_spawns() {
+  terminate_pids_with_grace "$POOL_KILL_GRACE_SEC" "${ACTIVE_SPAWN_PIDS[@]:-}"
+}
+
+on_pool_signal() {
+  local sig="$1"
+  if (( POOL_ABORT_HANDLING == 1 )); then
+    return 0
+  fi
+  POOL_ABORT_HANDLING=1
+  POOL_ABORT=1
+  POOL_ABORT_SIGNAL="$sig"
+  if [[ "$sig" == "INT" ]]; then
+    POOL_ABORT_RC=130
+  else
+    POOL_ABORT_RC=143
+  fi
+  watchdog_log "event=pool_abort_start signal=${sig}"
+  terminate_active_spawns
+  terminate_active_children
+  echo "POOL_ABORT signal=${sig} killed=${POOL_ABORT_KILLED} remaining=${POOL_ABORT_REMAINING}" >&2
+  watchdog_log "event=pool_abort_done signal=${sig}"
+  POOL_ABORT_HANDLING=0
+}
+
+trap 'on_pool_signal INT' INT
+trap 'on_pool_signal TERM' TERM
+trap 'release_pool_lock' EXIT
+
+start_fleet_monitor() {
+  local reason="${1:-manual}"
+  if [[ "$FLEET_MONITOR_ENABLED" != "1" ]]; then
+    return 0
+  fi
+
+  local existing_pid
+  existing_pid="$(read_pid_file "$FLEET_MONITOR_PID_FILE")"
+  if pid_is_alive "$existing_pid"; then
+    return 0
+  fi
+  rm -f "$FLEET_MONITOR_PID_FILE" >/dev/null 2>&1 || true
+  local cmd=(
+    "$FLEET_MONITOR_SCRIPT"
+    --pool-run-dir "$POOL_RUN_DIR"
+    --poll-sec "$FLEET_MONITOR_POLL_SEC"
+    --heartbeat-sec "$FLEET_MONITOR_HEARTBEAT_SEC"
+    --timeout-sec "$FLEET_MONITOR_TIMEOUT_SEC"
+    --stuck-after-sec "$FLEET_MONITOR_STUCK_AFTER_SEC"
+    --pid-file "$FLEET_MONITOR_PID_FILE"
+    --monitor-log "$FLEET_MONITOR_LOG"
+    --summary-json "$FLEET_SUMMARY_JSON"
+    --summary-csv "$FLEET_SUMMARY_CSV"
+    --registry-file "$FLEET_REGISTRY_FILE"
+  )
+  if [[ "$FLEET_MONITOR_STDOUT" == "1" ]]; then
+    cmd+=(--stdout)
+  fi
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "${cmd[@]}" >/dev/null 2>&1 < /dev/null || true
+  else
+    nohup "${cmd[@]}" >/dev/null 2>&1 &
+  fi
+
+  local monitor_pid=""
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    monitor_pid="$(read_pid_file "$FLEET_MONITOR_PID_FILE")"
+    if pid_is_alive "$monitor_pid"; then
+      watchdog_log "event=fleet_monitor_started pid=${monitor_pid} reason=${reason}"
+      return 0
+    fi
+    sleep 0.1
+  done
+  watchdog_log "event=fleet_monitor_start_failed reason=${reason}"
+  return 1
+}
+
+stop_fleet_monitor_if_running() {
+  if [[ "$FLEET_MONITOR_ENABLED" != "1" ]]; then
+    return 0
+  fi
+  local monitor_pid
+  monitor_pid="$(read_pid_file "$FLEET_MONITOR_PID_FILE")"
+  if ! pid_is_alive "$monitor_pid"; then
+    return 0
+  fi
+  kill "$monitor_pid" >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! pid_is_alive "$monitor_pid"; then
+      break
+    fi
+    sleep 0.2
+  done
+  if pid_is_alive "$monitor_pid"; then
+    kill -9 "$monitor_pid" >/dev/null 2>&1 || true
+  fi
+  watchdog_log "event=fleet_monitor_stopped pid=${monitor_pid}"
+}
+
+ensure_fleet_monitor_alive() {
+  local context="${1:-runtime}"
+  if [[ "$FLEET_MONITOR_ENABLED" != "1" ]] || [[ "$FLEET_WATCHDOG_ENABLED" != "1" ]]; then
+    return 0
+  fi
+  local monitor_pid
+  monitor_pid="$(read_pid_file "$FLEET_MONITOR_PID_FILE")"
+  if pid_is_alive "$monitor_pid"; then
+    return 0
+  fi
+  local now_epoch
+  now_epoch="$(date +%s)"
+  if (( FLEET_WATCHDOG_COOLDOWN_SEC > 0 )) && (( now_epoch - FLEET_WATCHDOG_LAST_RESTART_EPOCH < FLEET_WATCHDOG_COOLDOWN_SEC )); then
+    return 0
+  fi
+  FLEET_WATCHDOG_LAST_RESTART_EPOCH="$now_epoch"
+  if start_fleet_monitor "watchdog_${context}"; then
+    FLEET_WATCHDOG_RESTARTS=$((FLEET_WATCHDOG_RESTARTS + 1))
+    watchdog_log "event=fleet_monitor_restarted count=${FLEET_WATCHDOG_RESTARTS} context=${context}"
+  else
+    watchdog_log "event=fleet_monitor_restart_failed context=${context}"
+  fi
+}
+
+run_fleet_gate() {
+  FLEET_GATE_STATUS="SKIPPED"
+  FLEET_GATE_REASON="disabled"
+  FLEET_GATE_RC=0
+  FLEET_GATE_COUNTS_JSON="{}"
+  FLEET_GATE_DISK_STATUS="unknown"
+
+  if [[ "$FLEET_GATE_ENABLED" != "1" ]]; then
+    stop_fleet_monitor_if_running
+    return 0
+  fi
+  if [[ ! -x "$FLEET_MONITOR_SCRIPT" ]]; then
+    FLEET_GATE_STATUS="FAIL"
+    FLEET_GATE_REASON="fleet_monitor_missing"
+    FLEET_GATE_RC=127
+    return 1
+  fi
+
+  stop_fleet_monitor_if_running
+
+  set +e
+  "$FLEET_MONITOR_SCRIPT" \
+    --pool-run-dir "$POOL_RUN_DIR" \
+    --poll-sec 1 \
+    --heartbeat-sec "$FLEET_GATE_HEARTBEAT_SEC" \
+    --timeout-sec "$FLEET_GATE_TIMEOUT_SEC" \
+    --stuck-after-sec "$FLEET_MONITOR_STUCK_AFTER_SEC" \
+    --monitor-log "$FLEET_MONITOR_LOG" \
+    --summary-json "$FLEET_SUMMARY_JSON" \
+    --summary-csv "$FLEET_SUMMARY_CSV" \
+    --registry-file "$FLEET_REGISTRY_FILE" >"$FLEET_GATE_LOG" 2>&1
+  FLEET_GATE_RC=$?
+  set -e
+
+  if [[ -s "$FLEET_SUMMARY_JSON" ]]; then
+    if readarray -t gate_meta < <(python3 - "$FLEET_SUMMARY_JSON" <<'PY'
+import json
+import pathlib
+import sys
+
+obj = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+out = {
+    "total": int(obj.get("total", 0)),
+    "done_ok": int(obj.get("done_ok", 0)),
+    "done_fail": int(obj.get("done_fail", 0)),
+    "running": int(obj.get("running", 0)),
+    "stuck": int(obj.get("stuck", 0)),
+    "orphaned": int(obj.get("orphaned", 0)),
+    "unknown": int(obj.get("unknown", 0)),
+    "disk_status": str(obj.get("disk_status", "unknown") or "unknown"),
+    "disk_free_pct": obj.get("disk_free_pct"),
+    "disk_avail_kb": obj.get("disk_avail_kb"),
+}
+print(json.dumps(out, ensure_ascii=False, sort_keys=True))
+print(out["disk_status"])
+PY
+); then
+      FLEET_GATE_COUNTS_JSON="${gate_meta[0]:-{}}"
+      FLEET_GATE_DISK_STATUS="${gate_meta[1]:-unknown}"
+      if [[ -z "$FLEET_GATE_COUNTS_JSON" ]]; then
+        FLEET_GATE_COUNTS_JSON="{}"
+      fi
+    else
+      FLEET_GATE_COUNTS_JSON="{}"
+      FLEET_GATE_DISK_STATUS="unknown"
+    fi
+  fi
+
+  if [[ "$FLEET_GATE_DISK_STATUS" == "fail" ]]; then
+    FLEET_GATE_STATUS="FAIL"
+    FLEET_GATE_REASON="disk_low"
+    FLEET_GATE_RC=125
+    return 1
+  fi
+
+  if [[ "$FLEET_GATE_RC" == "0" ]]; then
+    FLEET_GATE_STATUS="PASS"
+    FLEET_GATE_REASON="ok"
+    return 0
+  fi
+
+  FLEET_GATE_STATUS="FAIL"
+  case "$FLEET_GATE_RC" in
+    1) FLEET_GATE_REASON="failed_or_orphaned" ;;
+    73) FLEET_GATE_REASON="lock_busy" ;;
+    124) FLEET_GATE_REASON="timeout" ;;
+    *) FLEET_GATE_REASON="monitor_rc_${FLEET_GATE_RC}" ;;
+  esac
+  return 1
+}
 
 run_one_agent_attempt() {
   local agent_id="$1"
@@ -262,6 +676,7 @@ run_one_agent_attempt() {
   local out_file="$3"
   local task_file="${TASK_FILE_BY_AGENT[$agent_id]}"
   local chat_url="${CHAT_BY_AGENT[$agent_id]}"
+  local fleet_registry_file="$FLEET_REGISTRY_FILE"
 
   mkdir -p "$POOL_AGENT_DIR/agent_${agent_id}"
   local run_env=()
@@ -273,6 +688,11 @@ run_one_agent_attempt() {
   if [[ -n "$chat_url" ]]; then
     run_env+=("CHATGPT_SEND_FORCE_CHAT_URL=$chat_url")
   fi
+  run_env+=("CHATGPT_SEND_FLEET_REGISTRY_FILE=$fleet_registry_file")
+  run_env+=("CHATGPT_SEND_FLEET_REGISTRY_LOCK_TIMEOUT_SEC=$FLEET_REGISTRY_LOCK_TIMEOUT_SEC")
+  run_env+=("CHATGPT_SEND_FLEET_AGENT_ID=$agent_id")
+  run_env+=("CHATGPT_SEND_FLEET_ATTEMPT=$attempt")
+  run_env+=("CHATGPT_SEND_FLEET_ASSIGNED_CHAT_URL=$chat_url")
 
   env "${run_env[@]}" \
     "$SPAWN" \
@@ -456,31 +876,45 @@ run_batch() {
   local stop_launch=0
 
   for agent_id in "${agents[@]}"; do
+    if (( POOL_ABORT == 1 )); then
+      stop_launch=1
+    fi
+    ensure_fleet_monitor_alive "attempt_${attempt}_before_launch_${agent_id}"
     if [[ "$stop_launch" == "1" ]]; then
-      FINAL_RC["$agent_id"]=99
-      FINAL_OUT["$agent_id"]=""
+      FINAL_RC["$agent_id"]="${POOL_ABORT_RC:-99}"
+      out_file="$POOL_AGENT_DIR/agent_${agent_id}/attempt_${attempt}.stdout"
+      : >"$out_file"
+      FINAL_OUT["$agent_id"]="$out_file"
       FINAL_ATTEMPT["$agent_id"]="$attempt"
+      append_summary_for_attempt "$agent_id" "$attempt" "${POOL_ABORT_RC:-99}" "$out_file"
       continue
     fi
 
     out_file="$POOL_AGENT_DIR/agent_${agent_id}/attempt_${attempt}.stdout"
     run_one_agent_attempt "$agent_id" "$attempt" "$out_file" &
     pid=$!
+    track_active_spawn_pid "$pid"
     running_pids+=("$pid")
     running_agents+=("$agent_id")
 
     while (( ${#running_pids[@]} >= CONCURRENCY )); do
+      if (( POOL_ABORT == 1 )); then
+        stop_launch=1
+      fi
+      ensure_fleet_monitor_alive "attempt_${attempt}_before_wait"
       pid0="${running_pids[0]}"
       agent0="${running_agents[0]}"
       set +e
       wait "$pid0"
       rc0=$?
       set -e
+      untrack_active_spawn_pid "$pid0"
       out0="$POOL_AGENT_DIR/agent_${agent0}/attempt_${attempt}.stdout"
       FINAL_RC["$agent0"]="$rc0"
       FINAL_OUT["$agent0"]="$out0"
       FINAL_ATTEMPT["$agent0"]="$attempt"
       append_summary_for_attempt "$agent0" "$attempt" "$rc0" "$out0"
+      ensure_fleet_monitor_alive "attempt_${attempt}_after_wait_${agent0}"
       if [[ "$rc0" != "0" ]]; then
         fail_count=$((fail_count + 1))
       fi
@@ -494,17 +928,20 @@ run_batch() {
   done
 
   for idx in "${!running_pids[@]}"; do
+    ensure_fleet_monitor_alive "attempt_${attempt}_tail_wait"
     pid="${running_pids[$idx]}"
     agent="${running_agents[$idx]}"
     set +e
     wait "$pid"
     rc=$?
     set -e
+    untrack_active_spawn_pid "$pid"
     out="$POOL_AGENT_DIR/agent_${agent}/attempt_${attempt}.stdout"
     FINAL_RC["$agent"]="$rc"
     FINAL_OUT["$agent"]="$out"
     FINAL_ATTEMPT["$agent"]="$attempt"
     append_summary_for_attempt "$agent" "$attempt" "$rc" "$out"
+    ensure_fleet_monitor_alive "attempt_${attempt}_after_tail_${agent}"
   done
 }
 
@@ -513,9 +950,20 @@ for ((i=1; i<=TOTAL_AGENTS; i++)); do
   ALL_AGENTS+=("$i")
 done
 
+acquire_pool_lock
+
+if [[ "$FLEET_MONITOR_ENABLED" == "1" ]]; then
+  if ! start_fleet_monitor "startup"; then
+    watchdog_log "event=fleet_monitor_start_retry_planned"
+  fi
+fi
+
 run_batch 1 "${ALL_AGENTS[@]}"
 
 for ((attempt=2; attempt<=RETRY_MAX+1; attempt++)); do
+  if (( POOL_ABORT == 1 )); then
+    break
+  fi
   retry_agents=()
   for agent_id in "${ALL_AGENTS[@]}"; do
     rc="${FINAL_RC[$agent_id]:-0}"
@@ -642,14 +1090,31 @@ if [[ -z "$fail_breakdown" ]]; then
   fail_breakdown="{}"
 fi
 
+if ! run_fleet_gate; then
+  watchdog_log "event=fleet_gate_failed rc=${FLEET_GATE_RC} reason=${FLEET_GATE_REASON} counts_json=${FLEET_GATE_COUNTS_JSON}"
+else
+  watchdog_log "event=fleet_gate_pass counts_json=${FLEET_GATE_COUNTS_JSON}"
+fi
+
 pool_status="OK"
+pool_exit_rc=0
 if (( fail_count > 0 )); then
   pool_status="FAILED"
+  pool_exit_rc=1
+fi
+if [[ "$FLEET_GATE_STATUS" == "FAIL" ]]; then
+  pool_status="FAILED"
+  pool_exit_rc=1
+fi
+if (( POOL_ABORT == 1 )); then
+  pool_status="INTERRUPTED"
+  pool_exit_rc="${POOL_ABORT_RC:-130}"
 fi
 
 echo "POOL_RUN_ID=$POOL_RUN_ID"
 echo "POOL_RUN_DIR=$POOL_RUN_DIR"
 echo "POOL_MODE=$MODE"
+echo "POOL_LOCK_FILE=$POOL_LOCK_FILE"
 echo "POOL_TOTAL=$TOTAL_AGENTS"
 echo "POOL_OK=$ok_count"
 echo "POOL_FAIL=$fail_count"
@@ -658,11 +1123,32 @@ echo "POOL_SUMMARY_JSONL=$SUMMARY_JSONL"
 echo "POOL_SUMMARY_CSV=$SUMMARY_CSV"
 echo "POOL_FINAL_SUMMARY_JSONL=$FINAL_SUMMARY_JSONL"
 echo "POOL_FINAL_SUMMARY_CSV=$FINAL_SUMMARY_CSV"
+echo "POOL_FLEET_REGISTRY=$FLEET_REGISTRY_FILE"
+echo "POOL_FLEET_MONITOR_LOG=$FLEET_MONITOR_LOG"
+echo "POOL_FLEET_MONITOR_PID_FILE=$FLEET_MONITOR_PID_FILE"
+echo "POOL_FLEET_SUMMARY_JSON=$FLEET_SUMMARY_JSON"
+echo "POOL_FLEET_SUMMARY_CSV=$FLEET_SUMMARY_CSV"
+echo "POOL_FLEET_HEARTBEAT_FILE=$FLEET_HEARTBEAT_FILE"
+echo "POOL_FLEET_EVENTS_JSONL=$FLEET_EVENTS_JSONL"
+echo "POOL_FLEET_GATE_LOG=$FLEET_GATE_LOG"
+echo "POOL_FLEET_GATE_STATUS=$FLEET_GATE_STATUS"
+echo "POOL_FLEET_GATE_REASON=$FLEET_GATE_REASON"
+echo "POOL_FLEET_GATE_RC=$FLEET_GATE_RC"
+echo "POOL_FLEET_GATE_DISK_STATUS=$FLEET_GATE_DISK_STATUS"
+echo "POOL_FLEET_GATE_COUNTS_JSON=$FLEET_GATE_COUNTS_JSON"
+echo "POOL_FLEET_WATCHDOG_RESTARTS=$FLEET_WATCHDOG_RESTARTS"
+echo "POOL_WATCHDOG_LOG=$POOL_WATCHDOG_LOG"
+echo "POOL_ABORT=$POOL_ABORT"
+echo "POOL_ABORT_SIGNAL=${POOL_ABORT_SIGNAL:-none}"
+echo "POOL_ABORT_KILLED=$POOL_ABORT_KILLED"
+echo "POOL_ABORT_REMAINING=$POOL_ABORT_REMAINING"
 echo "POOL_FAIL_BREAKDOWN_JSON=$fail_breakdown"
 echo "POOL_STATUS=$pool_status"
 
-if [[ "$pool_status" != "OK" ]]; then
-  exit 1
+release_pool_lock
+
+if (( pool_exit_rc != 0 )); then
+  exit "$pool_exit_rc"
 fi
 
 exit 0

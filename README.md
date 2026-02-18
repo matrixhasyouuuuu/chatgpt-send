@@ -253,6 +253,21 @@ Run several child agents (parallel example):
 
 Each command prints `RUN_ID`, `LOG_FILE`, `LAST_FILE`, `EXIT_FILE` and auto-monitor metadata. You can rely on monitor logs instead of manual polling.
 
+When you launch several child agents under one run root, monitor the whole fleet and get a final summary automatically:
+
+```bash
+./scripts/child_fleet_monitor.sh \
+  --pool-run-dir /abs/path/to/pool_run \
+  --poll-sec 2 \
+  --summary-json /abs/path/to/pool_run/fleet.summary.json
+```
+
+Monitor writes atomic snapshots (`fleet.summary.json` + `fleet.summary.csv`) with per-agent classes (`RUNNING`, `STUCK`, `DONE_OK`, `DONE_FAIL`, `ORPHANED`) and uses single-instance lock/pid files.
+
+`scripts/agent_pool_run.sh` can also run this monitor automatically (with watchdog restart + strict end-of-run gate). The pool output includes:
+- `POOL_FLEET_MONITOR_LOG`, `POOL_FLEET_SUMMARY_JSON`, `POOL_FLEET_EVENTS_JSONL`, `POOL_FLEET_HEARTBEAT_FILE`
+- `POOL_FLEET_GATE_STATUS`, `POOL_FLEET_GATE_REASON`, `POOL_FLEET_WATCHDOG_RESTARTS`
+
 </details>
 
 <details>
