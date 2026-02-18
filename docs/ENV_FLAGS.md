@@ -127,6 +127,22 @@
 - `POOL_GC_SCRIPT` (default: `$ROOT/scripts/fleet_gc.sh`)
 - `FLEET_GC_ACTIVE_HEARTBEAT_SEC` (default: `120`, safeguard для активного run по свежему `fleet.heartbeat`)
 
+## Agent pool report
+- `POOL_WRITE_REPORT` (default: `1`)
+- `POOL_REPORT_SCRIPT` (default: `$ROOT/scripts/pool_report.sh`)
+- `POOL_REPORT_MD` (default: `<pool-run-dir>/pool_report.md`)
+- `POOL_REPORT_JSON` (default: `<pool-run-dir>/pool_report.json`)
+- `POOL_REPORT_MAX_LAST_LINES` (default: `80`)
+- `POOL_REPORT_INCLUDE_LOGS` (default: `0`)
+
+## Live preflight / demo
+- `LIVE_CONCURRENCY` (default: `2`, expected live parallel size)
+- `LIVE_CHAT_POOL_FILE` (optional: chat pool file for scaled live runs)
+- `LIVE_DEMO_TASKS_FILE` (default: `$ROOT/scripts/demo_tasks_10.txt`)
+- `LIVE_ITERATIONS` (default: `1`, per-agent iterations in live pool demo mode)
+- `LIVE_PROJECT_PATH` (default: repo root, project passed into `agent_pool_run.sh`)
+- `ALLOW_WORK_CHAT_FOR_LIVE` (default: `0`, allow fallback to work chat when e2e chat missing)
+
 ## Fleet monitor disk guard
 - `FLEET_DISK_PATH` (default: `<pool-run-dir>`)
 - `FLEET_DISK_FREE_WARN_PCT` (default: `10`)

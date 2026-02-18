@@ -44,6 +44,23 @@ precheck_via_cdp() {
     --precheck-only >"$out"
 }
 
+probe_chat_contract_transport_call() {
+  # Usage: probe_chat_contract_transport_call <out_file> <chat_url> <timeout_s>
+  local out_file="$1"
+  local chat_url="$2"
+  local timeout_s_override="$3"
+  if mock_transport_enabled; then
+    mock_probe_chat "$chat_url" "$out_file"
+    return $?
+  fi
+  python3 "$ROOT/bin/cdp_chatgpt.py" \
+    --cdp-port "$CDP_PORT" \
+    --chatgpt-url "$chat_url" \
+    --timeout "$timeout_s_override" \
+    --prompt "probe" \
+    --probe-contract >"$out_file" 2>&1
+}
+
 fetch_last_via_cdp() {
   local fetch_n fetch_out st fields diag_fields fetch_url target_id actual_id checkpoint_id_write old_url
   local target_is_home actual_is_home

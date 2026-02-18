@@ -7,6 +7,12 @@ cd "$ROOT_DIR"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
+LIVE_CONCURRENCY="${LIVE_CONCURRENCY:-2}"
+LIVE_CHAT_POOL_FILE="${LIVE_CHAT_POOL_FILE:-}"
+LIVE_ITERATIONS="${LIVE_ITERATIONS:-1}"
+LIVE_PROJECT_PATH="${LIVE_PROJECT_PATH:-$ROOT_DIR}"
+LIVE_DEMO_TASKS_FILE="${LIVE_DEMO_TASKS_FILE:-$ROOT_DIR/scripts/demo_tasks_10.txt}"
+
 print_json_summary() {
   local label="$1"
   local path="$2"
@@ -53,6 +59,81 @@ export LIVE_CHAT_URL
 export LIVE_INIT_SPECIALIST_CHAT="${LIVE_INIT_SPECIALIST_CHAT:-0}"
 echo "LIVE_CHAT_URL=$LIVE_CHAT_URL"
 echo "LIVE_INIT_SPECIALIST_CHAT=$LIVE_INIT_SPECIALIST_CHAT"
+
+if [[ -n "$LIVE_CHAT_POOL_FILE" ]]; then
+  echo "== LIVE POOL =="
+  if [[ ! "$LIVE_CONCURRENCY" =~ ^[0-9]+$ ]] || (( LIVE_CONCURRENCY < 1 )); then
+    echo "DEMO_STATUS=POOL_FAIL"
+    echo "DEMO_POOL_REASON=invalid_live_concurrency"
+    exit 2
+  fi
+  if [[ ! "$LIVE_ITERATIONS" =~ ^[0-9]+$ ]] || (( LIVE_ITERATIONS < 1 )); then
+    echo "DEMO_STATUS=POOL_FAIL"
+    echo "DEMO_POOL_REASON=invalid_live_iterations"
+    exit 2
+  fi
+  if [[ ! -f "$LIVE_DEMO_TASKS_FILE" ]]; then
+    echo "DEMO_STATUS=POOL_FAIL"
+    echo "DEMO_POOL_REASON=demo_tasks_missing"
+    echo "DEMO_TASKS_FILE=$LIVE_DEMO_TASKS_FILE"
+    exit 3
+  fi
+
+  mapfile -t demo_tasks < <(sed -e 's/\r$//' "$LIVE_DEMO_TASKS_FILE" | sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d')
+  if (( ${#demo_tasks[@]} < LIVE_CONCURRENCY )); then
+    echo "DEMO_STATUS=POOL_FAIL"
+    echo "DEMO_POOL_REASON=not_enough_demo_tasks"
+    echo "DEMO_TASKS_COUNT=${#demo_tasks[@]}"
+    echo "DEMO_REQUIRED_TASKS=$LIVE_CONCURRENCY"
+    exit 3
+  fi
+
+  pool_tasks_file="$tmp_dir/pool_tasks.txt"
+  : >"$pool_tasks_file"
+  for ((i=0; i<LIVE_CONCURRENCY; i++)); do
+    printf '%s\n' "${demo_tasks[$i]}" >>"$pool_tasks_file"
+  done
+
+  pool_out="$tmp_dir/pool.out"
+  set +e
+  RUN_LIVE_CDP_E2E=1 \
+  bash "$ROOT_DIR/scripts/agent_pool_run.sh" \
+    --project-path "$LIVE_PROJECT_PATH" \
+    --tasks-file "$pool_tasks_file" \
+    --mode live \
+    --concurrency "$LIVE_CONCURRENCY" \
+    --iterations "$LIVE_ITERATIONS" \
+    --chat-pool-file "$LIVE_CHAT_POOL_FILE" \
+    --browser-policy required \
+    --open-browser \
+    --init-specialist-chat \
+    --skip-git-repo-check >"$pool_out" 2>&1
+  pool_rc=$?
+  set -e
+  cat "$pool_out"
+  demo_pool_report_md="$(sed -n 's/^POOL_REPORT_MD=//p' "$pool_out" | tail -n 1)"
+  demo_pool_report_json="$(sed -n 's/^POOL_REPORT_JSON=//p' "$pool_out" | tail -n 1)"
+  if [[ "$pool_rc" != "0" ]]; then
+    echo "DEMO_STATUS=POOL_FAIL"
+    echo "DEMO_POOL_EXIT=$pool_rc"
+    if [[ -n "$demo_pool_report_md" ]]; then
+      echo "DEMO_POOL_REPORT_MD=$demo_pool_report_md"
+    fi
+    if [[ -n "$demo_pool_report_json" ]]; then
+      echo "DEMO_POOL_REPORT_JSON=$demo_pool_report_json"
+    fi
+    exit "$pool_rc"
+  fi
+
+  if [[ -n "$demo_pool_report_md" ]]; then
+    echo "DEMO_POOL_REPORT_MD=$demo_pool_report_md"
+  fi
+  if [[ -n "$demo_pool_report_json" ]]; then
+    echo "DEMO_POOL_REPORT_JSON=$demo_pool_report_json"
+  fi
+  echo "DEMO_STATUS=OK"
+  exit 0
+fi
 
 echo "== LIVE BOOTSTRAP ONCE =="
 bootstrap_out="$tmp_dir/bootstrap.out"

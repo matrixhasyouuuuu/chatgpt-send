@@ -1,0 +1,18 @@
+{
+  "active": {
+    "url": "https://chatgpt.com/c/6994c413-7cb4-8388-81a3-1d6ee4311001"
+  },
+  "recent": [
+    {"chat_url": "https://chatgpt.com/c/6994c413-7cb4-8388-81a3-1d6ee4311002"},
+    {"chat_url": "https://chatgpt.com/c/6994c413-7cb4-8388-81a3-1d6ee4311003"},
+    {"chat_url": "https://chatgpt.com/c/6994c413-7cb4-8388-81a3-1d6ee4311004"}
+  ],
+  "nested": {
+    "notes": "mirror https://chatgpt.com/c/6994c413-7cb4-8388-81a3-1d6ee4311005",
+    "raw": [
+      "https://chatgpt.com/c/6994c413-7cb4-8388-81a3-1d6ee4311006",
+      "skip-home https://chatgpt.com/",
+      "duplicate https://chatgpt.com/c/6994c413-7cb4-8388-81a3-1d6ee4311003"
+    ]
+  }
+}

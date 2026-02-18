@@ -210,6 +210,34 @@ mock_reply_ready_probe() {
   return 0
 }
 
+mock_probe_chat() {
+  # Usage: mock_probe_chat <chat_url> <out_file>
+  local chat_url="$1"
+  local out_file="$2"
+  local fail_urls tokens token
+  if ! mock_maybe_fail; then
+    return $?
+  fi
+  fail_urls="${CHATGPT_SEND_MOCK_PROBE_FAIL_URLS:-}"
+  if [[ -n "${fail_urls//[[:space:]]/}" ]]; then
+    tokens="$(printf '%s\n' "$fail_urls" | tr ', ' '\n\n' | sed -e '/^[[:space:]]*$/d')"
+    while IFS= read -r token; do
+      token="$(printf '%s' "$token" | xargs || true)"
+      [[ -n "${token:-}" ]] || continue
+      if [[ "$token" == "$chat_url" ]]; then
+        {
+          echo "E_PROBE_CHAT_FAILED url=${chat_url} code=E_MOCK_FORCED_FAIL"
+        } >"$out_file"
+        return 78
+      fi
+    done <<<"$tokens"
+  fi
+  {
+    echo "PROBE_CHAT_OK url=${chat_url} prompt_ready=1 transport=mock"
+  } >"$out_file"
+  return 0
+}
+
 mock_fetch_last_json() {
   # Usage: mock_fetch_last_json <out_file> <fetch_last_n>
   local out_file="$1"

@@ -313,6 +313,12 @@ FLEET_EVENTS_LOCK_FILE="$POOL_RUN_DIR/fleet.events.lock"
 FLEET_GATE_LOG="$POOL_RUN_DIR/fleet.gate.log"
 POOL_WATCHDOG_LOG="$POOL_RUN_DIR/pool.watchdog.log"
 POOL_GC_LOG="$POOL_RUN_DIR/pool.gc.log"
+if [[ -z "$POOL_REPORT_MD" ]]; then
+  POOL_REPORT_MD="$POOL_RUN_DIR/pool_report.md"
+fi
+if [[ -z "$POOL_REPORT_JSON" ]]; then
+  POOL_REPORT_JSON="$POOL_RUN_DIR/pool_report.json"
+fi
 printf 'agent,attempt,spawn_rc,child_run_id,status,exit_code,browser_used,duration_sec,chat_url,assigned_chat_url,observed_chat_url_before,observed_chat_url_after,chat_match,fail_kind,fail_reason,task_hash,task_nonce,result_json,stdout_file,task_file\n' >"$SUMMARY_CSV"
 : >"$SUMMARY_JSONL"
 : >"$FLEET_REGISTRY_FILE"
@@ -384,6 +390,8 @@ POOL_ABORT_REMAINING=0
 POOL_GC_APPLIED=0
 POOL_GC_REASON="disabled"
 POOL_GC_EXIT_CODE=0
+POOL_REPORT_RC=0
+POOL_REPORT_STATUS="skipped"
 
 watchdog_log() {
   local msg="$1"
@@ -455,6 +463,38 @@ run_pool_gc_if_needed() {
     POOL_GC_APPLIED=0
     watchdog_log "event=pool_gc_failed reason=${POOL_GC_REASON} rc=${POOL_GC_EXIT_CODE} log=${POOL_GC_LOG}"
   fi
+}
+
+run_pool_report() {
+  if [[ "$POOL_WRITE_REPORT" != "1" ]]; then
+    POOL_REPORT_STATUS="disabled"
+    POOL_REPORT_RC=0
+    return 0
+  fi
+
+  set +e
+  "$POOL_REPORT_SCRIPT" \
+    --pool-run-dir "$POOL_RUN_DIR" \
+    --fleet-summary-json "$FLEET_SUMMARY_JSON" \
+    --summary-jsonl "$SUMMARY_JSONL" \
+    --out-md "$POOL_REPORT_MD" \
+    --out-json "$POOL_REPORT_JSON" \
+    --max-last-lines "$POOL_REPORT_MAX_LAST_LINES" \
+    --include-logs "$POOL_REPORT_INCLUDE_LOGS" \
+    --gate-status "$FLEET_GATE_STATUS" \
+    --gate-reason "$FLEET_GATE_REASON"
+  POOL_REPORT_RC=$?
+  set -e
+
+  if [[ "$POOL_REPORT_RC" == "0" ]]; then
+    POOL_REPORT_STATUS="ok"
+    watchdog_log "event=pool_report_done md=${POOL_REPORT_MD} json=${POOL_REPORT_JSON}"
+    return 0
+  fi
+
+  POOL_REPORT_STATUS="fail"
+  watchdog_log "event=pool_report_failed rc=${POOL_REPORT_RC} md=${POOL_REPORT_MD} json=${POOL_REPORT_JSON}"
+  return 0
 }
 
 read_pid_file() {
@@ -1391,6 +1431,8 @@ if (( POOL_ABORT == 1 )); then
   pool_exit_rc="${POOL_ABORT_RC:-130}"
 fi
 
+run_pool_report
+
 echo "POOL_RUN_ID=$POOL_RUN_ID"
 echo "POOL_RUN_DIR=$POOL_RUN_DIR"
 echo "POOL_RUNS_ROOT=$POOL_RUNS_ROOT"
@@ -1399,6 +1441,10 @@ echo "POOL_GC_APPLIED=$POOL_GC_APPLIED"
 echo "POOL_GC_REASON=$POOL_GC_REASON"
 echo "POOL_GC_RC=$POOL_GC_EXIT_CODE"
 echo "POOL_GC_LOG=$POOL_GC_LOG"
+echo "POOL_REPORT_MD=$POOL_REPORT_MD"
+echo "POOL_REPORT_JSON=$POOL_REPORT_JSON"
+echo "POOL_REPORT_RC=$POOL_REPORT_RC"
+echo "POOL_REPORT_STATUS=$POOL_REPORT_STATUS"
 echo "POOL_MODE=$MODE"
 echo "POOL_LOCK_FILE=$POOL_LOCK_FILE"
 echo "POOL_TOTAL=$TOTAL_AGENTS"

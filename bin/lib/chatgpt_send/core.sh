@@ -8,6 +8,7 @@ Usage:
   chatgpt_send --set-chatgpt-url URL
   chatgpt_send --clear-chatgpt-url
   chatgpt_send --show-chatgpt-url
+  chatgpt_send --probe-chat-url URL [--transport cdp|mock] [--no-state-write]
   chatgpt_send --open-browser [--chatgpt-url URL]
   chatgpt_send --sync-chatgpt-url
   chatgpt_send --list-chats
@@ -36,6 +37,8 @@ Options:
   --chrome-path PATH            (default: bin/chrome_no_sandbox)
   --chatgpt-url URL
   --chat-id ID                  shortcut for https://chatgpt.com/c/ID
+  --probe-chat-url URL          read-only probe for one chat URL (prompt-ready/login/cloudflare checks)
+  --no-state-write              do not update pinned/active state (used by probe/check scripts)
   --init-specialist             open browser (if needed) and send bootstrap prompt to create/pin a new Specialist chat
   --topic TEXT                  (with --init-specialist) short task/topic; used as first message and saved in sessions list
   --set-chatgpt-url URL         persist default chat URL (same chat every run)

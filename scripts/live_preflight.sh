@@ -7,9 +7,14 @@ STATE_DIR="$ROOT_DIR/state"
 run_live="${RUN_LIVE_CDP_E2E:-0}"
 cdp_port="${CHATGPT_SEND_CDP_PORT:-9222}"
 allow_work_chat="${ALLOW_WORK_CHAT_FOR_LIVE:-0}"
+live_concurrency="${LIVE_CONCURRENCY:-2}"
+live_chat_pool_file="${LIVE_CHAT_POOL_FILE:-}"
+chat_pool_manage="$ROOT_DIR/scripts/chat_pool_manage.sh"
 ok_cdp=0
 ok_work_chat=0
 ok_e2e_chat=0
+ok_chat_pool=0
+chat_pool_count=0
 ok_locks=1
 lock_in_use=0
 stale_pid=0
@@ -17,9 +22,15 @@ work_chat_url=""
 e2e_chat_url=""
 live_chat_url=""
 live_chat_source="none"
+pool_first_url=""
 cdp_version_json=""
 lock_file="${CHATGPT_SEND_LOCK_FILE:-/tmp/chatgpt-send-shared-browser.lock}"
 reason=""
+
+if [[ ! "$live_concurrency" =~ ^[0-9]+$ ]] || (( live_concurrency < 1 )); then
+  echo "invalid LIVE_CONCURRENCY: $live_concurrency" >&2
+  exit 2
+fi
 
 if cdp_version_json="$(curl -fsS --max-time 3 "http://127.0.0.1:${cdp_port}/json/version" 2>/dev/null)"; then
   ok_cdp=1
@@ -69,14 +80,42 @@ if [[ "$stale_pid" == "1" ]] && [[ "$lock_in_use" == "0" ]]; then
   reason="stale_pid_without_lock_holder"
 fi
 
+if [[ -n "$live_chat_pool_file" ]]; then
+  if [[ ! -x "$chat_pool_manage" ]]; then
+    echo "chat pool manager not executable: $chat_pool_manage" >&2
+    exit 15
+  fi
+  set +e
+  pool_validate_out="$("$chat_pool_manage" validate --chat-pool-file "$live_chat_pool_file" --min "$live_concurrency" 2>&1)"
+  pool_validate_rc=$?
+  set -e
+  echo "$pool_validate_out"
+  if [[ "$pool_validate_rc" != "0" ]]; then
+    exit 15
+  fi
+  ok_chat_pool=1
+  chat_pool_count="$(printf '%s\n' "$pool_validate_out" | sed -n 's/^CHAT_POOL_COUNT=//p' | tail -n 1)"
+  if [[ ! "$chat_pool_count" =~ ^[0-9]+$ ]]; then
+    chat_pool_count=0
+  fi
+  pool_first_url="$(sed -e 's/\r$//' "$live_chat_pool_file" | sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' | sed -n '1p' | xargs || true)"
+elif [[ "$run_live" == "1" ]] && (( live_concurrency >= 5 )); then
+  echo "E_CHAT_POOL_REQUIRED_FOR_SCALE concurrency=$live_concurrency"
+  exit 15
+fi
+
 echo "RUN_LIVE_CDP_E2E=$run_live"
 echo "CDP_PORT=$cdp_port"
+echo "LIVE_CONCURRENCY=$live_concurrency"
+echo "LIVE_CHAT_POOL_FILE=${live_chat_pool_file:-none}"
 echo "ALLOW_WORK_CHAT_FOR_LIVE=$allow_work_chat"
 echo "OK_CDP=$ok_cdp"
 echo "OK_E2E_CHAT_URL=$ok_e2e_chat"
 echo "E2E_CHAT_URL=${e2e_chat_url:-none}"
 echo "OK_WORK_CHAT_URL=$ok_work_chat"
 echo "WORK_CHAT_URL=${work_chat_url:-none}"
+echo "OK_CHAT_POOL=$ok_chat_pool"
+echo "CHAT_POOL_COUNT=$chat_pool_count"
 echo "OK_LOCKS=$ok_locks"
 echo "LOCK_FILE=$lock_file"
 echo "LOCK_IN_USE=$lock_in_use"
@@ -112,6 +151,9 @@ elif [[ "$allow_work_chat" == "1" ]] && [[ "$ok_work_chat" == "1" ]]; then
   live_chat_url="$work_chat_url"
   live_chat_source="work_fallback"
   echo "W_E2E_CHAT_MISSING_FALLBACK_TO_WORK=1"
+elif [[ "$ok_chat_pool" == "1" ]] && [[ "$pool_first_url" =~ ^https://chatgpt\.com/c/[A-Za-z0-9-]+$ ]]; then
+  live_chat_url="$pool_first_url"
+  live_chat_source="pool_fallback"
 elif [[ "$allow_work_chat" == "1" ]] && [[ "$ok_work_chat" != "1" ]]; then
   exit 11
 else

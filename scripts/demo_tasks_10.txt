@@ -1,0 +1,13 @@
+# Live demo tasks for multi-agent pool runs.
+# Keep tasks independent (research/inspection only) to avoid code conflicts.
+
+Collect top-level project tree and summarize major modules.
+List all scripts in scripts/ and classify by purpose.
+Review test/ coverage map and find untested critical paths.
+Inspect docs/ENV_FLAGS.md and produce config risk notes.
+Inspect docs/RELEASE_GATE.md and summarize gate assumptions.
+Scan for retry/backoff logic and list failure handling hotspots.
+Scan for lock/single-flight usage and report race-risk areas.
+Review state/ artifact schema usage across scripts.
+Review pool/fleet output fields and consistency across docs.
+Summarize top 5 operational risks for live multi-agent runs.

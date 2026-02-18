@@ -270,8 +270,23 @@ Monitor writes atomic snapshots (`fleet.summary.json` + `fleet.summary.csv`) wit
 - `POOL_FLEET_GATE_STATUS`, `POOL_FLEET_GATE_REASON`, `POOL_FLEET_GATE_EXPECTED_TOTAL`, `POOL_FLEET_GATE_OBSERVED_TOTAL`, `POOL_FLEET_GATE_MISSING_ARTIFACTS_TOTAL`, `POOL_FLEET_WATCHDOG_RESTARTS`
 - `POOL_CHAT_OK_TOTAL`, `POOL_CHAT_MISMATCH_TOTAL`, `POOL_CHAT_UNKNOWN_TOTAL`, `POOL_STRICT_CHAT_PROOF`
 - `POOL_GC_ROOT`, `POOL_GC_APPLIED`, `POOL_GC_REASON`, `POOL_GC_LOG` (retention/GC pre-run status)
+- `POOL_REPORT_MD`, `POOL_REPORT_JSON`, `POOL_REPORT_STATUS` (единый итоговый отчёт по пулу)
 - `POOL_STATUS=INTERRUPTED` + `POOL_ABORT_SIGNAL` on SIGINT/SIGTERM cleanup
 - `E_POOL_ALREADY_RUNNING` protection via single-flight pool lock
+
+For scaled live runs (5-10 agents), prepare chat pool with:
+
+```bash
+./scripts/chat_pool_manage.sh extract --out state/chat_pool_e2e_10.txt --count 10
+./scripts/chat_pool_manage.sh validate --chat-pool-file state/chat_pool_e2e_10.txt --min 10
+```
+
+Then run live demo directly in pool mode:
+
+```bash
+RUN_LIVE_CDP_E2E=1 LIVE_CONCURRENCY=10 LIVE_CHAT_POOL_FILE=state/chat_pool_e2e_10.txt \
+  ./scripts/run_live_multi_agent_demo.sh
+```
 
 </details>
 

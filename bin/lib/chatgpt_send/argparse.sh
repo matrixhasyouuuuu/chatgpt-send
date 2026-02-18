@@ -14,6 +14,8 @@ while [[ $# -gt 0 ]]; do
     --chrome-path) CHROME_PATH="$2"; shift 2;;
     --chatgpt-url) CHATGPT_URL="$2"; CHATGPT_URL_EXPLICIT=1; shift 2;;
     --chat-id) CHATGPT_URL="https://chatgpt.com/c/$2"; CHATGPT_URL_EXPLICIT=1; shift 2;;
+    --probe-chat-url) PROBE_CHAT_URL="$2"; shift 2;;
+    --no-state-write) SKIP_STATE_WRITE=1; shift;;
     --init-specialist) INIT_SPECIALIST=1; shift;;
     --topic) INIT_TOPIC="$2"; shift 2;;
     --set-active-title) SET_ACTIVE_TITLE="$2"; shift 2;;

@@ -7,6 +7,56 @@ if [[ $LIST_CHATS -eq 1 ]]; then
   exit 0
 fi
 
+if [[ -n "${PROBE_CHAT_URL//[[:space:]]/}" ]]; then
+  if ! is_chat_conversation_url "${PROBE_CHAT_URL}"; then
+    echo "E_ARG_INVALID key=probe_chat_url value=${PROBE_CHAT_URL} run_id=${RUN_ID}" >&2
+    exit 2
+  fi
+  if [[ "${WAIT_ONLY}" == "1" ]]; then
+    emit_wait_only_block "probe_chat"
+  fi
+  CHATGPT_URL="$PROBE_CHAT_URL"
+  CHATGPT_URL_EXPLICIT=1
+  CHAT_URL_SOURCE="probe_arg"
+  timeout_probe="$(resolve_timeout_seconds)"
+  probe_out="$(mktemp)"
+  echo "PROBE_CHAT_START url=${PROBE_CHAT_URL} transport=${CHATGPT_SEND_TRANSPORT:-cdp} read_only=1 run_id=${RUN_ID}" >&2
+  if ! mock_transport_enabled; then
+    if ! cdp_is_up; then
+      open_browser_impl "${CHATGPT_URL}" || exit 1
+    fi
+    if ! cdp_is_up; then
+      echo "E_PROBE_CHAT_FAILED url=${PROBE_CHAT_URL} code=E_CDP_UNREACHABLE run_id=${RUN_ID}" >&2
+      exit 78
+    fi
+  fi
+  set +e
+  probe_chat_contract_transport_call "$probe_out" "$PROBE_CHAT_URL" "$timeout_probe"
+  probe_rc=$?
+  set -e
+  probe_log="$(cat "$probe_out" 2>/dev/null || true)"
+  rm -f "$probe_out"
+  if [[ -n "${probe_log//[[:space:]]/}" ]]; then
+    printf '%s\n' "$probe_log" >&2
+  fi
+  if [[ "$probe_rc" == "0" ]]; then
+    echo "PROBE_CHAT_OK url=${PROBE_CHAT_URL} prompt_ready=1"
+    exit 0
+  fi
+  probe_code="E_PROBE_CHAT_FAILED"
+  if printf '%s\n' "$probe_log" | grep -Eq 'ui_state=login|E_LOGIN_REQUIRED'; then
+    probe_code="E_LOGIN_REQUIRED"
+  elif printf '%s\n' "$probe_log" | grep -Eq 'ui_state=captcha|E_CLOUDFLARE|cloudflare|captcha'; then
+    probe_code="E_CLOUDFLARE"
+  elif printf '%s\n' "$probe_log" | grep -Eq 'missing=composer|composer_missing'; then
+    probe_code="E_PROMPT_NOT_FOUND"
+  elif printf '%s\n' "$probe_log" | grep -Eq 'E_MOCK_FORCED_FAIL'; then
+    probe_code="E_MOCK_FORCED_FAIL"
+  fi
+  echo "E_PROBE_CHAT_FAILED url=${PROBE_CHAT_URL} code=${probe_code} status=${probe_rc} run_id=${RUN_ID}" >&2
+  exit 78
+fi
+
 if [[ $DOCTOR -eq 1 ]]; then
   echo "DOCTOR start run_id=${RUN_ID}" >&2
   profile_size="$(profile_size_kb)"
