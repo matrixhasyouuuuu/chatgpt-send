@@ -34,7 +34,13 @@ bash test/test_work_chat_url_priority.sh
 bash test/test_auto_wait_on_generation.sh
 bash test/test_reply_wait_polling.sh
 bash test/test_soft_reset_runtime_eval_timeout.sh
+bash test/test_init_specialist_home_transition_reply_wait.sh
+bash test/test_init_specialist_ignores_stale_work_chat.sh
+bash test/test_spawn_second_agent_e2e_mock_transport.sh
+bash test/test_multi_agent_parallel_e2e_mock_transport.sh
 bash test/test_spawn_second_agent.sh
+bash test/test_chat_pool_manager_check.sh
+bash test/test_agent_pool_mock_5_agents.sh
 bash test/test_cdp_chatgpt_wait.sh
 bash test/test_assistant_stability_guard.sh
 bash test/test_echo_miss_recover_no_resend.sh
@@ -51,6 +57,40 @@ bash test/test_home_probe_no_active_switch.sh state/golden/T_e2e_home_probe_no_a
 - kill Chrome mid-run,
 - transient CDP DOWN,
 - wrong-tab/multi-tab contention.
+
+## LIVE CDP E2E (opt-in)
+Эти проверки запускаются только вручную и не входят в обязательный базовый прогон.
+
+```bash
+export RUN_LIVE_CDP_E2E=1
+
+# Рекомендуется отдельный e2e чат:
+# echo 'https://chatgpt.com/c/<e2e_chat_id>' > state/chatgpt_url_e2e.txt
+# (fallback в рабочий чат только явно)
+# export ALLOW_WORK_CHAT_FOR_LIVE=1
+
+bash test/test_spawn_second_agent_e2e_cdp_smoke.sh
+bash test/test_multi_agent_parallel_e2e_cdp_shared_slots.sh
+
+# pool smoke (2 live child), требует state/chat_pool_e2e_2.txt
+bash test/test_agent_pool_live_2_agents.sh
+bash test/test_chat_pool_manager_probe_live_2.sh
+
+# единый демонстрационный прогон preflight + bootstrap-once + smoke + parallel
+bash scripts/run_live_multi_agent_demo.sh
+```
+
+Если нет готового окружения (CDP down, нет e2e chat URL/pool в state, требуется логин/Cloudflare), тесты должны завершаться через `SKIP_*`, а не ложным FAIL.
+
+`scripts/live_preflight.sh` теперь дополнительно печатает:
+- `OK_E2E_CHAT_URL`, `E2E_CHAT_URL`,
+- `LIVE_CHAT_SOURCE`, `LIVE_CHAT_URL`,
+- и завершает `exit 14`, если e2e chat не задан и `ALLOW_WORK_CHAT_FOR_LIVE!=1`.
+
+`scripts/live_specialist_bootstrap_once.sh` отправляет bootstrap в live чат не чаще TTL (по умолчанию 24h) и пишет маркеры:
+- `BOOTSTRAP_ONCE send ...`
+- `BOOTSTRAP_ONCE skip reason=cached ...`
+- `BOOTSTRAP_ONCE done ...`
 
 ## Пороговые критерии (thresholds)
 `GO`, если одновременно:

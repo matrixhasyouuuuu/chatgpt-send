@@ -185,6 +185,9 @@ PY
 }
 
 cdp_is_up() {
+  if mock_transport_enabled; then
+    return 1
+  fi
   curl -fsS "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1
 }
 
@@ -1894,6 +1897,10 @@ open_browser_impl() {
   # Usage: open_browser_impl <url>
   # Opens (or focuses) a shared automation Chrome instance and returns 0 on success.
   local url="$1"
+  if mock_transport_enabled; then
+    mock_open_browser "$url"
+    return $?
+  fi
 
   # Use a dedicated automation profile under this project (login persists).
   if [[ "$url" =~ ^https://chatgpt\.com/c/ ]] && ! is_chat_conversation_url "$url"; then

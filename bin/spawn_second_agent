@@ -45,7 +45,7 @@ Options:
   -h, --help                  Show help
 
 Output:
-  Prints child metadata (RUN_ID, LOG_FILE, LAST_FILE, EXIT_FILE, STATE_ROOT, CODEX_CHATGPT_SEND_ROOT, CDP_PORT).
+  Prints child metadata (RUN_ID, CHILD_RUN_ID, CHILD_RUN_DIR, LOG_FILE, LAST_FILE, EXIT_FILE, STATE_ROOT, CODEX_CHATGPT_SEND_ROOT, CDP_PORT).
   In --wait mode also prints CHILD_STATUS and CHILD_RESULT.
 EOF
 }
@@ -177,6 +177,10 @@ fi
 run_id="child-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$LOG_DIR"
 LOG_DIR="$(cd "$LOG_DIR" && pwd)"
+RUN_DIR="${LOG_DIR}/${run_id}"
+mkdir -p "$RUN_DIR"
+CHATGPT_SEND_CHILD_LOG_DIR="${RUN_DIR}/chatgpt_send"
+mkdir -p "$CHATGPT_SEND_CHILD_LOG_DIR"
 
 # Resolve canonical chatgpt_send tool root.
 chatgpt_send_dir="$(cd "$(dirname "$CHATGPT_SEND_PATH")" && pwd)"
@@ -266,13 +270,14 @@ if [[ -z "${CDP_PORT:-}" ]] || [[ ! "$CDP_PORT" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-prompt_file="$LOG_DIR/${run_id}.prompt.txt"
-log_file="$LOG_DIR/${run_id}.log"
-last_file="$LOG_DIR/${run_id}.last.txt"
-exit_file="$LOG_DIR/${run_id}.exit"
-pid_file="$LOG_DIR/${run_id}.pid"
-runner_file="$LOG_DIR/${run_id}.runner.sh"
-status_file="$LOG_DIR/${run_id}.status.log"
+prompt_file="$RUN_DIR/${run_id}.prompt.txt"
+log_file="$RUN_DIR/${run_id}.log"
+last_file="$RUN_DIR/${run_id}.last.txt"
+exit_file="$RUN_DIR/${run_id}.exit"
+pid_file="$RUN_DIR/${run_id}.pid"
+runner_file="$RUN_DIR/${run_id}.runner.sh"
+status_file="$RUN_DIR/${run_id}.status.log"
+child_result_file="$RUN_DIR/child_result.json"
 
 cat >"$prompt_file" <<EOF
 Ты второй агент (child agent), запущенный главным агентом.
@@ -314,7 +319,15 @@ export CHATGPT_SEND_AUTO_TIMEOUT_SEC='${CHATGPT_SEND_AUTO_TIMEOUT_SEC:-120}'
 export CHATGPT_SEND_MAX_CDP_SLOTS='${CHATGPT_SEND_MAX_CDP_SLOTS:-2}'
 export CHATGPT_SEND_SLOT_WAIT_TIMEOUT_SEC='${CHATGPT_SEND_SLOT_WAIT_TIMEOUT_SEC:-180}'
 export CHATGPT_SEND_RUN_ID="\${CHATGPT_SEND_RUN_ID:-${run_id}}"
-export CHATGPT_SEND_LOG_DIR="\${CHATGPT_SEND_LOG_DIR:-${LOG_DIR}}"
+export CHATGPT_SEND_LOG_DIR="\${CHATGPT_SEND_LOG_DIR:-${CHATGPT_SEND_CHILD_LOG_DIR}}"
+export CHATGPT_SEND_TRANSPORT="\${CHATGPT_SEND_TRANSPORT:-${CHATGPT_SEND_TRANSPORT:-cdp}}"
+CHILD_RESULT_JSON='${child_result_file}'
+STARTED_AT_ISO="\$(date -Iseconds)"
+STARTED_AT_EPOCH="\$(date +%s)"
+STATUS="UNKNOWN"
+SLOT_USED=0
+BROWSER_USED=0
+BROWSER_EVIDENCE_WRITTEN=0
 : > '${status_file}'
 echo \$\$ > '${pid_file}'
 
@@ -356,19 +369,92 @@ flow_ok() {
   echo "[child] lock_file=\${CHATGPT_SEND_LOCK_FILE}"
   echo "[child] run_id_env=\${CHATGPT_SEND_RUN_ID}"
   echo "[child] log_dir_env=\${CHATGPT_SEND_LOG_DIR}"
+  echo "[child] chatgpt_send_transport=\${CHATGPT_SEND_TRANSPORT:-cdp}"
+  echo "[child] chatgpt_send_log_dir=${CHATGPT_SEND_CHILD_LOG_DIR}"
   echo "[child] auto_timeout=\${CHATGPT_SEND_AUTO_TIMEOUT_SEC}"
-  echo "[child] started_at=\$(date -Iseconds)"
+  echo "[child] started_at=\${STARTED_AT_ISO}"
 } >> '${log_file}'
 iter_status "bootstrap" "done" "runner_started"
+if [[ '${BROWSER_POLICY}' == 'disabled' ]]; then
+  echo "[child] SLOT_SKIP reason=browser_disabled mode=global run_id=${run_id} child_id=${run_id}" >> '${log_file}'
+fi
+
+write_child_result_json() {
+  local rc="\$1"
+  local finished_at_iso="\$2"
+  local duration_sec="\$3"
+  local status_value="\${STATUS:-UNKNOWN}"
+
+  if [[ -f '${log_file}' ]] && grep -q 'CHILD_BROWSER_USED:' '${log_file}'; then
+    BROWSER_USED=1
+  elif [[ -f '${last_file}' ]] && grep -q 'CHILD_BROWSER_USED:' '${last_file}'; then
+    BROWSER_USED=1
+  else
+    BROWSER_USED=0
+  fi
+
+  if [[ "\${rc}" == "0" ]]; then
+    status_value="OK"
+  elif [[ -z "\${status_value}" ]] || [[ "\${status_value}" == "UNKNOWN" ]]; then
+    status_value="E_CHILD_FAILED"
+  fi
+  if [[ '${BROWSER_POLICY}' == 'required' ]] && [[ "\${BROWSER_USED}" != "1" ]] && [[ "\${rc}" != "0" ]]; then
+    status_value="E_CHILD_BROWSER_REQUIRED_NOT_USED"
+  fi
+
+  python3 - "\${CHILD_RESULT_JSON}" '${run_id}' "\${status_value}" "\${rc}" '${BROWSER_POLICY}' "\${BROWSER_USED}" "\${SLOT_USED}" "\${child_chat_url:-}" "\${CHATGPT_SEND_FORCE_CHAT_URL:-}" "\${STARTED_AT_ISO}" "\${finished_at_iso}" "\${duration_sec}" '${log_file}' <<'PY'
+import json
+import pathlib
+import sys
+
+out_path = pathlib.Path(sys.argv[1])
+run_id = sys.argv[2]
+status = sys.argv[3]
+exit_code = int(sys.argv[4])
+browser_policy = sys.argv[5]
+browser_used = sys.argv[6] == "1"
+slot_used = sys.argv[7] == "1"
+specialist_chat_url = sys.argv[8]
+pinned_route_url = sys.argv[9]
+started_at = sys.argv[10]
+finished_at = sys.argv[11]
+duration_sec = int(sys.argv[12])
+log_path = sys.argv[13]
+
+payload = {
+    "run_id": run_id,
+    "status": status,
+    "exit_code": exit_code,
+    "browser_policy": browser_policy,
+    "browser_used": browser_used,
+    "slot_used": slot_used,
+    "specialist_chat_url": specialist_chat_url,
+    "pinned_route_url": pinned_route_url,
+    "started_at": started_at,
+    "finished_at": finished_at,
+    "duration_sec": duration_sec,
+    "log_path": log_path,
+}
+out_path.parent.mkdir(parents=True, exist_ok=True)
+out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
 
 child_finalize() {
   local rc=\$?
+  local finished_at_iso="\$(date -Iseconds)"
+  local finished_at_epoch="\$(date +%s)"
+  local duration_sec=0
+  if [[ "\${finished_at_epoch}" =~ ^[0-9]+$ ]] && [[ "\${STARTED_AT_EPOCH}" =~ ^[0-9]+$ ]] && (( finished_at_epoch >= STARTED_AT_EPOCH )); then
+    duration_sec=\$((finished_at_epoch - STARTED_AT_EPOCH))
+  fi
   if [[ -f '${status_file}' ]]; then
     cat '${status_file}' >> '${last_file}' 2>/dev/null || true
   fi
   echo "\${rc}" > '${exit_file}'
   echo "[child] exit_code=\${rc}" >> '${log_file}'
-  echo "[child] finished_at=\$(date -Iseconds)" >> '${log_file}'
+  echo "[child] finished_at=\${finished_at_iso}" >> '${log_file}'
+  write_child_result_json "\${rc}" "\${finished_at_iso}" "\${duration_sec}" || echo "[child] child_result_json_write=failed path=\${CHILD_RESULT_JSON}" >> '${log_file}'
 }
 trap child_finalize EXIT
 
@@ -389,6 +475,11 @@ run_chatgpt_send() {
   local wait_ms=0
   local slot_release_ms=0
   local held_ms=0
+  local errexit_restore=0
+
+  if [[ \$- == *e* ]]; then
+    errexit_restore=1
+  fi
 
   now_ms() {
     date +%s%3N 2>/dev/null || python3 - <<'PY'
@@ -404,6 +495,19 @@ PY
     wait_timeout=180
   fi
 
+  if [[ '${BROWSER_POLICY}' == 'disabled' ]]; then
+    echo "[child] SLOT_SKIP reason=browser_disabled run_id=${run_id} child_id=${run_id}" >> '${log_file}'
+    set +e
+    '${CHATGPT_SEND_PATH}' "\$@"
+    st=\$?
+    if (( errexit_restore == 1 )); then
+      set -e
+    else
+      set +e
+    fi
+    return "\${st}"
+  fi
+
   slot_wait_start_ms="\$(now_ms)"
   while true; do
     for ((i=0; i<max_slots; i++)); do
@@ -414,6 +518,7 @@ PY
         slot_fd="\${fd}"
         slot_acquire_ms="\$(now_ms)"
         slot_hold_start_ms="\${slot_acquire_ms}"
+        SLOT_USED=1
         wait_ms=\$((slot_acquire_ms - slot_wait_start_ms))
         echo "[child] SLOT_ACQUIRE slot=\${slot_id} wait_ms=\${wait_ms} ts_ms=\${slot_acquire_ms} run_id=${run_id} child_id=${run_id}" >> '${log_file}'
         break 2
@@ -425,6 +530,7 @@ PY
       slot_wait_s0="\${now_s}"
     fi
     if (( now_s - slot_wait_s0 >= wait_timeout )); then
+      STATUS="E_SLOT_ACQUIRE_TIMEOUT"
       echo "[child] E_SLOT_ACQUIRE_TIMEOUT wait_timeout_sec=\${wait_timeout} run_id=${run_id}" >> '${log_file}'
       return 73
     fi
@@ -434,7 +540,11 @@ PY
   set +e
   '${CHATGPT_SEND_PATH}' "\$@"
   st=\$?
-  set -e
+  if (( errexit_restore == 1 )); then
+    set -e
+  else
+    set +e
+  fi
 
   if [[ -n "\${slot_fd:-}" ]]; then
     slot_release_ms="\$(now_ms)"
@@ -446,14 +556,67 @@ PY
   return "\${st}"
 }
 
+emit_browser_used_once() {
+  local op="\$1"
+  local rc="\${2:-0}"
+  local evidence=""
+  local marker=""
+
+  if [[ "\${BROWSER_EVIDENCE_WRITTEN}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "\${CHATGPT_SEND_TRANSPORT:-cdp}" != "cdp" ]]; then
+    return 0
+  fi
+  if [[ '${BROWSER_POLICY}' == 'disabled' ]]; then
+    return 0
+  fi
+  if [[ "\${rc}" != "0" ]]; then
+    return 0
+  fi
+
+  if [[ -n "\${CHATGPT_SEND_FORCE_CHAT_URL:-}" ]] && [[ "\${CHATGPT_SEND_FORCE_CHAT_URL}" =~ ^https://chatgpt\.com/c/[A-Za-z0-9-]+$ ]]; then
+    evidence="\${CHATGPT_SEND_FORCE_CHAT_URL}"
+  elif [[ -n "\${child_chat_url:-}" ]] && [[ "\${child_chat_url}" =~ ^https://chatgpt\.com/c/[A-Za-z0-9-]+$ ]]; then
+    evidence="\${child_chat_url}"
+  fi
+  if [[ -z "\${evidence}" ]]; then
+    return 0
+  fi
+
+  marker="CHILD_BROWSER_USED: yes ; REASON: chatgpt_send_ok ; EVIDENCE: \${evidence} ; OP: \${op}"
+  echo "[child] \${marker}" >> '${log_file}'
+  BROWSER_EVIDENCE_WRITTEN=1
+}
+
 run_chatgpt_send_logged() {
   local step="\$1"
   shift
+  local stream_log='${CHATGPT_SEND_CHILD_LOG_DIR}/transport.log'
+  local tmp_out=""
+  local tmp_err=""
+  local errexit_restore=0
+  if [[ \$- == *e* ]]; then
+    errexit_restore=1
+  fi
   echo "[child] step=\${step} cmd=\$*" >> '${log_file}'
+  mkdir -p "\$(dirname "\${stream_log}")"
+  tmp_out="\$(mktemp '${RUN_DIR}/chatgpt_send.'"'"'\${step}'"'"'.out.XXXXXX')"
+  tmp_err="\$(mktemp '${RUN_DIR}/chatgpt_send.'"'"'\${step}'"'"'.err.XXXXXX')"
   set +e
-  run_chatgpt_send "\$@" >> '${log_file}' 2>&1
+  run_chatgpt_send "\$@" >"\${tmp_out}" 2>"\${tmp_err}"
   local rc=\$?
-  set -e
+  if (( errexit_restore == 1 )); then
+    set -e
+  else
+    set +e
+  fi
+  cat "\${tmp_out}" >> '${log_file}' 2>/dev/null || true
+  cat "\${tmp_err}" >> '${log_file}' 2>/dev/null || true
+  cat "\${tmp_out}" >> "\${stream_log}" 2>/dev/null || true
+  cat "\${tmp_err}" >> "\${stream_log}" 2>/dev/null || true
+  rm -f "\${tmp_out}" "\${tmp_err}" 2>/dev/null || true
+  emit_browser_used_once "\${step}" "\${rc}"
   echo "[child] step=\${step} rc=\${rc}" >> '${log_file}'
   if [[ "\${rc}" == "0" ]]; then
     iter_status "\${step}" "done" "chatgpt_send_rc=0"
@@ -467,11 +630,32 @@ run_chatgpt_send_capture() {
   local step="\$1"
   shift
   local out=""
+  local stream_log='${CHATGPT_SEND_CHILD_LOG_DIR}/transport.log'
+  local tmp_out=""
+  local tmp_err=""
+  local errexit_restore=0
+  if [[ \$- == *e* ]]; then
+    errexit_restore=1
+  fi
   echo "[child] step=\${step} cmd=\$*" >> '${log_file}'
+  mkdir -p "\$(dirname "\${stream_log}")"
+  tmp_out="\$(mktemp '${RUN_DIR}/chatgpt_send.'"'"'\${step}'"'"'.out.XXXXXX')"
+  tmp_err="\$(mktemp '${RUN_DIR}/chatgpt_send.'"'"'\${step}'"'"'.err.XXXXXX')"
   set +e
-  out="\$(run_chatgpt_send "\$@" 2>> '${log_file}')"
+  run_chatgpt_send "\$@" >"\${tmp_out}" 2>"\${tmp_err}"
   local rc=\$?
-  set -e
+  if (( errexit_restore == 1 )); then
+    set -e
+  else
+    set +e
+  fi
+  out="\$(cat "\${tmp_out}" 2>/dev/null || true)"
+  cat "\${tmp_out}" >> '${log_file}' 2>/dev/null || true
+  cat "\${tmp_err}" >> '${log_file}' 2>/dev/null || true
+  cat "\${tmp_out}" >> "\${stream_log}" 2>/dev/null || true
+  cat "\${tmp_err}" >> "\${stream_log}" 2>/dev/null || true
+  rm -f "\${tmp_out}" "\${tmp_err}" 2>/dev/null || true
+  emit_browser_used_once "\${step}" "\${rc}"
   echo "[child] step=\${step} rc=\${rc} out=\${out}" >> '${log_file}'
   if [[ "\${rc}" == "0" ]]; then
     iter_status "\${step}" "done" "chatgpt_send_capture_rc=0"
@@ -511,7 +695,7 @@ if [[ '${INIT_SPECIALIST_CHAT}' == '1' ]]; then
   fi
 fi
 
-if [[ -z "\${child_chat_url:-}" ]]; then
+if [[ '${BROWSER_POLICY}' != 'disabled' ]] && [[ -z "\${child_chat_url:-}" ]]; then
   child_chat_url="\$(run_chatgpt_send_capture "show-chat-url" --show-chatgpt-url | tail -n 1 || true)"
   if [[ -n "\${child_chat_url:-}" ]]; then
     echo "[child] specialist_chat_url=\${child_chat_url}" >> '${log_file}'
@@ -550,6 +734,9 @@ browser_line=""
 if [[ -f '${last_file}' ]]; then
   browser_line="\$(grep -Eo 'CHILD_BROWSER_USED:.*' '${last_file}' | tail -n 1 || true)"
 fi
+if [[ -z "\${browser_line:-}" ]] && [[ -f '${log_file}' ]]; then
+  browser_line="\$(grep -Eo 'CHILD_BROWSER_USED:.*' '${log_file}' | tail -n 1 || true)"
+fi
 prompt_cmd_count="\$(grep -Ec 'chatgpt_send[^[:cntrl:]]*--prompt' '${log_file}' || true)"
 chat_url_line="\$(grep -Eo 'specialist_chat_url=https://chatgpt\\.com/c/[A-Za-z0-9-]+' '${log_file}' | tail -n 1 || true)"
 has_browser_evidence=0
@@ -564,7 +751,7 @@ if [[ '${BROWSER_POLICY}' == 'required' ]]; then
   if [[ '${INIT_SPECIALIST_CHAT}' == '1' ]] && [[ -z "\${chat_url_line}" ]] && [[ "\${has_browser_evidence}" == "0" ]] && [[ "\${prompt_cmd_count}" == "0" ]]; then
     policy_fail_code=45
   fi
-  if [[ "\${prompt_cmd_count}" == "0" ]]; then
+  if [[ "\${prompt_cmd_count}" == "0" ]] && [[ "\${has_browser_evidence}" == "0" ]]; then
     if [[ "\${policy_fail_code}" == "0" ]]; then
       policy_fail_code=44
     fi
@@ -586,17 +773,34 @@ elif [[ '${BROWSER_POLICY}' == 'disabled' ]]; then
 fi
 
 if [[ "\${policy_fail_code}" != "0" ]]; then
+  case "\${policy_fail_code}" in
+    41) STATUS="E_CHILD_BROWSER_REQUIRED_NOT_USED" ;;
+    42) STATUS="E_CHILD_BROWSER_REQUIRED_NO_EVIDENCE" ;;
+    43) STATUS="E_CHILD_BROWSER_DISABLED_VIOLATION" ;;
+    44) STATUS="E_CHILD_BROWSER_REQUIRED_NO_PROMPT" ;;
+    45) STATUS="E_CHILD_BROWSER_REQUIRED_NO_CHAT_URL" ;;
+    *) STATUS="E_CHILD_BROWSER_POLICY_FAILED" ;;
+  esac
   echo "[child] browser_policy_check=failed code=\${policy_fail_code} prompt_cmd_count=\${prompt_cmd_count} line=\${browser_line}" >> '${log_file}'
   st="\${policy_fail_code}"
 fi
 
 # Mark common transient infra failures explicitly in child logs.
 if [[ -f '${log_file}' ]] && grep -q 'Timed out waiting for assistant response activity' '${log_file}'; then
+  if [[ "\${STATUS}" == "UNKNOWN" ]]; then
+    STATUS="E_ACTIVITY_TIMEOUT"
+  fi
   echo "[child] error_code=E_ACTIVITY_TIMEOUT reason=assistant_activity_timeout original_exit=\${st}" >> '${log_file}'
 elif [[ -f '${last_file}' ]] && grep -q 'Timed out waiting for assistant response activity' '${last_file}'; then
+  if [[ "\${STATUS}" == "UNKNOWN" ]]; then
+    STATUS="E_ACTIVITY_TIMEOUT"
+  fi
   echo "[child] error_code=E_ACTIVITY_TIMEOUT reason=assistant_activity_timeout original_exit=\${st}" >> '${log_file}'
 fi
 if [[ "\${st}" == "70" ]] || ( [[ -f '${log_file}' ]] && grep -q 'Failed to acquire chatgpt_send lock within' '${log_file}' ); then
+  if [[ "\${STATUS}" == "UNKNOWN" ]]; then
+    STATUS="E_LOCK_TIMEOUT"
+  fi
   echo "[child] error_code=E_LOCK_TIMEOUT reason=lock_timeout original_exit=\${st}" >> '${log_file}'
 fi
 
@@ -630,6 +834,7 @@ if [[ -n "\${flow_report_ln:-}" ]] && { [[ -z "\${flow_exec_ln:-}" ]] || (( flow
   fi
 fi
 if [[ "\${flow_violation}" == "1" ]]; then
+  STATUS="E_FLOW_ORDER_VIOLATION"
   echo "[child] E_FLOW_ORDER_VIOLATION reason=\${flow_violation_reason}" >> '${log_file}'
   iter_status "flow-order" "blocked" "E_FLOW_ORDER_VIOLATION:\${flow_violation_reason}"
   if [[ '${BROWSER_POLICY}' == 'required' ]] && [[ "\${st}" == "0" ]]; then
@@ -656,6 +861,9 @@ else
     iter_status "final" "waiting" "generation_in_progress rc=\${st}"
   else
     iter_status "final" "blocked" "child_exit=\${st}"
+  fi
+  if [[ "\${STATUS}" == "UNKNOWN" ]]; then
+    STATUS="E_CHILD_FAILED"
   fi
 fi
 
@@ -694,6 +902,8 @@ else
 fi
 
 echo "RUN_ID=${run_id}"
+echo "CHILD_RUN_ID=${run_id}"
+echo "CHILD_RUN_DIR=${RUN_DIR}"
 echo "LAUNCHER=${launcher_mode}"
 echo "BROWSER_MODE=${BROWSER_MODE}"
 echo "BROWSER_POLICY=${BROWSER_POLICY}"
@@ -709,6 +919,8 @@ echo "LAST_FILE=${last_file}"
 echo "STATUS_FILE=${status_file}"
 echo "EXIT_FILE=${exit_file}"
 echo "PID_FILE=${pid_file}"
+echo "CHILD_RESULT_JSON=${child_result_file}"
+echo "CHILD_CHATGPT_SEND_LOG_DIR=${CHATGPT_SEND_CHILD_LOG_DIR}"
 
 if (( WAIT_MODE == 1 )); then
   deadline=$(( $(date +%s) + TIMEOUT_SEC ))

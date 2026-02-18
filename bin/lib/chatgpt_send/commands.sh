@@ -248,6 +248,9 @@ if [[ $INIT_SPECIALIST -eq 1 ]]; then
   # bootstrap prompt which will create a /c/<id> URL that we can pin.
   open_browser_impl "https://chatgpt.com/" || exit 1
   CHATGPT_URL="https://chatgpt.com/"
+  # Force explicit home target for init-specialist so stale work_chat_url
+  # cannot override the "create new chat" flow.
+  CHATGPT_URL_EXPLICIT=1
   topic="${INIT_TOPIC:-}"
   # Allow passing topic via --prompt/--prompt-file too.
   if [[ -z "${topic//[[:space:]]/}" ]] && [[ -n "${PROMPT//[[:space:]]/}" ]]; then
@@ -260,7 +263,7 @@ if [[ $INIT_SPECIALIST -eq 1 ]]; then
   bootstrap="$(cat "$ROOT/docs/specialist_bootstrap.txt" 2>/dev/null || true)"
   PROMPT="$bootstrap"
   if [[ -n "${topic//[[:space:]]/}" ]]; then
-    PROMPT+=$'\n\n'"Коротко: ${topic}"
+    PROMPT+=$'\n\n'"Тема: ${topic}"
   fi
   PROMPT_FILE=""
 

@@ -1,6 +1,41 @@
 # shellcheck shell=bash
 # Runtime send/reply helpers for chatgpt_send.
+chatgpt_send_validate_transport() {
+  case "${CHATGPT_SEND_TRANSPORT:-cdp}" in
+    cdp|mock) ;;
+    *)
+      echo "[E_TRANSPORT_INVALID] value=${CHATGPT_SEND_TRANSPORT:-}" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "${CHATGPT_SEND_TRANSPORT_LOGGED:-0}" != "1" ]]; then
+    echo "[P1] transport=${CHATGPT_SEND_TRANSPORT:-cdp}" >&2
+    CHATGPT_SEND_TRANSPORT_LOGGED=1
+  fi
+}
+
+fetch_last_transport_call() {
+  # Usage: fetch_last_transport_call <out_file> <fetch_last_n>
+  local out_file="$1"
+  local fetch_n="$2"
+  if mock_transport_enabled; then
+    mock_fetch_last_json "$out_file" "$fetch_n"
+    return $?
+  fi
+  python3 "$ROOT/bin/cdp_chatgpt.py" \
+    --cdp-port "$CDP_PORT" \
+    --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
+    --timeout "$timeout_s" \
+    --prompt "$PROMPT" \
+    --fetch-last \
+    --fetch-last-n "$fetch_n" >"$out_file"
+}
+
 precheck_via_cdp() {
+  if mock_transport_enabled; then
+    mock_precheck "$out"
+    return $?
+  fi
   python3 "$ROOT/bin/cdp_chatgpt.py" \
     --cdp-port "$CDP_PORT" \
     --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
@@ -10,21 +45,38 @@ precheck_via_cdp() {
 }
 
 fetch_last_via_cdp() {
-  local fetch_n fetch_out st fields diag_fields fetch_url target_id actual_id checkpoint_id_write
+  local fetch_n fetch_out st fields diag_fields fetch_url target_id actual_id checkpoint_id_write old_url
+  local target_is_home actual_is_home
+  local target_was_home retarget_tab retarget_url
   local prev_ckpt_fields prev_chat_url prev_chat_id prev_fingerprint prev_checkpoint_id prev_last_user_text_sig
   fetch_n="$FETCH_LAST_N"
   fetch_out="$(mktemp)"
+  target_was_home=0
+  if [[ "${CHATGPT_URL:-}" == "https://chatgpt.com/" ]] || [[ "${CHATGPT_URL:-}" == "https://chatgpt.com" ]]; then
+    target_was_home=1
+  fi
   echo "FETCH_LAST start n=${fetch_n} run_id=${RUN_ID}" >&2
   set +e
-  python3 "$ROOT/bin/cdp_chatgpt.py" \
-    --cdp-port "$CDP_PORT" \
-    --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
-    --timeout "$timeout_s" \
-    --prompt "$PROMPT" \
-    --fetch-last \
-    --fetch-last-n "$fetch_n" >"$fetch_out"
+  fetch_last_transport_call "$fetch_out" "$fetch_n"
   st=$?
   set -e
+  if [[ $st -ne 0 ]]; then
+    if [[ "${INIT_SPECIALIST:-0}" == "1" ]] && [[ "$target_was_home" -eq 1 ]] && [[ $st -eq 2 ]]; then
+      retarget_tab="$(capture_best_chat_tab_from_cdp || true)"
+      retarget_url="${retarget_tab%%$'\t'*}"
+      if [[ -n "${retarget_url:-}" ]] && [[ "$retarget_url" != "$retarget_tab" ]] && is_chat_conversation_url "$retarget_url"; then
+        old_url="${CHATGPT_URL:-}"
+        CHATGPT_URL="$retarget_url"
+        WORK_CHAT_URL="$retarget_url"
+        write_work_chat_url "$retarget_url"
+        echo "CHAT_ROUTE_UPDATE reason=init_specialist_home_tab_retarget old_url=${old_url:-none} new_url=${retarget_url} run_id=${RUN_ID}" >&2
+        set +e
+        fetch_last_transport_call "$fetch_out" "$fetch_n"
+        st=$?
+        set -e
+      fi
+    fi
+  fi
   if [[ $st -ne 0 ]]; then
     protocol_append_event "FETCH_LAST" "fail" "$PROMPT_HASH" "$(read_last_specialist_checkpoint_id | head -n 1 || true)" "status=${st}"
     rm -f "$fetch_out"
@@ -40,6 +92,7 @@ fetch_last_via_cdp() {
     return 79
   fi
   IFS=$'\x1f' read -r fetch_url FETCH_LAST_USER_TAIL_HASH FETCH_LAST_ASSISTANT_TAIL_HASH FETCH_LAST_CHECKPOINT_ID FETCH_LAST_LAST_USER_HASH FETCH_LAST_ASSISTANT_AFTER_LAST_USER <<<"$fields"
+  FETCH_LAST_URL="${fetch_url:-}"
   diag_fields="$(fetch_last_extract_diag_fields "$fetch_out" || true)"
   if [[ -n "${diag_fields:-}" ]]; then
     IFS=$'\x1f' read -r FETCH_LAST_TOTAL_MESSAGES FETCH_LAST_STOP_VISIBLE FETCH_LAST_LAST_USER_SIG FETCH_LAST_LAST_ASSISTANT_SIG FETCH_LAST_CHAT_ID FETCH_LAST_UI_CONTRACT_SIG FETCH_LAST_FINGERPRINT_V1 FETCH_LAST_LAST_USER_TEXT_SIG FETCH_LAST_LAST_ASSISTANT_TEXT_SIG FETCH_LAST_UI_STATE FETCH_LAST_NORM_VERSION <<<"$diag_fields"
@@ -58,10 +111,22 @@ fetch_last_via_cdp() {
 
   target_id="$(chat_id_from_url "${CHATGPT_URL:-}" 2>/dev/null || true)"
   actual_id="$(chat_id_from_url "${fetch_url:-}" 2>/dev/null || true)"
+  target_is_home=0
+  actual_is_home=0
+  if [[ "${CHATGPT_URL:-}" == "https://chatgpt.com/" ]] || [[ "${CHATGPT_URL:-}" == "https://chatgpt.com" ]]; then
+    target_is_home=1
+  fi
+  if [[ "${fetch_url:-}" == "https://chatgpt.com/" ]] || [[ "${fetch_url:-}" == "https://chatgpt.com" ]]; then
+    actual_is_home=1
+  fi
   echo "CHAT_TARGET_URL=${CHATGPT_URL:-none}" >&2
   echo "CHAT_ACTUAL_URL=${fetch_url:-none}" >&2
   if [[ -n "${target_id:-}" ]] && [[ -n "${actual_id:-}" ]] && [[ "${target_id}" == "${actual_id}" ]]; then
     echo "CHAT_ROUTE=OK run_id=${RUN_ID}" >&2
+  elif [[ "${INIT_SPECIALIST:-0}" == "1" ]] && [[ -z "${target_id:-}" ]] && [[ -z "${actual_id:-}" ]] && [[ "$target_is_home" -eq 1 ]] && [[ "$actual_is_home" -eq 1 ]]; then
+    echo "CHAT_ROUTE=OK reason=home_probe run_id=${RUN_ID}" >&2
+  elif [[ "${INIT_SPECIALIST:-0}" == "1" ]] && [[ "$target_is_home" -eq 1 ]] && [[ -n "${actual_id:-}" ]]; then
+    echo "CHAT_ROUTE=OK reason=home_to_conversation run_id=${RUN_ID}" >&2
   else
     echo "CHAT_ROUTE=E_ROUTE_MISMATCH expected=${target_id:-none} got=${actual_id:-none} run_id=${RUN_ID}" >&2
     protocol_append_event "FETCH_LAST" "fail" "$PROMPT_HASH" "$(read_last_specialist_checkpoint_id | head -n 1 || true)" "route_mismatch expected=${target_id:-none} got=${actual_id:-none}"
@@ -70,6 +135,13 @@ fetch_last_via_cdp() {
   fi
   if [[ -z "${FETCH_LAST_CHAT_ID:-}" ]]; then
     FETCH_LAST_CHAT_ID="${actual_id:-}"
+  fi
+  if [[ "${INIT_SPECIALIST:-0}" == "1" ]] && [[ "$target_is_home" -eq 1 ]] && [[ -n "${fetch_url:-}" ]] && is_chat_conversation_url "${fetch_url:-}"; then
+    old_url="${CHATGPT_URL:-}"
+    CHATGPT_URL="$fetch_url"
+    WORK_CHAT_URL="$fetch_url"
+    write_work_chat_url "$fetch_url"
+    echo "CHAT_ROUTE_UPDATE reason=init_specialist_home_to_conversation old_url=${old_url:-none} new_url=${fetch_url} run_id=${RUN_ID}" >&2
   fi
   if [[ -n "${FETCH_LAST_UI_STATE:-}" ]] && [[ "${FETCH_LAST_UI_STATE}" != "ok" ]]; then
     echo "E_UI_NOT_READY ui_state=${FETCH_LAST_UI_STATE} run_id=${RUN_ID}" >&2
@@ -139,13 +211,7 @@ postsend_verify_latest_user() {
   while true; do
     verify_out="$(mktemp)"
     set +e
-    python3 "$ROOT/bin/cdp_chatgpt.py" \
-      --cdp-port "$CDP_PORT" \
-      --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
-      --timeout "$timeout_s" \
-      --prompt "$PROMPT" \
-      --fetch-last \
-      --fetch-last-n "$verify_n" >"$verify_out"
+    fetch_last_transport_call "$verify_out" "$verify_n"
     st=$?
     if [[ $had_errexit -eq 1 ]]; then
       set -e
@@ -256,13 +322,7 @@ late_reply_recover_via_fetch_last() {
 
     tmp="$(mktemp)"
     set +e
-    python3 "$ROOT/bin/cdp_chatgpt.py" \
-      --cdp-port "$CDP_PORT" \
-      --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
-      --timeout "$timeout_s" \
-      --prompt "$PROMPT" \
-      --fetch-last \
-      --fetch-last-n "${FETCH_LAST_N}" >"$tmp"
+    fetch_last_transport_call "$tmp" "${FETCH_LAST_N}"
     st=$?
     set -e
 
@@ -324,6 +384,9 @@ late_reply_recover_via_fetch_last() {
 }
 
 contract_probe_via_cdp() {
+  if mock_transport_enabled; then
+    return 0
+  fi
   python3 "$ROOT/bin/cdp_chatgpt.py" \
     --cdp-port "$CDP_PORT" \
     --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
@@ -392,6 +455,11 @@ run_send_checked() {
 # Use CDP to type/click in the existing, visible ChatGPT tab and then scrape
 # the final assistant response.
 send_via_cdp() {
+  if mock_transport_enabled; then
+    mock_send_prompt || return $?
+    mock_wait_reply >"$out"
+    return 0
+  fi
   python3 "$ROOT/bin/cdp_chatgpt.py" \
     --cdp-port "$CDP_PORT" \
     --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
@@ -400,6 +468,11 @@ send_via_cdp() {
 }
 
 send_no_wait_via_cdp() {
+  if mock_transport_enabled; then
+    mock_send_prompt || return $?
+    printf '%s\n' "SEND_NO_WAIT_OK" >"$out"
+    return 0
+  fi
   python3 "$ROOT/bin/cdp_chatgpt.py" \
     --cdp-port "$CDP_PORT" \
     --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
@@ -410,6 +483,10 @@ send_no_wait_via_cdp() {
 
 reply_ready_probe_via_cdp() {
   local probe_log="${1:-/dev/null}"
+  if mock_transport_enabled; then
+    mock_reply_ready_probe "$probe_log"
+    return $?
+  fi
   python3 "$ROOT/bin/cdp_chatgpt.py" \
     --cdp-port "$CDP_PORT" \
     --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
@@ -761,6 +838,10 @@ PY
 
 soft_reset_via_cdp() {
   local reason="${1:-status4_timeout}"
+  if mock_transport_enabled; then
+    echo "[mock] soft_reset skipped reason=${reason} run_id=${RUN_ID}" >&2
+    return 0
+  fi
   local had_errexit=0
   case "$-" in
     *e*) had_errexit=1 ;;
@@ -961,12 +1042,36 @@ reply_wait_collect_via_probe() {
         return 0
       fi
       if [[ $fetch_status -eq 2 ]]; then
+        if [[ "${INIT_SPECIALIST:-0}" == "1" ]]; then
+          set +e
+          fetch_last_via_cdp
+          fetch_status=$?
+          set -e
+          fetch_status_last=$fetch_status
+          if [[ $fetch_status -eq 0 ]] && is_chat_conversation_url "${CHATGPT_URL:-}"; then
+            echo "REPLY_WAIT route_recovered reason=init_specialist_home_transition elapsed_ms=${elapsed_ms} chat_url=${CHATGPT_URL} run_id=${RUN_ID}" >&2
+            sleep "$poll_s"
+            continue
+          fi
+        fi
         echo "REPLY_WAIT done outcome=route_mismatch elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
         rm -f "$probe_log"
         return 2
       fi
       echo "REPLY_WAIT tick elapsed_ms=${elapsed_ms} probe_status=0 reason=${probe_reason} fetch_status=${fetch_status} no_progress_ms=${no_progress_ms} progress_ticks=${progress_ticks} run_id=${RUN_ID}" >&2
     elif [[ $probe_status -eq 2 ]]; then
+      if [[ "${INIT_SPECIALIST:-0}" == "1" ]]; then
+        set +e
+        fetch_last_via_cdp
+        fetch_status=$?
+        set -e
+        fetch_status_last=$fetch_status
+        if [[ $fetch_status -eq 0 ]] && is_chat_conversation_url "${CHATGPT_URL:-}"; then
+          echo "REPLY_WAIT route_recovered reason=init_specialist_home_transition elapsed_ms=${elapsed_ms} chat_url=${CHATGPT_URL} run_id=${RUN_ID}" >&2
+          sleep "$poll_s"
+          continue
+        fi
+      fi
       echo "REPLY_WAIT done outcome=route_mismatch elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
       rm -f "$probe_log"
       return 2

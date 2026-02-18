@@ -3,17 +3,41 @@
 Ключевые переменные окружения и базовые дефолты.
 
 ## Routing / safety
+- `CHATGPT_SEND_TRANSPORT` (default: `cdp`, варианты: `cdp|mock`)
 - `CHATGPT_SEND_FORCE_CHAT_URL` (default: empty)
 - `CHATGPT_SEND_PROTECT_CHAT_URL` (default: empty)
 - `CHATGPT_SEND_REQUIRE_CONVO_URL` (default: `1`)
 - `CHATGPT_SEND_ALLOW_HOME_SEND` (default: `0`)
 - `CHATGPT_SEND_ENFORCE_ACTIVE_PIN_MATCH` (default: `0`)
-- `CHATGPT_SEND_STRICT_SINGLE_CHAT` (default: `0`)
+- `CHATGPT_SEND_STRICT_SINGLE_CHAT` (default: `1`)
 - `CHATGPT_SEND_STRICT_SINGLE_CHAT_ACTION` (default: `block`, варианты: `block|close`)
+- `CHATGPT_SEND_FETCH_LAST_N` (default: `6`)
+- `CHATGPT_SEND_FETCH_LAST_REQUIRED` (default: `1`, без `FETCH_LAST` отправка блокируется)
+- `CHATGPT_SEND_NO_BLIND_RESEND` (default: `1`, запрет повторной отправки без подтверждённого ответа)
+- `CHATGPT_SEND_PROTO_ENFORCE_FINGERPRINT` (default: `0`, при `1` блок на `E_CHAT_FINGERPRINT_MISMATCH`)
+- `CHATGPT_SEND_PROTO_ENFORCE_POSTSEND_VERIFY` (default: `0`)
+- `CHATGPT_SEND_CHAT_SINGLE_FLIGHT` (default: `1`, single-flight lock на chat_url)
+- `CHATGPT_SEND_CHAT_LOCK_DIR` (default: `$ROOT/state/locks`)
+- `CHATGPT_SEND_CHAT_LOCK_TIMEOUT_SEC` (default: `20`)
+- `CHATGPT_SEND_PROTOCOL_LOCK_FILE` (default: `$ROOT/state/protocol.lock`)
+- `CHATGPT_SEND_CHECKPOINT_LOCK_FILE` (default: `$ROOT/state/checkpoint.lock`)
+- `CHATGPT_SEND_ENFORCE_ITERATION_PREFIX` (default: `1`)
 - `CHATGPT_SEND_STRICT_UI_CONTRACT` (default: `0`, при `1` падение на `E_UI_CONTRACT_FAIL`)
 - `CHATGPT_SEND_CAPTURE_EVIDENCE` (default: `1`, автоснимок evidence на фатальных E_* таймаутах/фейлах)
 - `CHATGPT_SEND_SANITIZE_LOGS` (default: `1`, редактирует чувствительные токены в evidence/log snapshots)
 - `state/work_chat_url.txt` — основной источник истины для рабочего `/c/...` чата
+
+## Mock transport (offline)
+- `CHATGPT_SEND_TRANSPORT=mock` — включает offline transport без CDP/Chrome
+- `CHATGPT_SEND_MOCK_CHAT_URL` (default: empty)
+- `CHATGPT_SEND_MOCK_CHAT_URL_FILE` (default: empty; если задан, читается/потребляется по строкам)
+- `CHATGPT_SEND_MOCK_REPLY` (default: empty)
+- `CHATGPT_SEND_MOCK_REPLY_FILE` (default: empty)
+- `CHATGPT_SEND_MOCK_REPLIES_DIR` (default: empty; берётся первый `*.txt`, файл удаляется после чтения)
+- `CHATGPT_SEND_MOCK_LAST_PROMPT_FILE` (default: `$ROOT/state/mock_last_prompt.txt`)
+- `CHATGPT_SEND_MOCK_SENT_FILE` (default: `$ROOT/state/mock_sent_count.txt`)
+- `CHATGPT_SEND_MOCK_PRECHECK_STATUS` (default: empty; если задан, принудительный статус precheck)
+- `CHATGPT_SEND_MOCK_ERROR_CODE` (default: empty; принудительный не-нулевой код для отказа mock операций)
 
 ## Wait / retry
 - `CHATGPT_SEND_AUTO_WAIT_ON_GENERATION` (default: `1`)
@@ -23,6 +47,10 @@
 - `CHATGPT_SEND_REPLY_POLL_MS` (default: `700`)
 - `CHATGPT_SEND_REPLY_MAX_SEC` (default: `90`)
 - `CHATGPT_SEND_REPLY_NO_PROGRESS_MAX_MS` (default: `45000`)
+- `CHATGPT_SEND_LATE_REPLY_GRACE_SEC` (default: `30`)
+- `CHATGPT_SEND_LATE_REPLY_POLL_MS` (default: `1500`)
+- `CHATGPT_SEND_LATE_REPLY_STABLE_TICKS` (default: `2`)
+- `CHATGPT_SEND_POSTSEND_VERIFY_FETCH_LAST_N` (default: `4`)
 - `CHATGPT_SEND_STALE_STOP_SEC` (default: `8`, в `cdp_chatgpt.py`)
 - `CHATGPT_SEND_STALE_STOP_POLL_SEC` (default: `0.4`, в `cdp_chatgpt.py`)
 - `CHATGPT_SEND_ASSISTANT_STABILITY_SEC` (default: `0.9`, guard от раннего capture обрезанного ответа)
@@ -47,6 +75,7 @@
 - `CHATGPT_SEND_LOCK_FILE` (default: empty)
 - `CHATGPT_SEND_LOCK_TIMEOUT_SEC` (default: `120`)
 - `CHATGPT_SEND_CDP_PORT` (default: `9222`)
+- `CHATGPT_SEND_NORM_VERSION` (default: `v1`)
 
 ## Diagnostics
 - `CHATGPT_SEND_STRICT_DOCTOR` (default: `0`)

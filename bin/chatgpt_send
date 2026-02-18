@@ -123,11 +123,12 @@ TIMEOUT_BUDGET_MAX="${CHATGPT_SEND_TIMEOUT_BUDGET_MAX:-3}"
 TIMEOUT_BUDGET_ACTION="${CHATGPT_SEND_TIMEOUT_BUDGET_ACTION:-restart}"
 NORM_VERSION="${CHATGPT_SEND_NORM_VERSION:-v1}"
 ENFORCE_ITERATION_PREFIX="${CHATGPT_SEND_ENFORCE_ITERATION_PREFIX:-1}"
+CHATGPT_SEND_TRANSPORT="${CHATGPT_SEND_TRANSPORT:-cdp}"
 
 LIB_CHATGPT_SEND_DIR="$SCRIPT_DIR/lib/chatgpt_send"
-if [[ ! -r "$LIB_CHATGPT_SEND_DIR/core.sh" ]] || [[ ! -r "$LIB_CHATGPT_SEND_DIR/runtime.sh" ]] || [[ ! -r "$LIB_CHATGPT_SEND_DIR/argparse.sh" ]] || [[ ! -r "$LIB_CHATGPT_SEND_DIR/commands.sh" ]] || [[ ! -r "$LIB_CHATGPT_SEND_DIR/send_pipeline.sh" ]] || [[ ! -r "$LIB_CHATGPT_SEND_DIR/main_flow.sh" ]]; then
+if [[ ! -r "$LIB_CHATGPT_SEND_DIR/core.sh" ]] || [[ ! -r "$LIB_CHATGPT_SEND_DIR/transport_mock.sh" ]] || [[ ! -r "$LIB_CHATGPT_SEND_DIR/runtime.sh" ]] || [[ ! -r "$LIB_CHATGPT_SEND_DIR/argparse.sh" ]] || [[ ! -r "$LIB_CHATGPT_SEND_DIR/commands.sh" ]] || [[ ! -r "$LIB_CHATGPT_SEND_DIR/send_pipeline.sh" ]] || [[ ! -r "$LIB_CHATGPT_SEND_DIR/main_flow.sh" ]]; then
   fallback_lib_dir="$ROOT/bin/lib/chatgpt_send"
-  if [[ -r "$fallback_lib_dir/core.sh" ]] && [[ -r "$fallback_lib_dir/runtime.sh" ]] && [[ -r "$fallback_lib_dir/argparse.sh" ]] && [[ -r "$fallback_lib_dir/commands.sh" ]] && [[ -r "$fallback_lib_dir/send_pipeline.sh" ]] && [[ -r "$fallback_lib_dir/main_flow.sh" ]]; then
+  if [[ -r "$fallback_lib_dir/core.sh" ]] && [[ -r "$fallback_lib_dir/transport_mock.sh" ]] && [[ -r "$fallback_lib_dir/runtime.sh" ]] && [[ -r "$fallback_lib_dir/argparse.sh" ]] && [[ -r "$fallback_lib_dir/commands.sh" ]] && [[ -r "$fallback_lib_dir/send_pipeline.sh" ]] && [[ -r "$fallback_lib_dir/main_flow.sh" ]]; then
     LIB_CHATGPT_SEND_DIR="$fallback_lib_dir"
   else
     echo "Missing chatgpt_send modules in $LIB_CHATGPT_SEND_DIR and $fallback_lib_dir" >&2
@@ -137,6 +138,8 @@ fi
 # Load modular function blocks (keeps top-level flow readable).
 # shellcheck source=/dev/null
 source "$LIB_CHATGPT_SEND_DIR/core.sh"
+# shellcheck source=/dev/null
+source "$LIB_CHATGPT_SEND_DIR/transport_mock.sh"
 # shellcheck source=/dev/null
 source "$LIB_CHATGPT_SEND_DIR/runtime.sh"
 # shellcheck source=/dev/null

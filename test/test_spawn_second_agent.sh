@@ -83,6 +83,8 @@ out="$(FAKE_CODEX_ARGS_FILE="$codex_args_file" "$SPAWN" \
   --chatgpt-send-path "$fake_chatgpt_send" 2>&1)"
 
 echo "$out" | rg -q -- '^RUN_ID='
+echo "$out" | rg -q -- '^CHILD_RUN_ID='
+echo "$out" | rg -q -- '^CHILD_RUN_DIR='
 echo "$out" | rg -q -- '^STATE_ROOT='
 echo "$out" | rg -q -- '^CODEX_CHATGPT_SEND_ROOT='
 echo "$out" | rg -q -- '^CDP_PORT='
@@ -95,15 +97,19 @@ state_root="$(echo "$out" | sed -n 's/^STATE_ROOT=//p' | head -n 1)"
 codex_chatgpt_root="$(echo "$out" | sed -n 's/^CODEX_CHATGPT_SEND_ROOT=//p' | head -n 1)"
 cdp_port="$(echo "$out" | sed -n 's/^CDP_PORT=//p' | head -n 1)"
 browser_mode="$(echo "$out" | sed -n 's/^BROWSER_MODE=//p' | head -n 1)"
+run_dir="$(echo "$out" | sed -n 's/^CHILD_RUN_DIR=//p' | head -n 1)"
 last_file="$(echo "$out" | sed -n 's/^LAST_FILE=//p' | head -n 1)"
 log_file="$(echo "$out" | sed -n 's/^LOG_FILE=//p' | head -n 1)"
 status_file="$(echo "$out" | sed -n 's/^STATUS_FILE=//p' | head -n 1)"
+child_result_json="$(echo "$out" | sed -n 's/^CHILD_RESULT_JSON=//p' | head -n 1)"
 
 [[ -d "$state_root" ]]
 [[ -d "$codex_chatgpt_root" ]]
+[[ -d "$run_dir" ]]
 [[ -f "$last_file" ]]
 [[ -f "$log_file" ]]
 [[ -f "$status_file" ]]
+test -s "$child_result_json"
 rg -q -- '^CHILD_RESULT: fake solved task$' "$last_file"
 rg -q -- '^\[child\] ITER_STATUS step=bootstrap status=done reason=runner_started' "$log_file"
 rg -q -- '^\[child\] ITER_STATUS step=final status=done reason=child_completed' "$log_file"
@@ -111,10 +117,18 @@ rg -q -- '^\[child\] FLOW_OK phase=read' "$log_file"
 rg -q -- '^\[child\] FLOW_OK phase=report' "$log_file"
 # Emit markers into test stdout so release_gate_check can see child status lines.
 grep -E '^\[child\] ITER_STATUS ' "$log_file" | sed -n '1,8p'
+printf '%s\n' "CHILD_RUN_DIR=$run_dir"
 [[ "$browser_mode" == "shared" ]]
 [[ "$state_root" == "$tool_root/state/child-agents-shared/"* ]]
 [[ "$codex_chatgpt_root" == "$proj/.chatgpt_send_child_state/"* ]]
 [[ "$cdp_port" == "9222" ]]
+[[ "$run_dir" == "$log_dir/child-"* ]]
+rg -q -- '"run_id"' "$child_result_json"
+rg -q -- '"status"' "$child_result_json"
+rg -q -- '"exit_code"' "$child_result_json"
+rg -q -- '"browser_policy"' "$child_result_json"
+rg -q -- '"browser_used"' "$child_result_json"
+rg -q -- '"slot_used"' "$child_result_json"
 
 # Verify default codex arg for non-trusted/non-git directories is passed.
 rg -q -- '--skip-git-repo-check' "$codex_args_file"
@@ -145,10 +159,17 @@ out_disabled="$(FAKE_CODEX_ARGS_FILE="$codex_args_file" "$SPAWN" \
   --chatgpt-send-path "$fake_chatgpt_send" \
   --browser-disabled 2>&1)"
 echo "$out_disabled" | rg -q -- '^BROWSER_POLICY=disabled$'
+disabled_log_file="$(echo "$out_disabled" | sed -n 's/^LOG_FILE=//p' | head -n 1)"
+disabled_result_json="$(echo "$out_disabled" | sed -n 's/^CHILD_RESULT_JSON=//p' | head -n 1)"
 if rg -q -- 'ARGS=--open-browser --chatgpt-url https://chatgpt.com/' "$env_capture"; then
   echo "unexpected browser open in --browser-disabled mode" >&2
   exit 1
 fi
+! rg -q -- 'SLOT_ACQUIRE' "$disabled_log_file"
+rg -q -- 'SLOT_SKIP reason=browser_disabled' "$disabled_log_file"
+rg -q -- '"browser_policy"[[:space:]]*:[[:space:]]*"disabled"' "$disabled_result_json"
+rg -q -- '"slot_used"[[:space:]]*:[[:space:]]*false' "$disabled_result_json"
+rg -q -- '"browser_used"[[:space:]]*:[[:space:]]*false' "$disabled_result_json"
 
 # Verify browser-required policy fails without explicit CHILD_BROWSER_USED: yes evidence.
 set +e
@@ -168,6 +189,29 @@ set -e
 [[ "$st_required" -ne 0 ]]
 echo "$out_required" | rg -q -- '^BROWSER_POLICY=required$'
 echo "$out_required" | rg -q -- '^CHILD_STATUS_NOTE=browser_policy_failed$'
+required_result_json="$(echo "$out_required" | sed -n 's/^CHILD_RESULT_JSON=//p' | head -n 1)"
+test -s "$required_result_json"
+
+# Verify browser-required passes when browser evidence is emitted by transport
+# (child did not issue chatgpt_send --prompt, but browser usage is proven).
+out_required_transport_ok="$(CHATGPT_SEND_FORCE_CHAT_URL='https://chatgpt.com/c/abcd-1234' FAKE_CODEX_ARGS_FILE="$codex_args_file" "$SPAWN" \
+  --project-path "$proj" \
+  --task "Browser required with transport-side evidence" \
+  --iterations 1 \
+  --launcher direct \
+  --wait \
+  --timeout-sec 30 \
+  --log-dir "$log_dir" \
+  --codex-bin "$fake_codex" \
+  --chatgpt-send-path "$fake_chatgpt_send" \
+  --browser-required \
+  --init-specialist-chat \
+  --open-browser 2>&1)"
+echo "$out_required_transport_ok" | rg -q -- '^BROWSER_POLICY=required$'
+echo "$out_required_transport_ok" | rg -q -- '^CHILD_STATUS=0$'
+required_transport_ok_result_json="$(echo "$out_required_transport_ok" | sed -n 's/^CHILD_RESULT_JSON=//p' | head -n 1)"
+test -s "$required_transport_ok_result_json"
+rg -q -- '"browser_used"[[:space:]]*:[[:space:]]*true' "$required_transport_ok_result_json"
 
 # Verify browser-required passes when child provides valid browser evidence,
 # even if early specialist_chat_url sync is empty.
@@ -184,6 +228,8 @@ out_required_ok="$(FAKE_CODEX_WITH_BROWSER_OK=1 FAKE_CODEX_ARGS_FILE="$codex_arg
   --browser-required 2>&1)"
 echo "$out_required_ok" | rg -q -- '^BROWSER_POLICY=required$'
 echo "$out_required_ok" | rg -q -- '^CHILD_STATUS=0$'
+required_ok_result_json="$(echo "$out_required_ok" | sed -n 's/^CHILD_RESULT_JSON=//p' | head -n 1)"
+test -s "$required_ok_result_json"
 
 # Verify non-zero codex exit is normalized when CHILD_RESULT is present.
 out_nonzero_ok="$(FAKE_CODEX_EXIT=1 FAKE_CODEX_ARGS_FILE="$codex_args_file" "$SPAWN" \
@@ -198,6 +244,8 @@ out_nonzero_ok="$(FAKE_CODEX_EXIT=1 FAKE_CODEX_ARGS_FILE="$codex_args_file" "$SP
   --chatgpt-send-path "$fake_chatgpt_send" 2>&1)"
 echo "$out_nonzero_ok" | rg -q -- '^CHILD_STATUS=0$'
 echo "$out_nonzero_ok" | rg -q -- '^CHILD_RESULT=CHILD_RESULT: fake solved task$'
+nonzero_result_json="$(echo "$out_nonzero_ok" | sed -n 's/^CHILD_RESULT_JSON=//p' | head -n 1)"
+test -s "$nonzero_result_json"
 
 # Verify early failure still writes exit metadata so coordinator won't hang.
 set +e
@@ -217,7 +265,9 @@ set -e
 [[ "$st_fail_fast" -ne 0 ]]
 echo "$out_fail_fast" | rg -q -- '^CHILD_STATUS='
 exit_file_fail_fast="$(echo "$out_fail_fast" | sed -n 's/^EXIT_FILE=//p' | head -n 1)"
+result_json_fail_fast="$(echo "$out_fail_fast" | sed -n 's/^CHILD_RESULT_JSON=//p' | head -n 1)"
 [[ -n "$exit_file_fail_fast" ]]
 [[ -f "$exit_file_fail_fast" ]]
+test -s "$result_json_fail_fast"
 
 echo "OK"

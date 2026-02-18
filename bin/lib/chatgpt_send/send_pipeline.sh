@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 # Send pipeline: target resolution, guards, send, wait, recovery.
 chatgpt_send_run_send_pipeline() {
+chatgpt_send_validate_transport
 # Resolve WORK_CHAT_URL with a single source-of-truth priority:
 # force env -> state/work_chat_url.txt -> explicit arg.
 # Legacy fallback: pinned/default env only when work state is absent.
@@ -61,16 +62,25 @@ if [[ $SYNC_URL -eq 1 ]]; then
   if [[ "${WAIT_ONLY}" == "1" ]]; then
     emit_wait_only_block "sync_chat_url"
   fi
-  if ! cdp_is_up; then
-    echo "CDP is not reachable on 127.0.0.1:$CDP_PORT. Run open-browser first." >&2
-    exit 2
-  fi
-  tab="$(capture_best_chat_tab_from_cdp || true)"
-  detected="${tab%%$'\t'*}"
-  title="${tab#*$'\t'}"
-  if [[ -z "${detected:-}" ]] || [[ "$detected" == "$tab" ]]; then
-    echo "Could not detect any https://chatgpt.com/c/... tab." >&2
-    exit 3
+  if mock_transport_enabled; then
+    detected="$(mock_capture_chat_url | head -n 1 || true)"
+    title="mock"
+    if [[ -z "${detected:-}" ]]; then
+      echo "Could not detect any mock chat URL." >&2
+      exit 3
+    fi
+  else
+    if ! cdp_is_up; then
+      echo "CDP is not reachable on 127.0.0.1:$CDP_PORT. Run open-browser first." >&2
+      exit 2
+    fi
+    tab="$(capture_best_chat_tab_from_cdp || true)"
+    detected="${tab%%$'\t'*}"
+    title="${tab#*$'\t'}"
+    if [[ -z "${detected:-}" ]] || [[ "$detected" == "$tab" ]]; then
+      echo "Could not detect any https://chatgpt.com/c/... tab." >&2
+      exit 3
+    fi
   fi
   if [[ -n "${PROTECT_CHAT_URL//[[:space:]]/}" ]] && is_chat_conversation_url "${PROTECT_CHAT_URL}" \
     && [[ "$detected" != "${PROTECT_CHAT_URL}" ]]; then
@@ -99,10 +109,15 @@ if [[ -n "${CHATGPT_URL:-}" ]] && [[ "$CHATGPT_URL" =~ ^https://chatgpt\.com/c/ 
 fi
 
 if [[ -n "${SAVE_CHAT_NAME//[[:space:]]/}" ]]; then
-  if [[ -z "${CHATGPT_URL:-}" ]] && cdp_is_up; then
-    tab="$(capture_chat_tab_from_cdp || true)"
-    CHATGPT_URL="${tab%%$'\t'*}"
-    title="${tab#*$'\t'}"
+  if [[ -z "${CHATGPT_URL:-}" ]]; then
+    if mock_transport_enabled; then
+      CHATGPT_URL="$(mock_capture_chat_url | head -n 1 || true)"
+      title="mock"
+    elif cdp_is_up; then
+      tab="$(capture_chat_tab_from_cdp || true)"
+      CHATGPT_URL="${tab%%$'\t'*}"
+      title="${tab#*$'\t'}"
+    fi
   fi
   if [[ -z "${CHATGPT_URL:-}" ]]; then
     echo "No chat URL to save. Provide --chatgpt-url, pin one via --set-chatgpt-url, or open browser and keep a single chat tab open." >&2
@@ -308,12 +323,16 @@ fi
 
 # Ensure we have a visible, shared Chrome to operate against.
 # (Do this before we capture pre/post URLs for auto-pinning.)
-if ! cdp_is_up; then
-  open_browser_impl "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
-fi
-if ! cdp_is_up; then
-  echo "CDP is not reachable on 127.0.0.1:$CDP_PORT. Browser is not ready." >&2
-  exit 2
+if mock_transport_enabled; then
+  echo "[mock] cdp_preflight skipped transport=mock run_id=${RUN_ID}" >&2
+else
+  if ! cdp_is_up; then
+    open_browser_impl "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
+  fi
+  if ! cdp_is_up; then
+    echo "CDP is not reachable on 127.0.0.1:$CDP_PORT. Browser is not ready." >&2
+    exit 2
+  fi
 fi
 
 # If no conversation URL is pinned yet, remember current chat tabs; after the
@@ -348,6 +367,7 @@ timeout_s="$(resolve_timeout_seconds)"
 PRECHECK_DONE=0
 LEDGER_PROMPT_STATE="none"
 FETCH_LAST_JSON=""
+FETCH_LAST_URL=""
 FETCH_LAST_CHECKPOINT_ID=""
 FETCH_LAST_LAST_USER_HASH=""
 FETCH_LAST_ASSISTANT_AFTER_LAST_USER="0"
@@ -460,6 +480,16 @@ ledger_info="$(protocol_prompt_state_info "${PROMPT_HASH:-}" "${CHATGPT_URL:-}" 
 IFS=$'\t' read -r LEDGER_PROMPT_STATE LEDGER_LOOKUP_KEY LEDGER_LAST_EVENT LEDGER_LAST_TS <<<"$ledger_info"
 [[ -n "${LEDGER_PROMPT_STATE:-}" ]] || LEDGER_PROMPT_STATE="none"
 echo "LEDGER_LOOKUP key=${LEDGER_LOOKUP_KEY:-none} result=${LEDGER_PROMPT_STATE} last_event=${LEDGER_LAST_EVENT:-none} last_ts=${LEDGER_LAST_TS:-none} run_id=${RUN_ID}" >&2
+
+INIT_SPECIALIST_HOME_FLOW=0
+if [[ "${INIT_SPECIALIST:-0}" == "1" ]] \
+  && [[ "${CHATGPT_URL:-}" == "https://chatgpt.com/" || "${CHATGPT_URL:-}" == "https://chatgpt.com" ]]; then
+  INIT_SPECIALIST_HOME_FLOW=1
+fi
+if [[ "$INIT_SPECIALIST_HOME_FLOW" == "1" ]]; then
+  echo "W_LEDGER_BYPASS_INIT_HOME previous_state=${LEDGER_PROMPT_STATE:-none} run_id=${RUN_ID}" >&2
+  LEDGER_PROMPT_STATE="none"
+fi
 
 pending_auto_heal_reuse() {
   # Usage: pending_auto_heal_reuse <trigger> <refresh_fetch_last:0|1>
