@@ -239,6 +239,9 @@ Behavior:
 - `--skip-git-repo-check` avoids startup failure when child project is outside trusted git repo.
 - Opens child Specialist browser only when policy allows and `--open-browser` is active.
 - Runs child `codex exec` and returns `CHILD_RESULT=...` in `--wait` mode.
+- In no-wait mode, starts background auto-monitor by default and prints:
+- `AUTO_MONITOR=1`, `MONITOR_LOG_FILE=...`, `MONITOR_PID_FILE=...`.
+- Disable with `--no-auto-monitor`.
 
 Run several child agents (parallel example):
 
@@ -248,7 +251,7 @@ Run several child agents (parallel example):
 ./bin/spawn_second_agent --project-path /abs/project/c --task "Task C" --iterations 5 --launcher window
 ```
 
-Each command prints `RUN_ID`, `LOG_FILE`, `LAST_FILE`, `EXIT_FILE`. Use those to monitor completion and build one aggregated summary across all child agents.
+Each command prints `RUN_ID`, `LOG_FILE`, `LAST_FILE`, `EXIT_FILE` and auto-monitor metadata. You can rely on monitor logs instead of manual polling.
 
 </details>
 

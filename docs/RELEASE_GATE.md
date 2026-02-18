@@ -39,6 +39,7 @@ bash test/test_init_specialist_ignores_stale_work_chat.sh
 bash test/test_spawn_second_agent_e2e_mock_transport.sh
 bash test/test_multi_agent_parallel_e2e_mock_transport.sh
 bash test/test_spawn_second_agent.sh
+bash test/test_spawn_second_agent_auto_monitor.sh
 bash test/test_chat_pool_manager_check.sh
 bash test/test_agent_pool_mock_5_agents.sh
 bash test/test_cdp_chatgpt_wait.sh

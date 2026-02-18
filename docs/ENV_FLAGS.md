@@ -81,3 +81,11 @@
 - `CHATGPT_SEND_STRICT_DOCTOR` (default: `0`)
 - `CHATGPT_SEND_PROGRESS` (default: `1`, в `cdp_chatgpt.py`)
 - `CHATGPT_SEND_ACTIVITY_TIMEOUT_SEC` (default: `45`, в `cdp_chatgpt.py`)
+
+## Spawn child auto-monitor
+- `SPAWN_AUTO_MONITOR` (default: `1`, включает фоновый монитор child-run в no-wait режиме)
+- `SPAWN_AUTO_MONITOR_STDOUT` (default: `0`, зеркалировать monitor-события в stdout)
+- `SPAWN_AUTO_MONITOR_POLL_SEC` (default: `2`)
+- `SPAWN_AUTO_MONITOR_HEARTBEAT_SEC` (default: `20`, `0` отключает heartbeat)
+- `SPAWN_AUTO_MONITOR_TIMEOUT_SEC` (default: `0`, без таймаута)
+- `SPAWN_AUTO_MONITOR_SCRIPT` (default: `$ROOT/scripts/child_run_monitor.sh`)

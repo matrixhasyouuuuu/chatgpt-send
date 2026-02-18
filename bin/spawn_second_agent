@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 # Spawn a second Codex agent.
 #
 # Main use-case:
@@ -42,10 +44,18 @@ Options:
   --model MODEL               Optional model for child codex exec
   --codex-bin PATH            Codex binary (default: codex)
   --chatgpt-send-path PATH    chatgpt_send path (default: /home/matrix/projects/chatgpt-send/bin/chatgpt_send)
+  --auto-monitor              Enable background child monitor (default)
+  --no-auto-monitor           Disable background child monitor
+  --auto-monitor-stdout       Mirror monitor events to stdout
+  --no-auto-monitor-stdout    Keep monitor events only in monitor log file (default)
+  --auto-monitor-poll-sec N   Monitor poll interval (default: 2)
+  --auto-monitor-heartbeat-sec N  Heartbeat interval (default: 20; 0 disables)
+  --auto-monitor-timeout-sec N    Monitor timeout (default: 0, disabled)
   -h, --help                  Show help
 
 Output:
   Prints child metadata (RUN_ID, CHILD_RUN_ID, CHILD_RUN_DIR, LOG_FILE, LAST_FILE, EXIT_FILE, STATE_ROOT, CODEX_CHATGPT_SEND_ROOT, CDP_PORT).
+  In no-wait mode also prints monitor metadata (AUTO_MONITOR, MONITOR_LOG_FILE, MONITOR_PID_FILE).
   In --wait mode also prints CHILD_STATUS and CHILD_RESULT.
 EOF
 }
@@ -71,6 +81,12 @@ CHATGPT_SEND_PATH="/home/matrix/projects/chatgpt-send/bin/chatgpt_send"
 BROWSER_POLICY="optional"
 SKIP_GIT_REPO_CHECK=1
 INIT_SPECIALIST_CHAT=1
+AUTO_MONITOR="${SPAWN_AUTO_MONITOR:-1}"
+AUTO_MONITOR_STDOUT="${SPAWN_AUTO_MONITOR_STDOUT:-0}"
+AUTO_MONITOR_POLL_SEC="${SPAWN_AUTO_MONITOR_POLL_SEC:-2}"
+AUTO_MONITOR_HEARTBEAT_SEC="${SPAWN_AUTO_MONITOR_HEARTBEAT_SEC:-20}"
+AUTO_MONITOR_TIMEOUT_SEC="${SPAWN_AUTO_MONITOR_TIMEOUT_SEC:-0}"
+MONITOR_SCRIPT="${SPAWN_AUTO_MONITOR_SCRIPT:-$ROOT_DIR/scripts/child_run_monitor.sh}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -98,6 +114,13 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL="${2:-}"; shift 2;;
     --codex-bin) CODEX_BIN="${2:-}"; shift 2;;
     --chatgpt-send-path) CHATGPT_SEND_PATH="${2:-}"; shift 2;;
+    --auto-monitor) AUTO_MONITOR=1; shift;;
+    --no-auto-monitor) AUTO_MONITOR=0; shift;;
+    --auto-monitor-stdout) AUTO_MONITOR_STDOUT=1; shift;;
+    --no-auto-monitor-stdout) AUTO_MONITOR_STDOUT=0; shift;;
+    --auto-monitor-poll-sec) AUTO_MONITOR_POLL_SEC="${2:-}"; shift 2;;
+    --auto-monitor-heartbeat-sec) AUTO_MONITOR_HEARTBEAT_SEC="${2:-}"; shift 2;;
+    --auto-monitor-timeout-sec) AUTO_MONITOR_TIMEOUT_SEC="${2:-}"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1" >&2; usage >&2; exit 2;;
   esac
@@ -135,12 +158,29 @@ if [[ "$BROWSER_POLICY" != "required" && "$BROWSER_POLICY" != "optional" && "$BR
   echo "Error: browser policy must be required|optional|disabled." >&2
   exit 2
 fi
+if [[ ! "$AUTO_MONITOR" =~ ^[01]$ ]] || [[ ! "$AUTO_MONITOR_STDOUT" =~ ^[01]$ ]]; then
+  echo "Error: --auto-monitor and --auto-monitor-stdout expect 0/1 mode." >&2
+  exit 2
+fi
+for n in "$AUTO_MONITOR_POLL_SEC" "$AUTO_MONITOR_HEARTBEAT_SEC" "$AUTO_MONITOR_TIMEOUT_SEC"; do
+  if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+    echo "Error: auto-monitor numeric option expected, got: $n" >&2
+    exit 2
+  fi
+done
+if (( AUTO_MONITOR_POLL_SEC < 1 )); then
+  echo "Error: --auto-monitor-poll-sec must be >= 1." >&2
+  exit 2
+fi
 # Apply browser opening policy at launcher level.
 if [[ "$BROWSER_POLICY" == "disabled" ]]; then
   OPEN_BROWSER=0
   INIT_SPECIALIST_CHAT=0
 elif [[ "$BROWSER_POLICY" == "required" ]]; then
   OPEN_BROWSER=1
+fi
+if (( WAIT_MODE == 1 )); then
+  AUTO_MONITOR=0
 fi
 
 if [[ ! -d "$PROJECT_PATH" ]]; then
@@ -901,6 +941,52 @@ else
   nohup "$runner_file" >/dev/null 2>&1 &
 fi
 
+auto_monitor_active=0
+monitor_log_file="$RUN_DIR/${run_id}.monitor.log"
+monitor_pid_file="$RUN_DIR/${run_id}.monitor.pid"
+if (( WAIT_MODE == 0 )) && [[ "$AUTO_MONITOR" == "1" ]]; then
+  if [[ -x "$MONITOR_SCRIPT" ]]; then
+    monitor_cmd=(
+      "$MONITOR_SCRIPT"
+      --run-dir "$RUN_DIR"
+      --run-id "$run_id"
+      --label "spawn_second_agent"
+      --poll-sec "$AUTO_MONITOR_POLL_SEC"
+      --heartbeat-sec "$AUTO_MONITOR_HEARTBEAT_SEC"
+      --timeout-sec "$AUTO_MONITOR_TIMEOUT_SEC"
+      --pid-file "$monitor_pid_file"
+      --monitor-log "$monitor_log_file"
+    )
+    if [[ "$AUTO_MONITOR_STDOUT" == "1" ]]; then
+      monitor_cmd+=(--stdout)
+    fi
+    rm -f "$monitor_pid_file" >/dev/null 2>&1 || true
+    if command -v setsid >/dev/null 2>&1; then
+      setsid -f "${monitor_cmd[@]}" >/dev/null 2>&1 < /dev/null || true
+    else
+      nohup "${monitor_cmd[@]}" >/dev/null 2>&1 &
+    fi
+    monitor_pid=""
+    for _ in 1 2 3 4 5; do
+      if [[ -s "$monitor_pid_file" ]]; then
+        monitor_pid="$(tr -d '[:space:]' <"$monitor_pid_file" 2>/dev/null || true)"
+        break
+      fi
+      sleep 0.1
+    done
+    if [[ -n "$monitor_pid" ]] && kill -0 "$monitor_pid" >/dev/null 2>&1; then
+      auto_monitor_active=1
+    else
+      auto_monitor_active=0
+      echo "W_AUTO_MONITOR_DISABLED reason=monitor_not_running run_id=${run_id}" >&2
+    fi
+  else
+    monitor_log_file=""
+    monitor_pid_file=""
+    echo "W_AUTO_MONITOR_DISABLED reason=monitor_script_missing path=${MONITOR_SCRIPT}" >&2
+  fi
+fi
+
 echo "RUN_ID=${run_id}"
 echo "CHILD_RUN_ID=${run_id}"
 echo "CHILD_RUN_DIR=${RUN_DIR}"
@@ -921,6 +1007,9 @@ echo "EXIT_FILE=${exit_file}"
 echo "PID_FILE=${pid_file}"
 echo "CHILD_RESULT_JSON=${child_result_file}"
 echo "CHILD_CHATGPT_SEND_LOG_DIR=${CHATGPT_SEND_CHILD_LOG_DIR}"
+echo "AUTO_MONITOR=${auto_monitor_active}"
+echo "MONITOR_LOG_FILE=${monitor_log_file:-none}"
+echo "MONITOR_PID_FILE=${monitor_pid_file:-none}"
 
 if (( WAIT_MODE == 1 )); then
   deadline=$(( $(date +%s) + TIMEOUT_SEC ))
