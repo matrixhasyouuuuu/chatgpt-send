@@ -110,4 +110,24 @@
 - `POOL_FLEET_GATE_ENABLED` (default: `1`, strict end-of-run gate)
 - `POOL_FLEET_GATE_TIMEOUT_SEC` (default: `20`)
 - `POOL_FLEET_GATE_HEARTBEAT_SEC` (default: `0`)
+- `POOL_STRICT_CHAT_PROOF` (default: `auto`, варианты: `0|1|auto`; `auto` => strict в live или при `--chat-pool-file`)
 - `POOL_FLEET_REGISTRY_LOCK_TIMEOUT_SEC` (default: `2`, propagated to child `spawn_second_agent`)
+- `POOL_FLEET_ROSTER_LOCK_TIMEOUT_SEC` (default: `2`, timeout for append to `fleet_roster.jsonl` before soft-skip with `W_FLEET_ROSTER_LOCK_TIMEOUT`)
+- `POOL_LOCK_FILE` (default: `/tmp/chatgpt-send-agent-pool.lock`, single-flight lock for whole pool run)
+- `POOL_LOCK_TIMEOUT_SEC` (default: `0`, `0` = fail-fast if lock busy)
+- `POOL_KILL_GRACE_SEC` (default: `5`, grace period before SIGKILL on abort cleanup)
+
+## Agent pool retention / GC
+- `POOL_RUNS_ROOT` (default: `$ROOT/state/runs`, root for pool run directories)
+- `POOL_GC` (default: `auto`, варианты: `0|1|auto`)
+- `POOL_GC_KEEP_LAST` (default: `20`)
+- `POOL_GC_KEEP_HOURS` (default: `72`)
+- `POOL_GC_MAX_TOTAL_MB` (default: `2048`)
+- `POOL_GC_FREE_WARN_PCT` (default: `10`, при `POOL_GC=auto` GC запускается если free_pct <= warn)
+- `POOL_GC_SCRIPT` (default: `$ROOT/scripts/fleet_gc.sh`)
+- `FLEET_GC_ACTIVE_HEARTBEAT_SEC` (default: `120`, safeguard для активного run по свежему `fleet.heartbeat`)
+
+## Fleet monitor disk guard
+- `FLEET_DISK_PATH` (default: `<pool-run-dir>`)
+- `FLEET_DISK_FREE_WARN_PCT` (default: `10`)
+- `FLEET_DISK_FREE_FAIL_PCT` (default: `5`)

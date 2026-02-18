@@ -19,6 +19,7 @@ Options:
   --summary-json FILE  (default: <pool-run-dir>/fleet.summary.json)
   --summary-csv FILE   (default: <pool-run-dir>/fleet.summary.csv)
   --registry-file FILE (default: <pool-run-dir>/fleet_registry.jsonl)
+  --roster-jsonl FILE  (default: <pool-run-dir>/fleet_roster.jsonl)
   --lock-file FILE     (default: <pool-run-dir>/fleet.monitor.lock)
   --stdout             (mirror monitor events to stdout)
   -h, --help
@@ -34,6 +35,7 @@ MONITOR_LOG=""
 SUMMARY_JSON=""
 SUMMARY_CSV=""
 REGISTRY_FILE=""
+ROSTER_JSONL=""
 LOCK_FILE=""
 OUT_PID_FILE=""
 TO_STDOUT=0
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --summary-json) SUMMARY_JSON="${2:-}"; shift 2 ;;
     --summary-csv) SUMMARY_CSV="${2:-}"; shift 2 ;;
     --registry-file) REGISTRY_FILE="${2:-}"; shift 2 ;;
+    --roster-jsonl) ROSTER_JSONL="${2:-}"; shift 2 ;;
     --lock-file) LOCK_FILE="${2:-}"; shift 2 ;;
     --stdout) TO_STDOUT=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -95,6 +98,9 @@ fi
 if [[ -z "$REGISTRY_FILE" ]]; then
   REGISTRY_FILE="$POOL_RUN_DIR/fleet_registry.jsonl"
 fi
+if [[ -z "$ROSTER_JSONL" ]]; then
+  ROSTER_JSONL="$POOL_RUN_DIR/fleet_roster.jsonl"
+fi
 if [[ -z "$LOCK_FILE" ]]; then
   LOCK_FILE="$POOL_RUN_DIR/fleet.monitor.lock"
 fi
@@ -122,6 +128,28 @@ short_line() {
   line="$(printf '%s' "$line" | tr '\r' ' ' | tr '\n' ' ')"
   line="$(printf '%s' "$line" | tr '\t' ' ' | sed 's/[[:space:]]\+/ /g')"
   printf '%s' "$line" | cut -c1-360
+}
+
+normalize_chat_url() {
+  local raw="${1:-}"
+  raw="$(printf '%s' "$raw" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [[ -n "$raw" ]] || return 0
+  if [[ "$raw" =~ ^https://chatgpt\.com/c/([A-Za-z0-9-]+)([/?#].*)?$ ]]; then
+    printf 'https://chatgpt.com/c/%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$raw" =~ ^https://chatgpt\.com/?([?#].*)?$ ]]; then
+    return 0
+  fi
+  return 0
+}
+
+extract_evidence_chat_url() {
+  local log_file="${1:-}"
+  [[ -f "$log_file" ]] || return 0
+  tail -n 200 "$log_file" 2>/dev/null \
+    | sed -n 's/.*EVIDENCE:[[:space:]]*\(https:\/\/chatgpt\.com[^[:space:]]*\).*/\1/p' \
+    | tail -n 1
 }
 
 log_event() {
@@ -162,6 +190,7 @@ mkdir -p "$(dirname "$OUT_PID_FILE")"
 mkdir -p "$(dirname "$HEARTBEAT_FILE")"
 mkdir -p "$(dirname "$EVENTS_JSONL")"
 mkdir -p "$(dirname "$EVENTS_LOCK_FILE")"
+mkdir -p "$(dirname "$ROSTER_JSONL")"
 
 for n in "$FLEET_DISK_FREE_WARN_PCT" "$FLEET_DISK_FREE_FAIL_PCT"; do
   if [[ ! "$n" =~ ^[0-9]+$ ]]; then
@@ -206,14 +235,22 @@ declare -A STATE_CLASS STATE_REASON LEGACY_STATE
 declare -A PID_VALUE ALIVE EXIT_CODE RESULT_STATUS RESULT_EXIT RESULT_PARSE_ERR
 declare -A LAST_STEP LAST_TAIL AGE_SEC LAST_UPDATE_EPOCH
 declare -A OBSERVED_CHAT_URL_BEFORE OBSERVED_CHAT_URL_AFTER
+declare -A ASSIGNED_CHAT_URL_NORM OBSERVED_CHAT_URL_NORM CHAT_PROOF
 declare -A RESULT_MTIME_CACHE
 declare -A PREV_CLASS
+declare -A PREV_ASSIGNED_CHAT_URL_NORM PREV_OBSERVED_CHAT_URL_NORM PREV_CHAT_PROOF
 
 registry_bad_lines_prev="-1"
+roster_bad_lines_prev="-1"
 DISK_STATUS="unknown"
 DISK_FREE_PCT=""
 DISK_AVAIL_KB=""
 disk_status_prev=""
+DISCOVERY_REGISTRY_COUNT=0
+DISCOVERY_ROSTER_COUNT=0
+DISCOVERY_MERGED_COUNT=0
+MISSING_ARTIFACTS_TOTAL=0
+LAST_DISCOVERED_KEY=""
 
 write_heartbeat() {
   local ts_ms
@@ -330,6 +367,7 @@ add_child_run() {
   local run_dir_in="${2:-}"
   local agent_in="${3:-}"
   local assigned_chat_in="${4:-}"
+  LAST_DISCOVERED_KEY=""
   local run_dir_trim="${run_dir_in%/}"
   if [[ -z "$run_dir_trim" ]]; then
     return 0
@@ -346,6 +384,7 @@ add_child_run() {
     agent_trim="$(basename "$(dirname "$run_dir_trim")")"
   fi
   local key="${run_id_trim}|${run_dir_trim}"
+  LAST_DISCOVERED_KEY="$key"
   if [[ -n "${KEY_SEEN[$key]:-}" ]]; then
     if [[ -z "${ASSIGNED_CHAT_URL[$key]:-}" ]] && [[ -n "${assigned_chat_in:-}" ]]; then
       ASSIGNED_CHAT_URL["$key"]="$assigned_chat_in"
@@ -382,12 +421,29 @@ add_child_run() {
   LAST_UPDATE_EPOCH["$key"]="0"
   OBSERVED_CHAT_URL_BEFORE["$key"]=""
   OBSERVED_CHAT_URL_AFTER["$key"]=""
+  ASSIGNED_CHAT_URL_NORM["$key"]=""
+  OBSERVED_CHAT_URL_NORM["$key"]=""
+  CHAT_PROOF["$key"]="unknown"
   RESULT_MTIME_CACHE["$key"]="0"
   PREV_CLASS["$key"]=""
+  PREV_ASSIGNED_CHAT_URL_NORM["$key"]=""
+  PREV_OBSERVED_CHAT_URL_NORM["$key"]=""
+  PREV_CHAT_PROOF["$key"]=""
   log_event "event=child_discovered run_id=${run_id_trim} agent=${agent_trim} run_dir=${run_dir_trim}"
 }
 
 refresh_discovery() {
+  local reg_bad_lines="0"
+  local roster_bad_lines="0"
+  local reg_count=0
+  local roster_count=0
+  local merged_count=0
+  local missing_artifacts=0
+  local -A reg_seen=()
+  local -A roster_seen=()
+  local -A merged_seen=()
+  local -A missing_seen=()
+
   if [[ -d "$POOL_RUN_DIR/logs" ]]; then
     while IFS= read -r dir; do
       [[ -n "$dir" ]] || continue
@@ -396,13 +452,31 @@ refresh_discovery() {
   fi
 
   if [[ -f "$REGISTRY_FILE" ]]; then
-    local reg_bad_lines="0"
-    while IFS=$'\t' read -r rid rdir ragent rchat; do
-      if [[ "$rid" == "__BAD_LINES__" ]]; then
-        reg_bad_lines="${rdir:-0}"
+    while IFS=$'\t' read -r kind c1 c2 c3 c4 c5; do
+      if [[ "$kind" == "META" ]] && [[ "$c1" == "bad_lines" ]]; then
+        reg_bad_lines="${c2:-0}"
         continue
       fi
-      add_child_run "$rid" "$rdir" "$ragent" "$rchat"
+      if [[ "$kind" != "ROW" ]]; then
+        continue
+      fi
+      add_child_run "$c1" "$c2" "$c3" "$c4"
+      local key="${LAST_DISCOVERED_KEY:-}"
+      if [[ -z "$key" ]]; then
+        continue
+      fi
+      if [[ -z "${reg_seen[$key]:-}" ]]; then
+        reg_seen["$key"]="1"
+        reg_count=$((reg_count + 1))
+      fi
+      if [[ -z "${merged_seen[$key]:-}" ]]; then
+        merged_seen["$key"]="1"
+        merged_count=$((merged_count + 1))
+      fi
+      if [[ "${c5:-0}" == "1" ]] && [[ -z "${missing_seen[$key]:-}" ]]; then
+        missing_seen["$key"]="1"
+        missing_artifacts=$((missing_artifacts + 1))
+      fi
     done < <(python3 - "$REGISTRY_FILE" <<'PY'
 import json
 import os
@@ -430,12 +504,17 @@ with open(path, encoding="utf-8", errors="replace") as fh:
             run_id = os.path.basename(run_dir.rstrip("/"))
         agent_id = str(obj.get("agent_id", "")).strip()
         assigned_chat = str(obj.get("assigned_chat_url", "")).strip()
+        missing = 0
+        for field in ("result_json", "pid_file", "status_file", "log_file"):
+            if not str(obj.get(field, "")).strip():
+                missing = 1
+                break
         key = (run_id, run_dir)
         if key in seen:
             continue
         seen.add(key)
-        print(f"{run_id}\t{run_dir}\t{agent_id}\t{assigned_chat}")
-print(f"__BAD_LINES__\t{bad}\t\t")
+        print(f"ROW\t{run_id}\t{run_dir}\t{agent_id}\t{assigned_chat}\t{missing}")
+print(f"META\tbad_lines\t{bad}\t\t\t")
 PY
 )
     if [[ "$reg_bad_lines" =~ ^[0-9]+$ ]]; then
@@ -445,6 +524,85 @@ PY
       registry_bad_lines_prev="$reg_bad_lines"
     fi
   fi
+
+  if [[ -f "$ROSTER_JSONL" ]]; then
+    while IFS=$'\t' read -r kind c1 c2 c3 c4 c5; do
+      if [[ "$kind" == "META" ]] && [[ "$c1" == "bad_lines" ]]; then
+        roster_bad_lines="${c2:-0}"
+        continue
+      fi
+      if [[ "$kind" != "ROW" ]]; then
+        continue
+      fi
+      add_child_run "$c1" "$c2" "$c3" "$c4"
+      local key="${LAST_DISCOVERED_KEY:-}"
+      if [[ -z "$key" ]]; then
+        continue
+      fi
+      if [[ -z "${roster_seen[$key]:-}" ]]; then
+        roster_seen["$key"]="1"
+        roster_count=$((roster_count + 1))
+      fi
+      if [[ -z "${merged_seen[$key]:-}" ]]; then
+        merged_seen["$key"]="1"
+        merged_count=$((merged_count + 1))
+      fi
+      if [[ "${c5:-0}" == "1" ]] && [[ -z "${missing_seen[$key]:-}" ]]; then
+        missing_seen["$key"]="1"
+        missing_artifacts=$((missing_artifacts + 1))
+      fi
+    done < <(python3 - "$ROSTER_JSONL" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+bad = 0
+seen = set()
+with open(path, encoding="utf-8", errors="replace") as fh:
+    for raw in fh:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            bad += 1
+            continue
+        run_dir = str(obj.get("run_dir", "")).strip()
+        if not run_dir:
+            bad += 1
+            continue
+        run_id = str(obj.get("run_id", "")).strip()
+        if not run_id:
+            run_id = os.path.basename(run_dir.rstrip("/"))
+        agent_id = str(obj.get("agent_id", "")).strip()
+        assigned_chat = str(obj.get("assigned_chat_url", "")).strip()
+        missing = 0
+        for field in ("result_json", "pid_file", "status_file", "log_file"):
+            if not str(obj.get(field, "")).strip():
+                missing = 1
+                break
+        key = (run_id, run_dir)
+        if key in seen:
+            continue
+        seen.add(key)
+        print(f"ROW\t{run_id}\t{run_dir}\t{agent_id}\t{assigned_chat}\t{missing}")
+print(f"META\tbad_lines\t{bad}\t\t\t")
+PY
+)
+    if [[ "$roster_bad_lines" =~ ^[0-9]+$ ]]; then
+      if [[ "$roster_bad_lines" != "$roster_bad_lines_prev" ]] && (( roster_bad_lines > 0 )); then
+        log_event "event=roster_warn code=W_FLEET_ROSTER_CORRUPT_LINE_SKIPPED bad_lines=${roster_bad_lines} roster_jsonl=${ROSTER_JSONL}"
+      fi
+      roster_bad_lines_prev="$roster_bad_lines"
+    fi
+  fi
+
+  DISCOVERY_REGISTRY_COUNT="$reg_count"
+  DISCOVERY_ROSTER_COUNT="$roster_count"
+  DISCOVERY_MERGED_COUNT="$merged_count"
+  MISSING_ARTIFACTS_TOTAL="$missing_artifacts"
 }
 
 refresh_result_cache() {
@@ -651,6 +809,40 @@ classify_child() {
   esac
   LEGACY_STATE["$key"]="$legacy"
 
+  local assigned_norm=""
+  local observed_norm=""
+  local observed_candidate=""
+  assigned_norm="$(normalize_chat_url "${ASSIGNED_CHAT_URL[$key]:-}")"
+  if [[ -n "${OBSERVED_CHAT_URL_AFTER[$key]:-}" ]]; then
+    observed_candidate="${OBSERVED_CHAT_URL_AFTER[$key]}"
+  elif [[ -n "${OBSERVED_CHAT_URL_BEFORE[$key]:-}" ]]; then
+    observed_candidate="${OBSERVED_CHAT_URL_BEFORE[$key]}"
+  else
+    observed_candidate="$(extract_evidence_chat_url "${LOG_FILE[$key]}")"
+  fi
+  observed_norm="$(normalize_chat_url "$observed_candidate")"
+
+  local proof="unknown"
+  if [[ -n "$assigned_norm" ]] && [[ -n "$observed_norm" ]]; then
+    if [[ "$assigned_norm" == "$observed_norm" ]]; then
+      proof="ok"
+    else
+      proof="mismatch"
+    fi
+  fi
+  ASSIGNED_CHAT_URL_NORM["$key"]="$assigned_norm"
+  OBSERVED_CHAT_URL_NORM["$key"]="$observed_norm"
+  CHAT_PROOF["$key"]="$proof"
+
+  if [[ "${PREV_CHAT_PROOF[$key]:-}" != "$proof" ]] \
+    || [[ "${PREV_ASSIGNED_CHAT_URL_NORM[$key]:-}" != "$assigned_norm" ]] \
+    || [[ "${PREV_OBSERVED_CHAT_URL_NORM[$key]:-}" != "$observed_norm" ]]; then
+    log_event "event=chat_proof run_id=${RUN_ID[$key]} proof=${proof} assigned=${assigned_norm:-none} observed=${observed_norm:-none}"
+    PREV_CHAT_PROOF["$key"]="$proof"
+    PREV_ASSIGNED_CHAT_URL_NORM["$key"]="$assigned_norm"
+    PREV_OBSERVED_CHAT_URL_NORM["$key"]="$observed_norm"
+  fi
+
   if [[ "${PREV_CLASS[$key]:-}" != "$klass" ]]; then
     append_transition_event "$key" "${PREV_CLASS[$key]:-}" "$klass" "$reason" "$step"
     PREV_CLASS["$key"]="$klass"
@@ -674,11 +866,15 @@ write_snapshot() {
   local disk_status="$8"
   local disk_free_pct="$9"
   local disk_avail_kb="${10}"
+  local discovery_registry="${11}"
+  local discovery_roster="${12}"
+  local discovery_merged="${13}"
+  local missing_artifacts_total="${14}"
 
   local tmp_rows
   tmp_rows="$(mktemp)"
   for key in "${ORDERED_KEYS[@]}"; do
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$key" \
       "${AGENT_ID[$key]}" \
       "${RUN_ID[$key]}" \
@@ -698,6 +894,9 @@ write_snapshot() {
       "$(short_line "${ASSIGNED_CHAT_URL[$key]}")" \
       "$(short_line "${OBSERVED_CHAT_URL_BEFORE[$key]}")" \
       "$(short_line "${OBSERVED_CHAT_URL_AFTER[$key]}")" \
+      "$(short_line "${ASSIGNED_CHAT_URL_NORM[$key]}")" \
+      "$(short_line "${OBSERVED_CHAT_URL_NORM[$key]}")" \
+      "$(short_line "${CHAT_PROOF[$key]}")" \
       "${PID_FILE[$key]}" \
       "${EXIT_FILE[$key]}" \
       "${STATUS_FILE[$key]}" \
@@ -708,19 +907,24 @@ write_snapshot() {
       "$(now_iso)" >>"$tmp_rows"
   done
 
-  python3 - "$tmp_rows" "$SUMMARY_JSON" "$SUMMARY_CSV" "$REGISTRY_FILE" \
+  python3 - "$tmp_rows" "$SUMMARY_JSON" "$SUMMARY_CSV" "$REGISTRY_FILE" "$ROSTER_JSONL" \
     "$total" "$done_ok" "$done_fail" "$running" "$stuck" "$orphaned" "$unknown" \
-    "$disk_status" "$disk_free_pct" "$disk_avail_kb" <<'PY'
+    "$disk_status" "$disk_free_pct" "$disk_avail_kb" \
+    "$discovery_registry" "$discovery_roster" "$discovery_merged" "$missing_artifacts_total" <<'PY'
 import csv
 import json
 import os
 import sys
 
-rows_file, json_out, csv_out, registry_file = sys.argv[1:5]
-total, done_ok, done_fail, running, stuck, orphaned, unknown = map(int, sys.argv[5:12])
-disk_status = str(sys.argv[12] or "unknown")
-disk_free_pct_raw = str(sys.argv[13] or "").strip()
-disk_avail_kb_raw = str(sys.argv[14] or "").strip()
+rows_file, json_out, csv_out, registry_file, roster_file = sys.argv[1:6]
+total, done_ok, done_fail, running, stuck, orphaned, unknown = map(int, sys.argv[6:13])
+disk_status = str(sys.argv[13] or "unknown")
+disk_free_pct_raw = str(sys.argv[14] or "").strip()
+disk_avail_kb_raw = str(sys.argv[15] or "").strip()
+discovery_registry = int(sys.argv[16])
+discovery_roster = int(sys.argv[17])
+discovery_merged = int(sys.argv[18])
+missing_artifacts_total = int(sys.argv[19])
 
 disk_free_pct = int(disk_free_pct_raw) if disk_free_pct_raw.isdigit() else None
 disk_avail_kb = int(disk_avail_kb_raw) if disk_avail_kb_raw.isdigit() else None
@@ -732,7 +936,7 @@ with open(rows_file, encoding="utf-8") as f:
         if not line:
             continue
         parts = line.split("\t")
-        if len(parts) != 27:
+        if len(parts) != 30:
             continue
         (
             key,
@@ -754,6 +958,9 @@ with open(rows_file, encoding="utf-8") as f:
             assigned_chat_url,
             observed_chat_url_before,
             observed_chat_url_after,
+            assigned_chat_url_norm,
+            observed_chat_url_norm,
+            chat_proof,
             pid_file,
             exit_file,
             status_file,
@@ -784,6 +991,9 @@ with open(rows_file, encoding="utf-8") as f:
                 "assigned_chat_url": assigned_chat_url or None,
                 "observed_chat_url_before": observed_chat_url_before or None,
                 "observed_chat_url_after": observed_chat_url_after or None,
+                "assigned_chat_url_norm": assigned_chat_url_norm or None,
+                "observed_chat_url_norm": observed_chat_url_norm or None,
+                "chat_proof": chat_proof or "unknown",
                 "pid_file": pid_file,
                 "exit_file": exit_file,
                 "status_file": status_file,
@@ -810,6 +1020,16 @@ payload = {
     "disk_free_pct": disk_free_pct,
     "disk_avail_kb": disk_avail_kb,
     "registry_file": registry_file,
+    "roster_jsonl": roster_file,
+    "discovery_sources": {
+        "registry": discovery_registry,
+        "roster": discovery_roster,
+        "merged": discovery_merged,
+    },
+    "missing_artifacts_total": missing_artifacts_total,
+    "chat_ok_total": sum(1 for r in agents if r.get("chat_proof") == "ok"),
+    "chat_mismatch_total": sum(1 for r in agents if r.get("chat_proof") == "mismatch"),
+    "chat_unknown_total": sum(1 for r in agents if r.get("chat_proof") == "unknown"),
     "agents": agents,
 }
 
@@ -838,6 +1058,9 @@ header = [
     "assigned_chat_url",
     "observed_chat_url_before",
     "observed_chat_url_after",
+    "assigned_chat_url_norm",
+    "observed_chat_url_norm",
+    "chat_proof",
     "run_dir",
     "pid_file",
     "exit_file",
@@ -865,7 +1088,7 @@ if (( HEARTBEAT_SEC > 0 )); then
 fi
 last_progress_sig=""
 
-log_event "event=start poll_sec=${POLL_SEC} heartbeat_sec=${HEARTBEAT_SEC} timeout_sec=${TIMEOUT_SEC} stuck_after_sec=${STUCK_AFTER_SEC} registry_file=${REGISTRY_FILE} heartbeat_file=${HEARTBEAT_FILE} events_jsonl=${EVENTS_JSONL} disk_path=${FLEET_DISK_PATH} disk_warn_pct=${FLEET_DISK_FREE_WARN_PCT} disk_fail_pct=${FLEET_DISK_FREE_FAIL_PCT}"
+log_event "event=start poll_sec=${POLL_SEC} heartbeat_sec=${HEARTBEAT_SEC} timeout_sec=${TIMEOUT_SEC} stuck_after_sec=${STUCK_AFTER_SEC} registry_file=${REGISTRY_FILE} roster_jsonl=${ROSTER_JSONL} heartbeat_file=${HEARTBEAT_FILE} events_jsonl=${EVENTS_JSONL} disk_path=${FLEET_DISK_PATH} disk_warn_pct=${FLEET_DISK_FREE_WARN_PCT} disk_fail_pct=${FLEET_DISK_FREE_FAIL_PCT}"
 
 while true; do
   now_ts="$(now_epoch)"
@@ -892,7 +1115,7 @@ while true; do
     esac
   done
 
-  write_snapshot "$total" "$done_ok" "$done_fail" "$running" "$stuck" "$orphaned" "$unknown" "${DISK_STATUS:-unknown}" "${DISK_FREE_PCT:-}" "${DISK_AVAIL_KB:-}"
+  write_snapshot "$total" "$done_ok" "$done_fail" "$running" "$stuck" "$orphaned" "$unknown" "${DISK_STATUS:-unknown}" "${DISK_FREE_PCT:-}" "${DISK_AVAIL_KB:-}" "${DISCOVERY_REGISTRY_COUNT:-0}" "${DISCOVERY_ROSTER_COUNT:-0}" "${DISCOVERY_MERGED_COUNT:-0}" "${MISSING_ARTIFACTS_TOTAL:-0}"
 
   progress_sig="${total}|${done_ok}|${done_fail}|${running}|${stuck}|${orphaned}|${unknown}"
   if [[ "$progress_sig" != "$last_progress_sig" ]]; then

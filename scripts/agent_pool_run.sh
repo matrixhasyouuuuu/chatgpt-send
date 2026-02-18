@@ -39,9 +39,24 @@ FLEET_GATE_ENABLED="${POOL_FLEET_GATE_ENABLED:-1}"           # 1|0
 FLEET_GATE_TIMEOUT_SEC="${POOL_FLEET_GATE_TIMEOUT_SEC:-20}"
 FLEET_GATE_HEARTBEAT_SEC="${POOL_FLEET_GATE_HEARTBEAT_SEC:-0}"
 FLEET_REGISTRY_LOCK_TIMEOUT_SEC="${POOL_FLEET_REGISTRY_LOCK_TIMEOUT_SEC:-2}"
+FLEET_ROSTER_LOCK_TIMEOUT_SEC="${POOL_FLEET_ROSTER_LOCK_TIMEOUT_SEC:-2}"
 POOL_LOCK_FILE="${POOL_LOCK_FILE:-/tmp/chatgpt-send-agent-pool.lock}"
 POOL_LOCK_TIMEOUT_SEC="${POOL_LOCK_TIMEOUT_SEC:-0}"
 POOL_KILL_GRACE_SEC="${POOL_KILL_GRACE_SEC:-5}"
+POOL_RUNS_ROOT="${POOL_RUNS_ROOT:-$ROOT_DIR/state/runs}"
+POOL_GC="${POOL_GC:-auto}" # 0|1|auto
+POOL_GC_KEEP_LAST="${POOL_GC_KEEP_LAST:-20}"
+POOL_GC_KEEP_HOURS="${POOL_GC_KEEP_HOURS:-72}"
+POOL_GC_MAX_TOTAL_MB="${POOL_GC_MAX_TOTAL_MB:-2048}"
+POOL_GC_FREE_WARN_PCT="${POOL_GC_FREE_WARN_PCT:-10}"
+POOL_GC_SCRIPT="${POOL_GC_SCRIPT:-$ROOT_DIR/scripts/fleet_gc.sh}"
+POOL_STRICT_CHAT_PROOF="${POOL_STRICT_CHAT_PROOF:-auto}" # 0|1|auto
+POOL_WRITE_REPORT="${POOL_WRITE_REPORT:-1}" # 0|1
+POOL_REPORT_SCRIPT="${POOL_REPORT_SCRIPT:-$ROOT_DIR/scripts/pool_report.sh}"
+POOL_REPORT_MD="${POOL_REPORT_MD:-}"
+POOL_REPORT_JSON="${POOL_REPORT_JSON:-}"
+POOL_REPORT_MAX_LAST_LINES="${POOL_REPORT_MAX_LAST_LINES:-80}"
+POOL_REPORT_INCLUDE_LOGS="${POOL_REPORT_INCLUDE_LOGS:-0}" # 0|1
 
 usage() {
   cat <<'USAGE'
@@ -128,12 +143,22 @@ if [[ ! "$BROWSER_POLICY" =~ ^(required|optional|disabled)$ ]]; then
   echo "invalid --browser-policy: $BROWSER_POLICY" >&2
   exit 6
 fi
+if [[ ! "$POOL_GC" =~ ^(0|1|auto)$ ]]; then
+  echo "invalid POOL_GC: $POOL_GC (expected 0|1|auto)" >&2
+  exit 6
+fi
+if [[ ! "$POOL_STRICT_CHAT_PROOF" =~ ^(0|1|auto)$ ]]; then
+  echo "invalid POOL_STRICT_CHAT_PROOF: $POOL_STRICT_CHAT_PROOF (expected 0|1|auto)" >&2
+  exit 6
+fi
 for n in \
   "$CONCURRENCY" "$ITERATIONS" "$TIMEOUT_SEC" "$FAIL_FAST_AFTER" "$RETRY_MAX" \
   "$FLEET_MONITOR_POLL_SEC" "$FLEET_MONITOR_HEARTBEAT_SEC" "$FLEET_MONITOR_TIMEOUT_SEC" \
   "$FLEET_MONITOR_STUCK_AFTER_SEC" "$FLEET_WATCHDOG_COOLDOWN_SEC" "$FLEET_GATE_TIMEOUT_SEC" \
-  "$FLEET_GATE_HEARTBEAT_SEC" "$FLEET_REGISTRY_LOCK_TIMEOUT_SEC" \
-  "$POOL_LOCK_TIMEOUT_SEC" "$POOL_KILL_GRACE_SEC"; do
+  "$FLEET_GATE_HEARTBEAT_SEC" "$FLEET_REGISTRY_LOCK_TIMEOUT_SEC" "$FLEET_ROSTER_LOCK_TIMEOUT_SEC" \
+  "$POOL_LOCK_TIMEOUT_SEC" "$POOL_KILL_GRACE_SEC" \
+  "$POOL_GC_KEEP_LAST" "$POOL_GC_KEEP_HOURS" "$POOL_GC_MAX_TOTAL_MB" "$POOL_GC_FREE_WARN_PCT" \
+  "$POOL_REPORT_MAX_LAST_LINES"; do
   if [[ ! "$n" =~ ^[0-9]+$ ]]; then
     echo "numeric option expected, got: $n" >&2
     exit 7
@@ -141,7 +166,8 @@ for n in \
 done
 if [[ ! "$CHAT_POOL_CHECK" =~ ^[01]$ ]] || [[ ! "$CHAT_POOL_PROBE" =~ ^[01]$ ]] || [[ ! "$CHAT_POOL_PROBE_NO_SEND" =~ ^[01]$ ]] \
   || [[ ! "$FLEET_MONITOR_ENABLED" =~ ^[01]$ ]] || [[ ! "$FLEET_MONITOR_STDOUT" =~ ^[01]$ ]] \
-  || [[ ! "$FLEET_WATCHDOG_ENABLED" =~ ^[01]$ ]] || [[ ! "$FLEET_GATE_ENABLED" =~ ^[01]$ ]]; then
+  || [[ ! "$FLEET_WATCHDOG_ENABLED" =~ ^[01]$ ]] || [[ ! "$FLEET_GATE_ENABLED" =~ ^[01]$ ]] \
+  || [[ ! "$POOL_WRITE_REPORT" =~ ^[01]$ ]] || [[ ! "$POOL_REPORT_INCLUDE_LOGS" =~ ^[01]$ ]]; then
   echo "switches must be 0 or 1" >&2
   exit 7
 fi
@@ -151,6 +177,14 @@ if (( CONCURRENCY < 1 )); then
 fi
 if (( FLEET_MONITOR_ENABLED == 1 )) && [[ ! -x "$FLEET_MONITOR_SCRIPT" ]]; then
   echo "fleet monitor script not executable: $FLEET_MONITOR_SCRIPT" >&2
+  exit 18
+fi
+if [[ "$POOL_GC" != "0" ]] && [[ ! -x "$POOL_GC_SCRIPT" ]]; then
+  echo "pool gc script not executable: $POOL_GC_SCRIPT" >&2
+  exit 18
+fi
+if [[ "$POOL_WRITE_REPORT" == "1" ]] && [[ ! -x "$POOL_REPORT_SCRIPT" ]]; then
+  echo "pool report script not executable: $POOL_REPORT_SCRIPT" >&2
   exit 18
 fi
 if (( FLEET_MONITOR_POLL_SEC < 1 )); then
@@ -168,6 +202,10 @@ fi
 if (( POOL_KILL_GRACE_SEC < 1 )); then
   echo "POOL_KILL_GRACE_SEC must be >= 1" >&2
   exit 22
+fi
+if (( POOL_GC_FREE_WARN_PCT > 100 )); then
+  echo "POOL_GC_FREE_WARN_PCT must be <= 100" >&2
+  exit 23
 fi
 
 mapfile -t TASKS < <(sed -e 's/\r$//' "$TASKS_FILE" | sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d')
@@ -239,24 +277,32 @@ if (( ${#CHAT_POOL[@]} > 0 )) && [[ "$CHAT_POOL_PROBE" == "1" ]]; then
   echo "$probe_out"
 fi
 
+if [[ "$POOL_RUNS_ROOT" != /* ]]; then
+  POOL_RUNS_ROOT="$ROOT_DIR/$POOL_RUNS_ROOT"
+fi
+
 if [[ -z "$LOG_DIR" ]]; then
   POOL_RUN_ID="pool-$(date +%Y%m%d-%H%M%S)-$RANDOM"
-  LOG_DIR="$ROOT_DIR/state/runs/$POOL_RUN_ID"
+  mkdir -p "$POOL_RUNS_ROOT"
+  LOG_DIR="$POOL_RUNS_ROOT/$POOL_RUN_ID"
 else
   POOL_RUN_ID="$(basename "$LOG_DIR")"
 fi
 
 POOL_RUN_DIR="$LOG_DIR"
+POOL_ACTIVE_MARKER="$POOL_RUN_DIR/.pool.active"
 POOL_AGENT_DIR="$POOL_RUN_DIR/agents"
 POOL_TASK_DIR="$POOL_RUN_DIR/tasks"
 POOL_RESULT_DIR="$POOL_RUN_DIR/results"
 mkdir -p "$POOL_AGENT_DIR" "$POOL_TASK_DIR" "$POOL_RESULT_DIR"
+touch "$POOL_ACTIVE_MARKER"
 
 SUMMARY_JSONL="$POOL_RUN_DIR/summary.jsonl"
 SUMMARY_CSV="$POOL_RUN_DIR/summary.csv"
 FINAL_SUMMARY_JSONL="$POOL_RUN_DIR/summary.final.jsonl"
 FINAL_SUMMARY_CSV="$POOL_RUN_DIR/summary.final.csv"
 FLEET_REGISTRY_FILE="$POOL_RUN_DIR/fleet_registry.jsonl"
+FLEET_ROSTER_JSONL="$POOL_RUN_DIR/fleet_roster.jsonl"
 FLEET_MONITOR_PID_FILE="$POOL_RUN_DIR/fleet.monitor.pid"
 FLEET_MONITOR_LOG="$POOL_RUN_DIR/fleet.monitor.log"
 FLEET_SUMMARY_JSON="$POOL_RUN_DIR/fleet.summary.json"
@@ -266,9 +312,11 @@ FLEET_EVENTS_JSONL="$POOL_RUN_DIR/fleet.events.jsonl"
 FLEET_EVENTS_LOCK_FILE="$POOL_RUN_DIR/fleet.events.lock"
 FLEET_GATE_LOG="$POOL_RUN_DIR/fleet.gate.log"
 POOL_WATCHDOG_LOG="$POOL_RUN_DIR/pool.watchdog.log"
+POOL_GC_LOG="$POOL_RUN_DIR/pool.gc.log"
 printf 'agent,attempt,spawn_rc,child_run_id,status,exit_code,browser_used,duration_sec,chat_url,assigned_chat_url,observed_chat_url_before,observed_chat_url_after,chat_match,fail_kind,fail_reason,task_hash,task_nonce,result_json,stdout_file,task_file\n' >"$SUMMARY_CSV"
 : >"$SUMMARY_JSONL"
 : >"$FLEET_REGISTRY_FILE"
+: >"$FLEET_ROSTER_JSONL"
 : >"$POOL_WATCHDOG_LOG"
 
 declare -A TASK_FILE_BY_AGENT=()
@@ -318,6 +366,14 @@ FLEET_GATE_REASON="disabled"
 FLEET_GATE_RC=0
 FLEET_GATE_COUNTS_JSON="{}"
 FLEET_GATE_DISK_STATUS="unknown"
+FLEET_GATE_EXPECTED_TOTAL=0
+FLEET_GATE_OBSERVED_TOTAL=0
+FLEET_GATE_COMPLETED_TOTAL=0
+FLEET_GATE_MISSING_ARTIFACTS_TOTAL=0
+FLEET_CHAT_OK_TOTAL=0
+FLEET_CHAT_MISMATCH_TOTAL=0
+FLEET_CHAT_UNKNOWN_TOTAL=0
+POOL_STRICT_CHAT_PROOF_EFFECTIVE=0
 POOL_LOCK_FD=""
 POOL_ABORT=0
 POOL_ABORT_SIGNAL=""
@@ -325,10 +381,80 @@ POOL_ABORT_RC=0
 POOL_ABORT_HANDLING=0
 POOL_ABORT_KILLED=0
 POOL_ABORT_REMAINING=0
+POOL_GC_APPLIED=0
+POOL_GC_REASON="disabled"
+POOL_GC_EXIT_CODE=0
 
 watchdog_log() {
   local msg="$1"
   printf '[pool-watchdog] ts=%s run_id=%s %s\n' "$(date -Iseconds)" "$POOL_RUN_ID" "$msg" >>"$POOL_WATCHDOG_LOG"
+}
+
+remove_pool_active_marker() {
+  rm -f "$POOL_ACTIVE_MARKER" >/dev/null 2>&1 || true
+}
+
+disk_free_pct_at_path() {
+  local path="$1"
+  local used=""
+  used="$(df -Pk "$path" 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5}' | head -n 1)"
+  if [[ ! "$used" =~ ^[0-9]+$ ]]; then
+    printf '0'
+    return 0
+  fi
+  local free=$((100 - used))
+  if (( free < 0 )); then
+    free=0
+  fi
+  printf '%s' "$free"
+}
+
+run_pool_gc_if_needed() {
+  POOL_GC_APPLIED=0
+  POOL_GC_REASON="disabled"
+  POOL_GC_EXIT_CODE=0
+  : >"$POOL_GC_LOG"
+
+  local should_run=0
+  if [[ "$POOL_GC" == "1" ]]; then
+    should_run=1
+    POOL_GC_REASON="forced"
+  elif [[ "$POOL_GC" == "auto" ]]; then
+    local free_pct
+    free_pct="$(disk_free_pct_at_path "$POOL_RUNS_ROOT")"
+    if [[ "$free_pct" =~ ^[0-9]+$ ]] && (( free_pct <= POOL_GC_FREE_WARN_PCT )); then
+      should_run=1
+      POOL_GC_REASON="auto_low_disk"
+    else
+      POOL_GC_REASON="auto_skip"
+      watchdog_log "event=pool_gc_skip mode=auto free_pct=${free_pct} warn_pct=${POOL_GC_FREE_WARN_PCT}"
+      return 0
+    fi
+  else
+    POOL_GC_REASON="disabled"
+    return 0
+  fi
+
+  if (( should_run == 0 )); then
+    return 0
+  fi
+
+  watchdog_log "event=pool_gc_start reason=${POOL_GC_REASON} root=${POOL_RUNS_ROOT}"
+  set +e
+  "$POOL_GC_SCRIPT" \
+    --root "$POOL_RUNS_ROOT" \
+    --keep-last "$POOL_GC_KEEP_LAST" \
+    --keep-hours "$POOL_GC_KEEP_HOURS" \
+    --max-total-mb "$POOL_GC_MAX_TOTAL_MB" >"$POOL_GC_LOG" 2>&1
+  POOL_GC_EXIT_CODE=$?
+  set -e
+  if [[ "$POOL_GC_EXIT_CODE" == "0" ]]; then
+    POOL_GC_APPLIED=1
+    watchdog_log "event=pool_gc_done reason=${POOL_GC_REASON} log=${POOL_GC_LOG}"
+  else
+    POOL_GC_APPLIED=0
+    watchdog_log "event=pool_gc_failed reason=${POOL_GC_REASON} rc=${POOL_GC_EXIT_CODE} log=${POOL_GC_LOG}"
+  fi
 }
 
 read_pid_file() {
@@ -483,7 +609,7 @@ on_pool_signal() {
 
 trap 'on_pool_signal INT' INT
 trap 'on_pool_signal TERM' TERM
-trap 'release_pool_lock' EXIT
+trap 'remove_pool_active_marker; release_pool_lock' EXIT
 
 start_fleet_monitor() {
   local reason="${1:-manual}"
@@ -509,6 +635,7 @@ start_fleet_monitor() {
     --summary-json "$FLEET_SUMMARY_JSON"
     --summary-csv "$FLEET_SUMMARY_CSV"
     --registry-file "$FLEET_REGISTRY_FILE"
+    --roster-jsonl "$FLEET_ROSTER_JSONL"
   )
   if [[ "$FLEET_MONITOR_STDOUT" == "1" ]]; then
     cmd+=(--stdout)
@@ -585,6 +712,24 @@ run_fleet_gate() {
   FLEET_GATE_RC=0
   FLEET_GATE_COUNTS_JSON="{}"
   FLEET_GATE_DISK_STATUS="unknown"
+  FLEET_GATE_EXPECTED_TOTAL="$TOTAL_AGENTS"
+  FLEET_GATE_OBSERVED_TOTAL=0
+  FLEET_GATE_COMPLETED_TOTAL=0
+  FLEET_GATE_MISSING_ARTIFACTS_TOTAL=0
+  FLEET_CHAT_OK_TOTAL=0
+  FLEET_CHAT_MISMATCH_TOTAL=0
+  FLEET_CHAT_UNKNOWN_TOTAL=0
+  if [[ "$POOL_STRICT_CHAT_PROOF" == "1" ]]; then
+    POOL_STRICT_CHAT_PROOF_EFFECTIVE=1
+  elif [[ "$POOL_STRICT_CHAT_PROOF" == "0" ]]; then
+    POOL_STRICT_CHAT_PROOF_EFFECTIVE=0
+  else
+    if [[ "$MODE" == "live" ]] || [[ -n "$CHAT_POOL_FILE" ]]; then
+      POOL_STRICT_CHAT_PROOF_EFFECTIVE=1
+    else
+      POOL_STRICT_CHAT_PROOF_EFFECTIVE=0
+    fi
+  fi
 
   if [[ "$FLEET_GATE_ENABLED" != "1" ]]; then
     stop_fleet_monitor_if_running
@@ -609,7 +754,8 @@ run_fleet_gate() {
     --monitor-log "$FLEET_MONITOR_LOG" \
     --summary-json "$FLEET_SUMMARY_JSON" \
     --summary-csv "$FLEET_SUMMARY_CSV" \
-    --registry-file "$FLEET_REGISTRY_FILE" >"$FLEET_GATE_LOG" 2>&1
+    --registry-file "$FLEET_REGISTRY_FILE" \
+    --roster-jsonl "$FLEET_ROSTER_JSONL" >"$FLEET_GATE_LOG" 2>&1
   FLEET_GATE_RC=$?
   set -e
 
@@ -624,29 +770,80 @@ out = {
     "total": int(obj.get("total", 0)),
     "done_ok": int(obj.get("done_ok", 0)),
     "done_fail": int(obj.get("done_fail", 0)),
+    "orphaned": int(obj.get("orphaned", 0)),
     "running": int(obj.get("running", 0)),
     "stuck": int(obj.get("stuck", 0)),
-    "orphaned": int(obj.get("orphaned", 0)),
     "unknown": int(obj.get("unknown", 0)),
     "disk_status": str(obj.get("disk_status", "unknown") or "unknown"),
     "disk_free_pct": obj.get("disk_free_pct"),
     "disk_avail_kb": obj.get("disk_avail_kb"),
+    "observed_total": int((obj.get("discovery_sources") or {}).get("merged", 0)),
+    "merged_total": int((obj.get("discovery_sources") or {}).get("merged", 0)),
+    "completed_total": int(obj.get("done_ok", 0)) + int(obj.get("done_fail", 0)) + int(obj.get("orphaned", 0)),
+    "missing_artifacts_total": int(obj.get("missing_artifacts_total", 0)),
+    "chat_ok_total": int(obj.get("chat_ok_total", 0)),
+    "chat_mismatch_total": int(obj.get("chat_mismatch_total", 0)),
+    "chat_unknown_total": int(obj.get("chat_unknown_total", 0)),
 }
 print(json.dumps(out, ensure_ascii=False, sort_keys=True))
 print(out["disk_status"])
+print(out["observed_total"])
+print(out["completed_total"])
+print(out["missing_artifacts_total"])
+print(out["chat_ok_total"])
+print(out["chat_mismatch_total"])
+print(out["chat_unknown_total"])
 PY
 ); then
       FLEET_GATE_COUNTS_JSON="${gate_meta[0]:-{}}"
       FLEET_GATE_DISK_STATUS="${gate_meta[1]:-unknown}"
+      FLEET_GATE_OBSERVED_TOTAL="${gate_meta[2]:-0}"
+      FLEET_GATE_COMPLETED_TOTAL="${gate_meta[3]:-0}"
+      FLEET_GATE_MISSING_ARTIFACTS_TOTAL="${gate_meta[4]:-0}"
+      FLEET_CHAT_OK_TOTAL="${gate_meta[5]:-0}"
+      FLEET_CHAT_MISMATCH_TOTAL="${gate_meta[6]:-0}"
+      FLEET_CHAT_UNKNOWN_TOTAL="${gate_meta[7]:-0}"
       if [[ -z "$FLEET_GATE_COUNTS_JSON" ]]; then
         FLEET_GATE_COUNTS_JSON="{}"
       fi
     else
       FLEET_GATE_COUNTS_JSON="{}"
       FLEET_GATE_DISK_STATUS="unknown"
+      FLEET_GATE_OBSERVED_TOTAL=0
+      FLEET_GATE_COMPLETED_TOTAL=0
+      FLEET_GATE_MISSING_ARTIFACTS_TOTAL=0
+      FLEET_CHAT_OK_TOTAL=0
+      FLEET_CHAT_MISMATCH_TOTAL=0
+      FLEET_CHAT_UNKNOWN_TOTAL=0
     fi
   fi
 
+  if [[ "$FLEET_GATE_MISSING_ARTIFACTS_TOTAL" =~ ^[0-9]+$ ]] && (( FLEET_GATE_MISSING_ARTIFACTS_TOTAL > 0 )); then
+    FLEET_GATE_STATUS="FAIL"
+    FLEET_GATE_REASON="missing_artifacts"
+    FLEET_GATE_RC=126
+    return 1
+  fi
+  if [[ "$FLEET_GATE_OBSERVED_TOTAL" =~ ^[0-9]+$ ]] && (( FLEET_GATE_OBSERVED_TOTAL < FLEET_GATE_EXPECTED_TOTAL )); then
+    FLEET_GATE_STATUS="FAIL"
+    FLEET_GATE_REASON="fleet_incomplete"
+    FLEET_GATE_RC=127
+    return 1
+  fi
+  if [[ "$POOL_STRICT_CHAT_PROOF_EFFECTIVE" == "1" ]]; then
+    if [[ "$FLEET_CHAT_MISMATCH_TOTAL" =~ ^[0-9]+$ ]] && (( FLEET_CHAT_MISMATCH_TOTAL > 0 )); then
+      FLEET_GATE_STATUS="FAIL"
+      FLEET_GATE_REASON="chat_mismatch"
+      FLEET_GATE_RC=123
+      return 1
+    fi
+    if [[ "$FLEET_CHAT_UNKNOWN_TOTAL" =~ ^[0-9]+$ ]] && (( FLEET_CHAT_UNKNOWN_TOTAL > 0 )); then
+      FLEET_GATE_STATUS="FAIL"
+      FLEET_GATE_REASON="chat_proof_unknown"
+      FLEET_GATE_RC=122
+      return 1
+    fi
+  fi
   if [[ "$FLEET_GATE_DISK_STATUS" == "fail" ]]; then
     FLEET_GATE_STATUS="FAIL"
     FLEET_GATE_REASON="disk_low"
@@ -668,6 +865,84 @@ PY
     *) FLEET_GATE_REASON="monitor_rc_${FLEET_GATE_RC}" ;;
   esac
   return 1
+}
+
+append_fleet_roster_row() {
+  local agent_id="$1"
+  local attempt="$2"
+  local child_run_id="$3"
+  local child_run_dir="$4"
+  local child_result_json="$5"
+  local out_file="$6"
+  local assigned_chat_url="$7"
+  if [[ -z "$child_run_id" ]] && [[ -z "$child_run_dir" ]]; then
+    return 0
+  fi
+
+  local pid_file=""
+  local status_file=""
+  local log_file=""
+  pid_file="$(sed -n 's/^PID_FILE=//p' "$out_file" | tail -n 1 || true)"
+  status_file="$(sed -n 's/^STATUS_FILE=//p' "$out_file" | tail -n 1 || true)"
+  log_file="$(sed -n 's/^LOG_FILE=//p' "$out_file" | tail -n 1 || true)"
+
+  local payload=""
+  payload="$(python3 - \
+    "$agent_id" "$attempt" "$child_run_id" "$child_run_dir" "$child_result_json" \
+    "$pid_file" "$status_file" "$log_file" "$assigned_chat_url" "$MODE" "$LAUNCHER" <<'PY'
+import json
+import sys
+import time
+
+(
+    agent_id,
+    attempt,
+    run_id,
+    run_dir,
+    result_json,
+    pid_file,
+    status_file,
+    log_file,
+    assigned_chat_url,
+    pool_mode,
+    launcher,
+) = sys.argv[1:12]
+
+obj = {
+    "ts_ms": int(time.time() * 1000),
+    "agent_id": int(agent_id) if str(agent_id).isdigit() else agent_id,
+    "attempt": int(attempt) if str(attempt).isdigit() else None,
+    "run_id": run_id or "",
+    "run_dir": run_dir or "",
+    "result_json": result_json or "",
+    "pid_file": pid_file or "",
+    "status_file": status_file or "",
+    "log_file": log_file or "",
+    "assigned_chat_url": assigned_chat_url or "",
+    "pool_mode": pool_mode or "",
+    "launcher": launcher or "",
+}
+print(json.dumps(obj, ensure_ascii=False))
+PY
+)"
+  if [[ -z "$payload" ]]; then
+    return 0
+  fi
+
+  local roster_lock="${FLEET_ROSTER_JSONL}.lock"
+  local roster_fd=""
+  exec {roster_fd}>>"$roster_lock" || true
+  if [[ -n "$roster_fd" ]]; then
+    if ! flock -w "$FLEET_ROSTER_LOCK_TIMEOUT_SEC" "$roster_fd" >/dev/null 2>&1; then
+      echo "W_FLEET_ROSTER_LOCK_TIMEOUT file=${FLEET_ROSTER_JSONL} timeout_sec=${FLEET_ROSTER_LOCK_TIMEOUT_SEC} run_id=${child_run_id}" >&2
+      exec {roster_fd}>&- || true
+      return 0
+    fi
+  fi
+  printf '%s\n' "$payload" >>"$FLEET_ROSTER_JSONL"
+  if [[ -n "$roster_fd" ]]; then
+    exec {roster_fd}>&- || true
+  fi
 }
 
 run_one_agent_attempt() {
@@ -720,9 +995,12 @@ append_summary_for_attempt() {
   local task_file="${TASK_FILE_BY_AGENT[$agent_id]}"
 
   local child_run_id=""
+  local child_run_dir=""
   local child_result_json=""
   child_run_id="$(sed -n 's/^CHILD_RUN_ID=//p' "$out_file" | tail -n 1 || true)"
+  child_run_dir="$(sed -n 's/^CHILD_RUN_DIR=//p' "$out_file" | tail -n 1 || true)"
   child_result_json="$(sed -n 's/^CHILD_RESULT_JSON=//p' "$out_file" | tail -n 1 || true)"
+  append_fleet_roster_row "$agent_id" "$attempt" "$child_run_id" "$child_run_dir" "$child_result_json" "$out_file" "$chat_url_assigned"
 
   local status=""
   local exit_code=""
@@ -882,6 +1160,7 @@ run_batch() {
     ensure_fleet_monitor_alive "attempt_${attempt}_before_launch_${agent_id}"
     if [[ "$stop_launch" == "1" ]]; then
       FINAL_RC["$agent_id"]="${POOL_ABORT_RC:-99}"
+      mkdir -p "$POOL_AGENT_DIR/agent_${agent_id}"
       out_file="$POOL_AGENT_DIR/agent_${agent_id}/attempt_${attempt}.stdout"
       : >"$out_file"
       FINAL_OUT["$agent_id"]="$out_file"
@@ -951,6 +1230,7 @@ for ((i=1; i<=TOTAL_AGENTS; i++)); do
 done
 
 acquire_pool_lock
+run_pool_gc_if_needed
 
 if [[ "$FLEET_MONITOR_ENABLED" == "1" ]]; then
   if ! start_fleet_monitor "startup"; then
@@ -1113,6 +1393,12 @@ fi
 
 echo "POOL_RUN_ID=$POOL_RUN_ID"
 echo "POOL_RUN_DIR=$POOL_RUN_DIR"
+echo "POOL_RUNS_ROOT=$POOL_RUNS_ROOT"
+echo "POOL_GC_ROOT=$POOL_RUNS_ROOT"
+echo "POOL_GC_APPLIED=$POOL_GC_APPLIED"
+echo "POOL_GC_REASON=$POOL_GC_REASON"
+echo "POOL_GC_RC=$POOL_GC_EXIT_CODE"
+echo "POOL_GC_LOG=$POOL_GC_LOG"
 echo "POOL_MODE=$MODE"
 echo "POOL_LOCK_FILE=$POOL_LOCK_FILE"
 echo "POOL_TOTAL=$TOTAL_AGENTS"
@@ -1124,6 +1410,7 @@ echo "POOL_SUMMARY_CSV=$SUMMARY_CSV"
 echo "POOL_FINAL_SUMMARY_JSONL=$FINAL_SUMMARY_JSONL"
 echo "POOL_FINAL_SUMMARY_CSV=$FINAL_SUMMARY_CSV"
 echo "POOL_FLEET_REGISTRY=$FLEET_REGISTRY_FILE"
+echo "POOL_FLEET_ROSTER_JSONL=$FLEET_ROSTER_JSONL"
 echo "POOL_FLEET_MONITOR_LOG=$FLEET_MONITOR_LOG"
 echo "POOL_FLEET_MONITOR_PID_FILE=$FLEET_MONITOR_PID_FILE"
 echo "POOL_FLEET_SUMMARY_JSON=$FLEET_SUMMARY_JSON"
@@ -1135,6 +1422,14 @@ echo "POOL_FLEET_GATE_STATUS=$FLEET_GATE_STATUS"
 echo "POOL_FLEET_GATE_REASON=$FLEET_GATE_REASON"
 echo "POOL_FLEET_GATE_RC=$FLEET_GATE_RC"
 echo "POOL_FLEET_GATE_DISK_STATUS=$FLEET_GATE_DISK_STATUS"
+echo "POOL_FLEET_GATE_EXPECTED_TOTAL=$FLEET_GATE_EXPECTED_TOTAL"
+echo "POOL_FLEET_GATE_OBSERVED_TOTAL=$FLEET_GATE_OBSERVED_TOTAL"
+echo "POOL_FLEET_GATE_COMPLETED_TOTAL=$FLEET_GATE_COMPLETED_TOTAL"
+echo "POOL_FLEET_GATE_MISSING_ARTIFACTS_TOTAL=$FLEET_GATE_MISSING_ARTIFACTS_TOTAL"
+echo "POOL_CHAT_OK_TOTAL=$FLEET_CHAT_OK_TOTAL"
+echo "POOL_CHAT_MISMATCH_TOTAL=$FLEET_CHAT_MISMATCH_TOTAL"
+echo "POOL_CHAT_UNKNOWN_TOTAL=$FLEET_CHAT_UNKNOWN_TOTAL"
+echo "POOL_STRICT_CHAT_PROOF=$POOL_STRICT_CHAT_PROOF_EFFECTIVE"
 echo "POOL_FLEET_GATE_COUNTS_JSON=$FLEET_GATE_COUNTS_JSON"
 echo "POOL_FLEET_WATCHDOG_RESTARTS=$FLEET_WATCHDOG_RESTARTS"
 echo "POOL_WATCHDOG_LOG=$POOL_WATCHDOG_LOG"

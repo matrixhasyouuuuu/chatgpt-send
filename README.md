@@ -266,7 +266,12 @@ Monitor writes atomic snapshots (`fleet.summary.json` + `fleet.summary.csv`) wit
 
 `scripts/agent_pool_run.sh` can also run this monitor automatically (with watchdog restart + strict end-of-run gate). The pool output includes:
 - `POOL_FLEET_MONITOR_LOG`, `POOL_FLEET_SUMMARY_JSON`, `POOL_FLEET_EVENTS_JSONL`, `POOL_FLEET_HEARTBEAT_FILE`
-- `POOL_FLEET_GATE_STATUS`, `POOL_FLEET_GATE_REASON`, `POOL_FLEET_WATCHDOG_RESTARTS`
+- `POOL_FLEET_ROSTER_JSONL` (orchestrator append-only roster; used with registry as second source)
+- `POOL_FLEET_GATE_STATUS`, `POOL_FLEET_GATE_REASON`, `POOL_FLEET_GATE_EXPECTED_TOTAL`, `POOL_FLEET_GATE_OBSERVED_TOTAL`, `POOL_FLEET_GATE_MISSING_ARTIFACTS_TOTAL`, `POOL_FLEET_WATCHDOG_RESTARTS`
+- `POOL_CHAT_OK_TOTAL`, `POOL_CHAT_MISMATCH_TOTAL`, `POOL_CHAT_UNKNOWN_TOTAL`, `POOL_STRICT_CHAT_PROOF`
+- `POOL_GC_ROOT`, `POOL_GC_APPLIED`, `POOL_GC_REASON`, `POOL_GC_LOG` (retention/GC pre-run status)
+- `POOL_STATUS=INTERRUPTED` + `POOL_ABORT_SIGNAL` on SIGINT/SIGTERM cleanup
+- `E_POOL_ALREADY_RUNNING` protection via single-flight pool lock
 
 </details>
 
