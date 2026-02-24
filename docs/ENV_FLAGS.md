@@ -23,6 +23,7 @@
 - `CHATGPT_SEND_CHECKPOINT_LOCK_FILE` (default: `$ROOT/state/checkpoint.lock`)
 - `CHATGPT_SEND_ENFORCE_ITERATION_PREFIX` (default: `1`)
 - `CHATGPT_SEND_STRICT_UI_CONTRACT` (default: `0`, при `1` падение на `E_UI_CONTRACT_FAIL`)
+- `CHATGPT_SEND_SKIP_STATE_WRITE` (default: `0`, read-only mode for probe/check commands)
 - `CHATGPT_SEND_CAPTURE_EVIDENCE` (default: `1`, автоснимок evidence на фатальных E_* таймаутах/фейлах)
 - `CHATGPT_SEND_SANITIZE_LOGS` (default: `1`, редактирует чувствительные токены в evidence/log snapshots)
 - `state/work_chat_url.txt` — основной источник истины для рабочего `/c/...` чата
@@ -37,12 +38,16 @@
 - `CHATGPT_SEND_MOCK_LAST_PROMPT_FILE` (default: `$ROOT/state/mock_last_prompt.txt`)
 - `CHATGPT_SEND_MOCK_SENT_FILE` (default: `$ROOT/state/mock_sent_count.txt`)
 - `CHATGPT_SEND_MOCK_PRECHECK_STATUS` (default: empty; если задан, принудительный статус precheck)
+- `CHATGPT_SEND_MOCK_PROBE_FAIL_URLS` (default: empty; список URL для принудительного fail в `--probe-chat-url`)
 - `CHATGPT_SEND_MOCK_ERROR_CODE` (default: empty; принудительный не-нулевой код для отказа mock операций)
 
 ## Wait / retry
 - `CHATGPT_SEND_AUTO_WAIT_ON_GENERATION` (default: `1`)
 - `CHATGPT_SEND_AUTO_WAIT_MAX_SEC` (default: `60`)
 - `CHATGPT_SEND_AUTO_WAIT_POLL_MS` (default: `500`)
+- `CHATGPT_SEND_BUSY_POLICY` (default: `auto_stop`, варианты: `auto_stop|wait|fail`)
+- `CHATGPT_SEND_BUSY_TIMEOUT_SEC` (default: `20`, таймаут ожидания/stop)
+- `CHATGPT_SEND_BUSY_STOP_RETRIES` (default: `2`, попытки авто-нажатия Stop)
 - `CHATGPT_SEND_REPLY_POLLING` (default: `1`)
 - `CHATGPT_SEND_REPLY_POLL_MS` (default: `700`)
 - `CHATGPT_SEND_REPLY_MAX_SEC` (default: `90`)
@@ -56,6 +61,12 @@
 - `CHATGPT_SEND_ASSISTANT_STABILITY_SEC` (default: `0.9`, guard от раннего capture обрезанного ответа)
 - `CHATGPT_SEND_ASSISTANT_PROBE_STABILITY_SEC` (default: `0.4`, стабильность для `--reply-ready-probe`)
 - `CHATGPT_SEND_ASSISTANT_STABILITY_POLL_SEC` (default: `0.2`, шаг проверки стабильности)
+- `CHATGPT_SEND_CONFIRM_ONLY_RETRY_ATTEMPTS` (default: `2`, read-only confirm-loop attempts после `status4_timeout` перед `exit 81`)
+- `CHATGPT_SEND_CONFIRM_ONLY_RETRY_MS` (default: `500`, пауза между read-only confirm-loop попытками; min `100`)
+
+## UX facade / planner (`status`, `explain`, `step`)
+- `CHATGPT_SEND_PREFLIGHT_TTL_SEC` (default: `8`, TTL для planner preflight freshness gating перед `DELEGATE_SEND_PIPELINE`)
+- `state/status/preflight_token.v1.json` — read-only preflight token (пишется `step read`, используется planner-ом для freshness)
 
 ## Recovery
 - `CHATGPT_SEND_CDP_RECOVER_BUDGET` (default: `1`)
@@ -117,6 +128,31 @@
 - `POOL_LOCK_TIMEOUT_SEC` (default: `0`, `0` = fail-fast if lock busy)
 - `POOL_KILL_GRACE_SEC` (default: `5`, grace period before SIGKILL on abort cleanup)
 
+## Agent pool live follower
+- `POOL_FOLLOW` (default: `auto`, варианты: `0|1|auto`; feature toggle follow, `auto` включает follow для multi-agent при включённом monitor)
+- `POOL_FOLLOW_MODE` (default: `auto`, варианты: `auto|off|log|cli|both`)
+  - `auto`: `both` при TTY, иначе `log`
+  - `log`: follow пишет только в log-файл
+  - `cli`: follow печатает `PROGRESS ...` в stderr pool-процесса
+  - `both`: одновременно в stderr + log через `tee`
+  - `off`: отключает follow независимо от `POOL_FOLLOW`
+- `POOL_FOLLOW_TICK_MS` (default: `1000`, шаг polling follower-а)
+- `POOL_FOLLOW_NO_ANSI` (default: `0`, `1` отключает цвет в `fleet_follow.sh`)
+- `POOL_FOLLOW_PID_FILE` (default: `<pool-run-dir>/fleet.follow.pid`)
+- `POOL_FOLLOW_LOG` (default: `<pool-run-dir>/fleet.follow.log`)
+- `POOL_FLEET_FOLLOW_SCRIPT` (default: `$ROOT/scripts/fleet_follow.sh`)
+
+## Agent pool early gate (mid-run abort/retry)
+- `POOL_EARLY_GATE` (default: `auto`, варианты: `0|1|auto`; `auto` включает gate для live или `concurrency>=5`)
+- `POOL_EARLY_GATE_TICK_SEC` (default: `5`)
+- `POOL_EARLY_GATE_STUCK_FAIL` (default: `1`, fail-fast при any stuck/orphaned)
+- `POOL_EARLY_GATE_MAX_STUCK` (default: `0`, порог confirmed stuck)
+- `POOL_EARLY_GATE_MAX_ORPHANED` (default: `0`, порог confirmed orphaned)
+- `POOL_EARLY_GATE_ACTION` (default: `abort_and_retry`, варианты: `abort|abort_and_retry|abort_no_retry`)
+- `POOL_EARLY_GATE_RETRYABLE_CLASSES` (default: `ORPHANED,STUCK`, CSV для selective retry)
+- `POOL_EARLY_GATE_CONFIRM_TICKS` (default: `2`, сколько подряд trigger-ticks нужно для срабатывания early-abort)
+- `POOL_EARLY_GATE_CONFIRM_MODE` (default: `consecutive`, текущий режим подтверждения trigger-тиков)
+
 ## Agent pool retention / GC
 - `POOL_RUNS_ROOT` (default: `$ROOT/state/runs`, root for pool run directories)
 - `POOL_GC` (default: `auto`, варианты: `0|1|auto`)
@@ -138,6 +174,7 @@
 ## Live preflight / demo
 - `LIVE_CONCURRENCY` (default: `2`, expected live parallel size)
 - `LIVE_CHAT_POOL_FILE` (optional: chat pool file for scaled live runs)
+- `LIVE_CHAT_POOL_PRECHECK` (default: `auto`, варианты: `0|1|auto`; `auto` включает per-chat precheck для scale `LIVE_CONCURRENCY>=5`)
 - `LIVE_DEMO_TASKS_FILE` (default: `$ROOT/scripts/demo_tasks_10.txt`)
 - `LIVE_ITERATIONS` (default: `1`, per-agent iterations in live pool demo mode)
 - `LIVE_PROJECT_PATH` (default: repo root, project passed into `agent_pool_run.sh`)

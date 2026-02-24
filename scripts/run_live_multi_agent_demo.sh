@@ -50,6 +50,8 @@ fi
 
 export RUN_LIVE_CDP_E2E=1
 LIVE_CHAT_URL="$(sed -n 's/^LIVE_CHAT_URL=//p' "$preflight_out" | head -n 1)"
+OK_CHAT_POOL_PRECHECK="$(sed -n 's/^OK_CHAT_POOL_PRECHECK=//p' "$preflight_out" | head -n 1)"
+CHAT_POOL_PRECHECK_SUMMARY_JSON="$(sed -n 's/^CHAT_POOL_PRECHECK_SUMMARY_JSON=//p' "$preflight_out" | head -n 1)"
 if [[ -z "$LIVE_CHAT_URL" || "$LIVE_CHAT_URL" == "none" ]]; then
   echo "DEMO_STATUS=PRECHECK_FAIL"
   echo "DEMO_PRECHECK_EXIT=14"
@@ -62,10 +64,22 @@ echo "LIVE_INIT_SPECIALIST_CHAT=$LIVE_INIT_SPECIALIST_CHAT"
 
 if [[ -n "$LIVE_CHAT_POOL_FILE" ]]; then
   echo "== LIVE POOL =="
+  export POOL_FOLLOW_MODE="${POOL_FOLLOW_MODE:-cli}"
+  export POOL_FOLLOW_NO_ANSI="${POOL_FOLLOW_NO_ANSI:-1}"
+  export POOL_FOLLOW_TICK_MS="${POOL_FOLLOW_TICK_MS:-500}"
   if [[ ! "$LIVE_CONCURRENCY" =~ ^[0-9]+$ ]] || (( LIVE_CONCURRENCY < 1 )); then
     echo "DEMO_STATUS=POOL_FAIL"
     echo "DEMO_POOL_REASON=invalid_live_concurrency"
     exit 2
+  fi
+  if (( LIVE_CONCURRENCY >= 5 )) && [[ "${OK_CHAT_POOL_PRECHECK:-0}" != "1" ]]; then
+    echo "DEMO_STATUS=PRECHECK_FAIL"
+    echo "DEMO_PRECHECK_EXIT=16"
+    echo "DEMO_PRECHECK_REASON=chat_pool_precheck_not_ok"
+    if [[ -n "$CHAT_POOL_PRECHECK_SUMMARY_JSON" && "$CHAT_POOL_PRECHECK_SUMMARY_JSON" != "none" ]]; then
+      echo "DEMO_CHAT_POOL_PRECHECK_SUMMARY=$CHAT_POOL_PRECHECK_SUMMARY_JSON"
+    fi
+    exit 16
   fi
   if [[ ! "$LIVE_ITERATIONS" =~ ^[0-9]+$ ]] || (( LIVE_ITERATIONS < 1 )); then
     echo "DEMO_STATUS=POOL_FAIL"
@@ -107,10 +121,9 @@ if [[ -n "$LIVE_CHAT_POOL_FILE" ]]; then
     --browser-policy required \
     --open-browser \
     --init-specialist-chat \
-    --skip-git-repo-check >"$pool_out" 2>&1
-  pool_rc=$?
+    --skip-git-repo-check 2>&1 | tee "$pool_out"
+  pool_rc="${PIPESTATUS[0]}"
   set -e
-  cat "$pool_out"
   demo_pool_report_md="$(sed -n 's/^POOL_REPORT_MD=//p' "$pool_out" | tail -n 1)"
   demo_pool_report_json="$(sed -n 's/^POOL_REPORT_JSON=//p' "$pool_out" | tail -n 1)"
   if [[ "$pool_rc" != "0" ]]; then
@@ -130,6 +143,9 @@ if [[ -n "$LIVE_CHAT_POOL_FILE" ]]; then
   fi
   if [[ -n "$demo_pool_report_json" ]]; then
     echo "DEMO_POOL_REPORT_JSON=$demo_pool_report_json"
+  fi
+  if [[ -n "$CHAT_POOL_PRECHECK_SUMMARY_JSON" && "$CHAT_POOL_PRECHECK_SUMMARY_JSON" != "none" ]]; then
+    echo "DEMO_CHAT_POOL_PRECHECK_SUMMARY=$CHAT_POOL_PRECHECK_SUMMARY_JSON"
   fi
   echo "DEMO_STATUS=OK"
   exit 0

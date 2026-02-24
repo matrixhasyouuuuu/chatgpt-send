@@ -33,6 +33,7 @@ FLEET_MONITOR_HEARTBEAT_SEC="${POOL_FLEET_MONITOR_HEARTBEAT_SEC:-20}"
 FLEET_MONITOR_TIMEOUT_SEC="${POOL_FLEET_MONITOR_TIMEOUT_SEC:-0}"
 FLEET_MONITOR_STUCK_AFTER_SEC="${POOL_FLEET_MONITOR_STUCK_AFTER_SEC:-240}"
 FLEET_MONITOR_STDOUT="${POOL_FLEET_MONITOR_STDOUT:-0}"       # 1|0
+FLEET_FOLLOW_SCRIPT="${POOL_FLEET_FOLLOW_SCRIPT:-$ROOT_DIR/scripts/fleet_follow.sh}"
 FLEET_WATCHDOG_ENABLED="${POOL_FLEET_WATCHDOG_ENABLED:-1}"   # 1|0
 FLEET_WATCHDOG_COOLDOWN_SEC="${POOL_FLEET_WATCHDOG_COOLDOWN_SEC:-2}"
 FLEET_GATE_ENABLED="${POOL_FLEET_GATE_ENABLED:-1}"           # 1|0
@@ -57,6 +58,21 @@ POOL_REPORT_MD="${POOL_REPORT_MD:-}"
 POOL_REPORT_JSON="${POOL_REPORT_JSON:-}"
 POOL_REPORT_MAX_LAST_LINES="${POOL_REPORT_MAX_LAST_LINES:-80}"
 POOL_REPORT_INCLUDE_LOGS="${POOL_REPORT_INCLUDE_LOGS:-0}" # 0|1
+POOL_FOLLOW="${POOL_FOLLOW:-auto}" # auto|0|1 (feature toggle)
+POOL_FOLLOW_MODE="${POOL_FOLLOW_MODE:-auto}" # auto|off|log|cli|both
+POOL_FOLLOW_TICK_MS="${POOL_FOLLOW_TICK_MS:-1000}"
+POOL_FOLLOW_NO_ANSI="${POOL_FOLLOW_NO_ANSI:-0}" # 0|1
+POOL_FOLLOW_PID_FILE="${POOL_FOLLOW_PID_FILE:-}"
+POOL_FOLLOW_LOG="${POOL_FOLLOW_LOG:-}"
+POOL_EARLY_GATE="${POOL_EARLY_GATE:-auto}" # 0|1|auto
+POOL_EARLY_GATE_TICK_SEC="${POOL_EARLY_GATE_TICK_SEC:-5}"
+POOL_EARLY_GATE_STUCK_FAIL="${POOL_EARLY_GATE_STUCK_FAIL:-1}" # 0|1
+POOL_EARLY_GATE_MAX_ORPHANED="${POOL_EARLY_GATE_MAX_ORPHANED:-0}"
+POOL_EARLY_GATE_MAX_STUCK="${POOL_EARLY_GATE_MAX_STUCK:-0}"
+POOL_EARLY_GATE_ACTION="${POOL_EARLY_GATE_ACTION:-abort_and_retry}" # abort|abort_and_retry|abort_no_retry
+POOL_EARLY_GATE_RETRYABLE_CLASSES="${POOL_EARLY_GATE_RETRYABLE_CLASSES:-ORPHANED,STUCK}"
+POOL_EARLY_GATE_CONFIRM_TICKS="${POOL_EARLY_GATE_CONFIRM_TICKS:-2}"
+POOL_EARLY_GATE_CONFIRM_MODE="${POOL_EARLY_GATE_CONFIRM_MODE:-consecutive}"
 
 usage() {
   cat <<'USAGE'
@@ -151,6 +167,26 @@ if [[ ! "$POOL_STRICT_CHAT_PROOF" =~ ^(0|1|auto)$ ]]; then
   echo "invalid POOL_STRICT_CHAT_PROOF: $POOL_STRICT_CHAT_PROOF (expected 0|1|auto)" >&2
   exit 6
 fi
+if [[ ! "$POOL_FOLLOW" =~ ^(0|1|auto)$ ]]; then
+  echo "invalid POOL_FOLLOW: $POOL_FOLLOW (expected 0|1|auto)" >&2
+  exit 6
+fi
+if [[ ! "$POOL_FOLLOW_MODE" =~ ^(auto|off|log|cli|both)$ ]]; then
+  echo "invalid POOL_FOLLOW_MODE: $POOL_FOLLOW_MODE (expected auto|off|log|cli|both)" >&2
+  exit 6
+fi
+if [[ ! "$POOL_EARLY_GATE" =~ ^(0|1|auto)$ ]]; then
+  echo "invalid POOL_EARLY_GATE: $POOL_EARLY_GATE (expected 0|1|auto)" >&2
+  exit 6
+fi
+if [[ ! "$POOL_EARLY_GATE_ACTION" =~ ^(abort|abort_and_retry|abort_no_retry)$ ]]; then
+  echo "invalid POOL_EARLY_GATE_ACTION: $POOL_EARLY_GATE_ACTION (expected abort|abort_and_retry|abort_no_retry)" >&2
+  exit 6
+fi
+if [[ ! "$POOL_EARLY_GATE_CONFIRM_MODE" =~ ^(consecutive)$ ]]; then
+  echo "invalid POOL_EARLY_GATE_CONFIRM_MODE: $POOL_EARLY_GATE_CONFIRM_MODE (expected consecutive)" >&2
+  exit 6
+fi
 for n in \
   "$CONCURRENCY" "$ITERATIONS" "$TIMEOUT_SEC" "$FAIL_FAST_AFTER" "$RETRY_MAX" \
   "$FLEET_MONITOR_POLL_SEC" "$FLEET_MONITOR_HEARTBEAT_SEC" "$FLEET_MONITOR_TIMEOUT_SEC" \
@@ -158,7 +194,9 @@ for n in \
   "$FLEET_GATE_HEARTBEAT_SEC" "$FLEET_REGISTRY_LOCK_TIMEOUT_SEC" "$FLEET_ROSTER_LOCK_TIMEOUT_SEC" \
   "$POOL_LOCK_TIMEOUT_SEC" "$POOL_KILL_GRACE_SEC" \
   "$POOL_GC_KEEP_LAST" "$POOL_GC_KEEP_HOURS" "$POOL_GC_MAX_TOTAL_MB" "$POOL_GC_FREE_WARN_PCT" \
-  "$POOL_REPORT_MAX_LAST_LINES"; do
+  "$POOL_REPORT_MAX_LAST_LINES" "$POOL_FOLLOW_TICK_MS" \
+  "$POOL_EARLY_GATE_TICK_SEC" "$POOL_EARLY_GATE_MAX_ORPHANED" "$POOL_EARLY_GATE_MAX_STUCK" \
+  "$POOL_EARLY_GATE_CONFIRM_TICKS"; do
   if [[ ! "$n" =~ ^[0-9]+$ ]]; then
     echo "numeric option expected, got: $n" >&2
     exit 7
@@ -167,7 +205,9 @@ done
 if [[ ! "$CHAT_POOL_CHECK" =~ ^[01]$ ]] || [[ ! "$CHAT_POOL_PROBE" =~ ^[01]$ ]] || [[ ! "$CHAT_POOL_PROBE_NO_SEND" =~ ^[01]$ ]] \
   || [[ ! "$FLEET_MONITOR_ENABLED" =~ ^[01]$ ]] || [[ ! "$FLEET_MONITOR_STDOUT" =~ ^[01]$ ]] \
   || [[ ! "$FLEET_WATCHDOG_ENABLED" =~ ^[01]$ ]] || [[ ! "$FLEET_GATE_ENABLED" =~ ^[01]$ ]] \
-  || [[ ! "$POOL_WRITE_REPORT" =~ ^[01]$ ]] || [[ ! "$POOL_REPORT_INCLUDE_LOGS" =~ ^[01]$ ]]; then
+  || [[ ! "$POOL_WRITE_REPORT" =~ ^[01]$ ]] || [[ ! "$POOL_REPORT_INCLUDE_LOGS" =~ ^[01]$ ]] \
+  || [[ ! "$POOL_FOLLOW_NO_ANSI" =~ ^[01]$ ]] \
+  || [[ ! "$POOL_EARLY_GATE_STUCK_FAIL" =~ ^[01]$ ]]; then
   echo "switches must be 0 or 1" >&2
   exit 7
 fi
@@ -177,6 +217,10 @@ if (( CONCURRENCY < 1 )); then
 fi
 if (( FLEET_MONITOR_ENABLED == 1 )) && [[ ! -x "$FLEET_MONITOR_SCRIPT" ]]; then
   echo "fleet monitor script not executable: $FLEET_MONITOR_SCRIPT" >&2
+  exit 18
+fi
+if [[ "$POOL_FOLLOW" == "1" ]] && [[ "$POOL_FOLLOW_MODE" != "off" ]] && [[ ! -x "$FLEET_FOLLOW_SCRIPT" ]]; then
+  echo "fleet follow script not executable: $FLEET_FOLLOW_SCRIPT" >&2
   exit 18
 fi
 if [[ "$POOL_GC" != "0" ]] && [[ ! -x "$POOL_GC_SCRIPT" ]]; then
@@ -189,6 +233,18 @@ if [[ "$POOL_WRITE_REPORT" == "1" ]] && [[ ! -x "$POOL_REPORT_SCRIPT" ]]; then
 fi
 if (( FLEET_MONITOR_POLL_SEC < 1 )); then
   echo "POOL_FLEET_MONITOR_POLL_SEC must be >= 1" >&2
+  exit 19
+fi
+if (( POOL_FOLLOW_TICK_MS < 50 )); then
+  echo "POOL_FOLLOW_TICK_MS must be >= 50" >&2
+  exit 19
+fi
+if (( POOL_EARLY_GATE_TICK_SEC < 1 )); then
+  echo "POOL_EARLY_GATE_TICK_SEC must be >= 1" >&2
+  exit 19
+fi
+if (( POOL_EARLY_GATE_CONFIRM_TICKS < 1 )); then
+  echo "POOL_EARLY_GATE_CONFIRM_TICKS must be >= 1" >&2
   exit 19
 fi
 if (( FLEET_MONITOR_STUCK_AFTER_SEC < 1 )); then
@@ -311,6 +367,18 @@ FLEET_HEARTBEAT_FILE="$POOL_RUN_DIR/fleet.heartbeat"
 FLEET_EVENTS_JSONL="$POOL_RUN_DIR/fleet.events.jsonl"
 FLEET_EVENTS_LOCK_FILE="$POOL_RUN_DIR/fleet.events.lock"
 FLEET_GATE_LOG="$POOL_RUN_DIR/fleet.gate.log"
+POOL_EARLY_ABORT_FILE="$POOL_RUN_DIR/.early_abort"
+POOL_EARLY_ABORT_REASON_FILE="$POOL_RUN_DIR/.early_abort.reason"
+POOL_EARLY_ABORT_IDS_FILE="$POOL_RUN_DIR/.early_abort.ids"
+POOL_EARLY_ABORT_META_JSON="$POOL_RUN_DIR/early_abort.meta.json"
+POOL_EARLY_ABORT_SNAPSHOT="$POOL_RUN_DIR/early_gate_snapshot.json"
+POOL_EARLY_GATE_PID_FILE="$POOL_RUN_DIR/early_gate.pid"
+if [[ -z "$POOL_FOLLOW_PID_FILE" ]]; then
+  POOL_FOLLOW_PID_FILE="$POOL_RUN_DIR/fleet.follow.pid"
+fi
+if [[ -z "$POOL_FOLLOW_LOG" ]]; then
+  POOL_FOLLOW_LOG="$POOL_RUN_DIR/fleet.follow.log"
+fi
 POOL_WATCHDOG_LOG="$POOL_RUN_DIR/pool.watchdog.log"
 POOL_GC_LOG="$POOL_RUN_DIR/pool.gc.log"
 if [[ -z "$POOL_REPORT_MD" ]]; then
@@ -392,6 +460,87 @@ POOL_GC_REASON="disabled"
 POOL_GC_EXIT_CODE=0
 POOL_REPORT_RC=0
 POOL_REPORT_STATUS="skipped"
+POOL_FOLLOW_EFFECTIVE=0
+POOL_FOLLOW_REASON="disabled"
+POOL_FOLLOW_MODE_EFFECTIVE="off"
+POOL_EARLY_GATE_EFFECTIVE=0
+POOL_EARLY_GATE_REASON="disabled"
+POOL_EARLY_ABORT_TRIGGERED=0
+POOL_EARLY_ABORT_REASON="none"
+POOL_EARLY_ABORT_IDS_COUNT=0
+POOL_EARLY_ABORT_ACTION_TAKEN=0
+POOL_EARLY_ABORT_RETRY_TRIGGERED=0
+EARLY_RETRY_PENDING=0
+EARLY_RETRY_SOURCE="none"
+declare -a EARLY_RETRY_AGENTS=()
+
+if [[ "$POOL_FOLLOW_MODE" == "off" ]]; then
+  POOL_FOLLOW_EFFECTIVE=0
+  POOL_FOLLOW_REASON="mode_off"
+else
+  if [[ "$POOL_FOLLOW" == "1" ]]; then
+    POOL_FOLLOW_EFFECTIVE=1
+    POOL_FOLLOW_REASON="forced"
+  elif [[ "$POOL_FOLLOW" == "auto" ]]; then
+    if (( TOTAL_AGENTS > 1 )) && [[ "$FLEET_MONITOR_ENABLED" == "1" ]]; then
+      POOL_FOLLOW_EFFECTIVE=1
+      POOL_FOLLOW_REASON="auto_multi_agent"
+    else
+      POOL_FOLLOW_EFFECTIVE=0
+      POOL_FOLLOW_REASON="auto_skip"
+    fi
+  fi
+fi
+
+if (( POOL_FOLLOW_EFFECTIVE == 1 )) && [[ "$FLEET_MONITOR_ENABLED" != "1" ]]; then
+  POOL_FOLLOW_EFFECTIVE=0
+  POOL_FOLLOW_REASON="monitor_disabled"
+fi
+
+if (( POOL_FOLLOW_EFFECTIVE == 1 )); then
+  if [[ "$POOL_FOLLOW_MODE" == "auto" ]]; then
+    if [[ -t 1 ]]; then
+      POOL_FOLLOW_MODE_EFFECTIVE="both"
+    else
+      POOL_FOLLOW_MODE_EFFECTIVE="log"
+    fi
+  else
+    POOL_FOLLOW_MODE_EFFECTIVE="$POOL_FOLLOW_MODE"
+  fi
+else
+  POOL_FOLLOW_MODE_EFFECTIVE="off"
+fi
+
+if (( POOL_FOLLOW_EFFECTIVE == 1 )) && [[ ! -x "$FLEET_FOLLOW_SCRIPT" ]]; then
+  if [[ "$POOL_FOLLOW" == "1" ]]; then
+    echo "fleet follow script not executable: $FLEET_FOLLOW_SCRIPT" >&2
+    exit 18
+  fi
+  POOL_FOLLOW_EFFECTIVE=0
+  POOL_FOLLOW_REASON="follow_script_missing"
+  POOL_FOLLOW_MODE_EFFECTIVE="off"
+fi
+
+if [[ "$POOL_EARLY_GATE" == "1" ]]; then
+  POOL_EARLY_GATE_EFFECTIVE=1
+  POOL_EARLY_GATE_REASON="forced"
+elif [[ "$POOL_EARLY_GATE" == "auto" ]]; then
+  if [[ "$MODE" == "live" ]] || (( CONCURRENCY >= 5 )); then
+    POOL_EARLY_GATE_EFFECTIVE=1
+    POOL_EARLY_GATE_REASON="auto_live_or_scale"
+  else
+    POOL_EARLY_GATE_EFFECTIVE=0
+    POOL_EARLY_GATE_REASON="auto_skip"
+  fi
+else
+  POOL_EARLY_GATE_EFFECTIVE=0
+  POOL_EARLY_GATE_REASON="disabled"
+fi
+
+if (( POOL_EARLY_GATE_EFFECTIVE == 1 )) && [[ "$FLEET_MONITOR_ENABLED" != "1" ]]; then
+  POOL_EARLY_GATE_EFFECTIVE=0
+  POOL_EARLY_GATE_REASON="monitor_disabled"
+fi
 
 watchdog_log() {
   local msg="$1"
@@ -626,6 +775,290 @@ terminate_active_spawns() {
   terminate_pids_with_grace "$POOL_KILL_GRACE_SEC" "${ACTIVE_SPAWN_PIDS[@]:-}"
 }
 
+should_early_abort_from_summary() {
+  local summary_json="$1"
+  python3 - "$summary_json" "$POOL_EARLY_GATE_STUCK_FAIL" "$POOL_EARLY_GATE_MAX_STUCK" "$POOL_EARLY_GATE_MAX_ORPHANED" <<'PY'
+import json
+import pathlib
+import sys
+
+summary = pathlib.Path(sys.argv[1])
+stuck_fail = int(sys.argv[2])
+max_stuck = int(sys.argv[3])
+max_orphaned = int(sys.argv[4])
+
+if not summary.exists():
+    print("state=missing")
+    print("trigger=0")
+    print("stuck=0")
+    print("orphaned=0")
+    raise SystemExit(0)
+
+try:
+    obj = json.loads(summary.read_text(encoding="utf-8"))
+except Exception:
+    print("state=invalid")
+    print("trigger=0")
+    print("stuck=0")
+    print("orphaned=0")
+    raise SystemExit(0)
+
+def as_int(v):
+    try:
+        return int(v)
+    except Exception:
+        return 0
+
+stuck = as_int(obj.get("stuck_confirmed_total", obj.get("stuck", 0)))
+orphaned = as_int(obj.get("orphaned_confirmed_total", obj.get("orphaned", 0)))
+trigger = 0
+reason = "none"
+
+if max_stuck >= 0 and stuck > max_stuck:
+    trigger = 1
+    reason = "stuck_threshold"
+if max_orphaned >= 0 and orphaned > max_orphaned:
+    trigger = 1
+    reason = "orphaned_threshold"
+if stuck_fail == 1 and (stuck > 0 or orphaned > 0):
+    trigger = 1
+    reason = "stuck_or_orphaned"
+
+print("state=ok")
+print(f"trigger={trigger}")
+print(f"reason={reason}")
+print(f"stuck={stuck}")
+print(f"orphaned={orphaned}")
+PY
+}
+
+collect_early_abort_blame_rows() {
+  local summary_json="$1"
+  python3 - "$summary_json" <<'PY'
+import json
+import pathlib
+import sys
+
+summary = pathlib.Path(sys.argv[1])
+if not summary.exists():
+    raise SystemExit(0)
+
+try:
+    obj = json.loads(summary.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+
+seen = set()
+for row in obj.get("agents", []):
+    if not isinstance(row, dict):
+        continue
+    klass = str(row.get("state_class", "")).upper()
+    if klass not in {"STUCK", "ORPHANED"}:
+        continue
+    agent_id = str(row.get("agent_id", "")).strip()
+    run_id = str(row.get("run_id", "")).strip()
+    key = (agent_id, run_id, klass)
+    if key in seen:
+        continue
+    seen.add(key)
+    print(f"{agent_id}\t{run_id}\t{klass}")
+PY
+}
+
+write_early_abort_meta_json() {
+  local reason="$1"
+  local stuck="$2"
+  local orphaned="$3"
+  local bad_ticks="$4"
+  local ids_count="$5"
+  python3 - "$POOL_EARLY_ABORT_META_JSON" "$reason" "$stuck" "$orphaned" "$bad_ticks" "$POOL_EARLY_GATE_CONFIRM_TICKS" "$ids_count" <<'PY'
+import json
+import pathlib
+import sys
+from datetime import datetime, timezone
+
+out = pathlib.Path(sys.argv[1])
+payload = {
+    "reason": sys.argv[2],
+    "stuck": int(sys.argv[3]),
+    "orphaned": int(sys.argv[4]),
+    "bad_ticks": int(sys.argv[5]),
+    "confirm_ticks": int(sys.argv[6]),
+    "ids_count": int(sys.argv[7]),
+    "ts_utc": datetime.now(timezone.utc).isoformat(),
+}
+out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+start_early_gate_if_needed() {
+  local reason="${1:-manual}"
+  if (( POOL_EARLY_GATE_EFFECTIVE != 1 )); then
+    return 0
+  fi
+  rm -f "$POOL_EARLY_ABORT_FILE" "$POOL_EARLY_ABORT_REASON_FILE" "$POOL_EARLY_ABORT_IDS_FILE" "$POOL_EARLY_ABORT_META_JSON" "$POOL_EARLY_ABORT_SNAPSHOT" "$POOL_EARLY_GATE_PID_FILE" >/dev/null 2>&1 || true
+
+  (
+    bad_ticks=0
+    bad_reason_last="none"
+    while true; do
+      probe_state="missing"
+      probe_trigger="0"
+      probe_reason="none"
+      probe_stuck="0"
+      probe_orphaned="0"
+
+      while IFS='=' read -r k v; do
+        case "$k" in
+          state) probe_state="$v" ;;
+          trigger) probe_trigger="$v" ;;
+          reason) probe_reason="$v" ;;
+          stuck) probe_stuck="$v" ;;
+          orphaned) probe_orphaned="$v" ;;
+        esac
+      done < <(should_early_abort_from_summary "$FLEET_SUMMARY_JSON")
+
+      if [[ "$probe_trigger" == "1" ]]; then
+        if [[ "$POOL_EARLY_GATE_CONFIRM_MODE" == "consecutive" ]]; then
+          if [[ "$probe_reason" == "$bad_reason_last" ]]; then
+            bad_ticks=$((bad_ticks + 1))
+          else
+            bad_ticks=1
+            bad_reason_last="$probe_reason"
+          fi
+        else
+          bad_ticks=$((bad_ticks + 1))
+        fi
+
+        if (( bad_ticks >= POOL_EARLY_GATE_CONFIRM_TICKS )); then
+          ids_count=0
+          : >"$POOL_EARLY_ABORT_IDS_FILE"
+          while IFS= read -r blame_row; do
+            [[ -n "$blame_row" ]] || continue
+            printf '%s\n' "$blame_row" >>"$POOL_EARLY_ABORT_IDS_FILE"
+            ids_count=$((ids_count + 1))
+          done < <(collect_early_abort_blame_rows "$FLEET_SUMMARY_JSON")
+          write_early_abort_meta_json "$probe_reason" "$probe_stuck" "$probe_orphaned" "$bad_ticks" "$ids_count"
+          printf '%s\n' "reason=${probe_reason} stuck=${probe_stuck} orphaned=${probe_orphaned} confirm_ticks=${POOL_EARLY_GATE_CONFIRM_TICKS} bad_ticks=${bad_ticks}" >"$POOL_EARLY_ABORT_REASON_FILE"
+          : >"$POOL_EARLY_ABORT_FILE"
+          if [[ -f "$FLEET_SUMMARY_JSON" ]]; then
+            cp -f "$FLEET_SUMMARY_JSON" "$POOL_EARLY_ABORT_SNAPSHOT" >/dev/null 2>&1 || true
+          fi
+          watchdog_log "event=early_gate_trigger reason=${probe_reason} stuck=${probe_stuck} orphaned=${probe_orphaned} confirm_ticks=${POOL_EARLY_GATE_CONFIRM_TICKS} bad_ticks=${bad_ticks} ids=${ids_count}"
+          break
+        fi
+      else
+        bad_ticks=0
+        bad_reason_last="none"
+      fi
+      sleep "$POOL_EARLY_GATE_TICK_SEC"
+    done
+  ) &
+  local eg_pid="$!"
+  printf '%s\n' "$eg_pid" >"$POOL_EARLY_GATE_PID_FILE"
+  watchdog_log "event=early_gate_started pid=${eg_pid} reason=${reason} tick_sec=${POOL_EARLY_GATE_TICK_SEC} action=${POOL_EARLY_GATE_ACTION}"
+}
+
+stop_early_gate_if_running() {
+  local eg_pid
+  eg_pid="$(read_pid_file "$POOL_EARLY_GATE_PID_FILE")"
+  if ! pid_is_alive "$eg_pid"; then
+    rm -f "$POOL_EARLY_GATE_PID_FILE" >/dev/null 2>&1 || true
+    return 0
+  fi
+  kill "$eg_pid" >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! pid_is_alive "$eg_pid"; then
+      break
+    fi
+    sleep 0.2
+  done
+  if pid_is_alive "$eg_pid"; then
+    kill -9 "$eg_pid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$POOL_EARLY_GATE_PID_FILE" >/dev/null 2>&1 || true
+  watchdog_log "event=early_gate_stopped pid=${eg_pid}"
+}
+
+read_early_abort_reason() {
+  if [[ -f "$POOL_EARLY_ABORT_REASON_FILE" ]]; then
+    tr '\n' ' ' <"$POOL_EARLY_ABORT_REASON_FILE" | sed -e 's/[[:space:]]\+/ /g' -e 's/[[:space:]]*$//'
+  else
+    printf 'reason=unknown'
+  fi
+}
+
+apply_early_abort_if_triggered() {
+  local context="${1:-runtime}"
+  if (( POOL_EARLY_GATE_EFFECTIVE != 1 )); then
+    return 1
+  fi
+  if [[ ! -f "$POOL_EARLY_ABORT_FILE" ]]; then
+    return 1
+  fi
+  if (( POOL_EARLY_ABORT_ACTION_TAKEN == 1 )); then
+    return 0
+  fi
+  POOL_EARLY_ABORT_ACTION_TAKEN=1
+  POOL_EARLY_ABORT_TRIGGERED=1
+  POOL_EARLY_ABORT_REASON="$(read_early_abort_reason)"
+  POOL_EARLY_ABORT_IDS_COUNT=0
+  if [[ -f "$POOL_EARLY_ABORT_IDS_FILE" ]]; then
+    POOL_EARLY_ABORT_IDS_COUNT="$(wc -l <"$POOL_EARLY_ABORT_IDS_FILE" | tr -d '[:space:]')"
+    if [[ ! "$POOL_EARLY_ABORT_IDS_COUNT" =~ ^[0-9]+$ ]]; then
+      POOL_EARLY_ABORT_IDS_COUNT=0
+    fi
+  fi
+  watchdog_log "event=early_gate_abort context=${context} ${POOL_EARLY_ABORT_REASON} ids=${POOL_EARLY_ABORT_IDS_COUNT}"
+  echo "EARLY_GATE_TRIGGER context=${context} ${POOL_EARLY_ABORT_REASON} ids=${POOL_EARLY_ABORT_IDS_COUNT}" >&2
+  terminate_active_spawns
+  terminate_active_children
+  return 0
+}
+
+collect_retryable_agents_from_fleet_summary() {
+  if [[ ! -s "$FLEET_SUMMARY_JSON" ]]; then
+    return 0
+  fi
+  python3 - "$FLEET_SUMMARY_JSON" "$POOL_EARLY_GATE_RETRYABLE_CLASSES" <<'PY'
+import json
+import pathlib
+import sys
+
+summary = pathlib.Path(sys.argv[1])
+classes = {c.strip().upper() for c in sys.argv[2].split(",") if c.strip()}
+if not classes:
+    raise SystemExit(0)
+
+try:
+    obj = json.loads(summary.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+
+seen = set()
+for row in obj.get("agents", []):
+    if not isinstance(row, dict):
+        continue
+    klass = str(row.get("state_class", "")).upper()
+    if klass not in classes:
+        continue
+    agent_id = row.get("agent_id")
+    agent_str = str(agent_id).strip()
+    if not agent_str.isdigit():
+        continue
+    if agent_str in seen:
+        continue
+    seen.add(agent_str)
+    print(agent_str)
+PY
+}
+
+collect_retryable_agents_from_abort_ids_file() {
+  local ids_file="$1"
+  [[ -f "$ids_file" ]] || return 0
+  awk -F'\t' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1); if ($1 ~ /^[0-9]+$/) print $1}' "$ids_file" | sort -u
+}
+
 on_pool_signal() {
   local sig="$1"
   if (( POOL_ABORT_HANDLING == 1 )); then
@@ -640,16 +1073,15 @@ on_pool_signal() {
     POOL_ABORT_RC=143
   fi
   watchdog_log "event=pool_abort_start signal=${sig}"
+  stop_early_gate_if_running
+  stop_fleet_follow_if_running
+  stop_fleet_monitor_if_running
   terminate_active_spawns
   terminate_active_children
   echo "POOL_ABORT signal=${sig} killed=${POOL_ABORT_KILLED} remaining=${POOL_ABORT_REMAINING}" >&2
   watchdog_log "event=pool_abort_done signal=${sig}"
   POOL_ABORT_HANDLING=0
 }
-
-trap 'on_pool_signal INT' INT
-trap 'on_pool_signal TERM' TERM
-trap 'remove_pool_active_marker; release_pool_lock' EXIT
 
 start_fleet_monitor() {
   local reason="${1:-manual}"
@@ -721,6 +1153,105 @@ stop_fleet_monitor_if_running() {
   fi
   watchdog_log "event=fleet_monitor_stopped pid=${monitor_pid}"
 }
+
+start_fleet_follow_if_needed() {
+  local reason="${1:-manual}"
+  if (( POOL_FOLLOW_EFFECTIVE != 1 )); then
+    return 0
+  fi
+  if [[ "$POOL_FOLLOW_MODE_EFFECTIVE" == "off" ]]; then
+    return 0
+  fi
+  if [[ ! -x "$FLEET_FOLLOW_SCRIPT" ]]; then
+    watchdog_log "event=fleet_follow_disabled reason=script_missing path=${FLEET_FOLLOW_SCRIPT}"
+    return 0
+  fi
+
+  local existing_pid
+  existing_pid="$(read_pid_file "$POOL_FOLLOW_PID_FILE")"
+  if pid_is_alive "$existing_pid"; then
+    return 0
+  fi
+  rm -f "$POOL_FOLLOW_PID_FILE" >/dev/null 2>&1 || true
+
+  local -a base_cmd=(
+    "$FLEET_FOLLOW_SCRIPT"
+    --pool-run-dir "$POOL_RUN_DIR"
+    --tick-ms "$POOL_FOLLOW_TICK_MS"
+  )
+  if [[ "$POOL_FOLLOW_NO_ANSI" == "1" ]]; then
+    base_cmd+=(--no-ansi)
+  fi
+
+  local follow_pid=""
+  case "$POOL_FOLLOW_MODE_EFFECTIVE" in
+    log)
+      "${base_cmd[@]}" --log "$POOL_FOLLOW_LOG" >/dev/null 2>&1 &
+      follow_pid="$!"
+      ;;
+    cli)
+      "${base_cmd[@]}" 1>&2 &
+      follow_pid="$!"
+      ;;
+    both)
+      "${base_cmd[@]}" | tee -a "$POOL_FOLLOW_LOG" 1>&2 &
+      follow_pid="$!"
+      ;;
+    *)
+      watchdog_log "event=fleet_follow_start_failed reason=${reason} mode=${POOL_FOLLOW_MODE_EFFECTIVE}"
+      return 1
+      ;;
+  esac
+
+  if [[ -n "$follow_pid" ]]; then
+    printf '%s\n' "$follow_pid" >"$POOL_FOLLOW_PID_FILE"
+  fi
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    follow_pid="$(read_pid_file "$POOL_FOLLOW_PID_FILE")"
+    if pid_is_alive "$follow_pid"; then
+      watchdog_log "event=fleet_follow_started pid=${follow_pid} reason=${reason} mode=${POOL_FOLLOW_MODE_EFFECTIVE} tick_ms=${POOL_FOLLOW_TICK_MS} no_ansi=${POOL_FOLLOW_NO_ANSI}"
+      return 0
+    fi
+    sleep 0.1
+  done
+  rm -f "$POOL_FOLLOW_PID_FILE" >/dev/null 2>&1 || true
+  watchdog_log "event=fleet_follow_start_failed reason=${reason} mode=${POOL_FOLLOW_MODE_EFFECTIVE}"
+  return 1
+}
+
+stop_fleet_follow_if_running() {
+  local follow_pid
+  follow_pid="$(read_pid_file "$POOL_FOLLOW_PID_FILE")"
+  if ! pid_is_alive "$follow_pid"; then
+    rm -f "$POOL_FOLLOW_PID_FILE" >/dev/null 2>&1 || true
+    return 0
+  fi
+  kill "$follow_pid" >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! pid_is_alive "$follow_pid"; then
+      break
+    fi
+    sleep 0.2
+  done
+  if pid_is_alive "$follow_pid"; then
+    kill -9 "$follow_pid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$POOL_FOLLOW_PID_FILE" >/dev/null 2>&1 || true
+  watchdog_log "event=fleet_follow_stopped pid=${follow_pid}"
+}
+
+cleanup_pool_on_exit() {
+  stop_early_gate_if_running
+  stop_fleet_follow_if_running
+  stop_fleet_monitor_if_running
+  remove_pool_active_marker
+  release_pool_lock
+}
+
+trap 'on_pool_signal INT' INT
+trap 'on_pool_signal TERM' TERM
+trap 'cleanup_pool_on_exit' EXIT
 
 ensure_fleet_monitor_alive() {
   local context="${1:-runtime}"
@@ -1194,6 +1725,9 @@ run_batch() {
   local stop_launch=0
 
   for agent_id in "${agents[@]}"; do
+    if apply_early_abort_if_triggered "attempt_${attempt}_before_launch_${agent_id}"; then
+      stop_launch=1
+    fi
     if (( POOL_ABORT == 1 )); then
       stop_launch=1
     fi
@@ -1217,6 +1751,9 @@ run_batch() {
     running_agents+=("$agent_id")
 
     while (( ${#running_pids[@]} >= CONCURRENCY )); do
+      if apply_early_abort_if_triggered "attempt_${attempt}_before_wait"; then
+        stop_launch=1
+      fi
       if (( POOL_ABORT == 1 )); then
         stop_launch=1
       fi
@@ -1247,6 +1784,7 @@ run_batch() {
   done
 
   for idx in "${!running_pids[@]}"; do
+    apply_early_abort_if_triggered "attempt_${attempt}_tail_wait" || true
     ensure_fleet_monitor_alive "attempt_${attempt}_tail_wait"
     pid="${running_pids[$idx]}"
     agent="${running_agents[$idx]}"
@@ -1277,25 +1815,96 @@ if [[ "$FLEET_MONITOR_ENABLED" == "1" ]]; then
     watchdog_log "event=fleet_monitor_start_retry_planned"
   fi
 fi
+if (( POOL_EARLY_GATE_EFFECTIVE == 1 )); then
+  start_early_gate_if_needed "startup"
+else
+  watchdog_log "event=early_gate_skip reason=${POOL_EARLY_GATE_REASON} mode=${POOL_EARLY_GATE}"
+fi
+if (( POOL_FOLLOW_EFFECTIVE == 1 )); then
+  if ! start_fleet_follow_if_needed "startup"; then
+    watchdog_log "event=fleet_follow_start_retry_planned"
+  fi
+else
+  watchdog_log "event=fleet_follow_skip reason=${POOL_FOLLOW_REASON} mode_config=${POOL_FOLLOW_MODE} mode_effective=${POOL_FOLLOW_MODE_EFFECTIVE}"
+fi
 
 run_batch 1 "${ALL_AGENTS[@]}"
+
+if (( POOL_EARLY_ABORT_TRIGGERED == 1 )); then
+  stop_early_gate_if_running
+  stop_fleet_follow_if_running
+  stop_fleet_monitor_if_running
+  if [[ "$POOL_EARLY_GATE_ACTION" == "abort_and_retry" ]] && (( RETRY_MAX > 0 )); then
+    if mapfile -t EARLY_RETRY_AGENTS < <(collect_retryable_agents_from_abort_ids_file "$POOL_EARLY_ABORT_IDS_FILE"); then
+      if (( ${#EARLY_RETRY_AGENTS[@]} > 0 )); then
+        EARLY_RETRY_SOURCE="abort_ids"
+      elif mapfile -t EARLY_RETRY_AGENTS < <(collect_retryable_agents_from_fleet_summary); then
+        if (( ${#EARLY_RETRY_AGENTS[@]} > 0 )); then
+          EARLY_RETRY_SOURCE="fleet_summary"
+        fi
+      fi
+      if (( ${#EARLY_RETRY_AGENTS[@]} > 0 )); then
+        EARLY_RETRY_PENDING=1
+        POOL_EARLY_ABORT_RETRY_TRIGGERED=1
+        watchdog_log "event=early_gate_retry_planned source=${EARLY_RETRY_SOURCE} agents=${EARLY_RETRY_AGENTS[*]}"
+      else
+        watchdog_log "event=early_gate_retry_skipped reason=no_retryable_agents"
+      fi
+    fi
+  else
+    watchdog_log "event=early_gate_retry_skipped action=${POOL_EARLY_GATE_ACTION} retry_max=${RETRY_MAX}"
+  fi
+fi
 
 for ((attempt=2; attempt<=RETRY_MAX+1; attempt++)); do
   if (( POOL_ABORT == 1 )); then
     break
   fi
   retry_agents=()
-  for agent_id in "${ALL_AGENTS[@]}"; do
-    rc="${FINAL_RC[$agent_id]:-0}"
-    if [[ "$rc" != "0" ]]; then
-      retry_agents+=("$agent_id")
+  if (( EARLY_RETRY_PENDING == 1 )); then
+    retry_agents=("${EARLY_RETRY_AGENTS[@]}")
+    EARLY_RETRY_PENDING=0
+    POOL_EARLY_ABORT_ACTION_TAKEN=0
+    POOL_EARLY_ABORT_TRIGGERED=0
+    POOL_EARLY_ABORT_REASON="none"
+    POOL_EARLY_ABORT_IDS_COUNT=0
+    rm -f "$POOL_EARLY_ABORT_FILE" "$POOL_EARLY_ABORT_REASON_FILE" "$POOL_EARLY_ABORT_IDS_FILE" "$POOL_EARLY_ABORT_META_JSON" "$POOL_EARLY_ABORT_SNAPSHOT" >/dev/null 2>&1 || true
+    if [[ "$FLEET_MONITOR_ENABLED" == "1" ]]; then
+      if ! start_fleet_monitor "early_retry_attempt_${attempt}"; then
+        watchdog_log "event=fleet_monitor_start_retry_planned context=early_retry_attempt_${attempt}"
+      fi
     fi
-  done
+    if (( POOL_EARLY_GATE_EFFECTIVE == 1 )); then
+      start_early_gate_if_needed "early_retry_attempt_${attempt}"
+    fi
+    if (( POOL_FOLLOW_EFFECTIVE == 1 )); then
+      if ! start_fleet_follow_if_needed "early_retry_attempt_${attempt}"; then
+        watchdog_log "event=fleet_follow_start_retry_planned context=early_retry_attempt_${attempt}"
+      fi
+    fi
+    watchdog_log "event=retry_phase_start source=early_gate source_detail=${EARLY_RETRY_SOURCE} attempt=${attempt} agents=${retry_agents[*]}"
+    echo "RETRY_PHASE_START source=early_gate source_detail=${EARLY_RETRY_SOURCE} attempt=${attempt} agents=${retry_agents[*]}" >&2
+    EARLY_RETRY_SOURCE="none"
+  else
+    for agent_id in "${ALL_AGENTS[@]}"; do
+      rc="${FINAL_RC[$agent_id]:-0}"
+      if [[ "$rc" != "0" ]]; then
+        retry_agents+=("$agent_id")
+      fi
+    done
+  fi
   if (( ${#retry_agents[@]} == 0 )); then
     break
   fi
   run_batch "$attempt" "${retry_agents[@]}"
+  if (( POOL_EARLY_ABORT_RETRY_TRIGGERED == 1 )) && (( EARLY_RETRY_PENDING == 0 )); then
+    echo "RETRY_PHASE_DONE source=early_gate attempt=${attempt}" >&2
+    watchdog_log "event=retry_phase_done source=early_gate attempt=${attempt}"
+    POOL_EARLY_ABORT_RETRY_TRIGGERED=0
+  fi
 done
+
+stop_early_gate_if_running
 
 retried_count=0
 for agent_id in "${ALL_AGENTS[@]}"; do
@@ -1426,12 +2035,20 @@ if [[ "$FLEET_GATE_STATUS" == "FAIL" ]]; then
   pool_status="FAILED"
   pool_exit_rc=1
 fi
+if (( POOL_EARLY_ABORT_TRIGGERED == 1 )); then
+  if [[ "$POOL_EARLY_GATE_ACTION" == "abort_no_retry" ]] || [[ "$POOL_EARLY_GATE_ACTION" == "abort" ]] || (( EARLY_RETRY_PENDING == 0 )); then
+    pool_status="ABORTED_EARLY"
+    pool_exit_rc=1
+  fi
+fi
 if (( POOL_ABORT == 1 )); then
   pool_status="INTERRUPTED"
   pool_exit_rc="${POOL_ABORT_RC:-130}"
 fi
 
 run_pool_report
+stop_early_gate_if_running
+stop_fleet_follow_if_running
 
 echo "POOL_RUN_ID=$POOL_RUN_ID"
 echo "POOL_RUN_DIR=$POOL_RUN_DIR"
@@ -1478,6 +2095,26 @@ echo "POOL_CHAT_UNKNOWN_TOTAL=$FLEET_CHAT_UNKNOWN_TOTAL"
 echo "POOL_STRICT_CHAT_PROOF=$POOL_STRICT_CHAT_PROOF_EFFECTIVE"
 echo "POOL_FLEET_GATE_COUNTS_JSON=$FLEET_GATE_COUNTS_JSON"
 echo "POOL_FLEET_WATCHDOG_RESTARTS=$FLEET_WATCHDOG_RESTARTS"
+echo "POOL_FOLLOW=$POOL_FOLLOW_EFFECTIVE"
+echo "POOL_FOLLOW_MODE=$POOL_FOLLOW_MODE_EFFECTIVE"
+echo "POOL_FOLLOW_MODE_CONFIG=$POOL_FOLLOW_MODE"
+echo "POOL_FOLLOW_REASON=$POOL_FOLLOW_REASON"
+echo "POOL_FOLLOW_TICK_MS=$POOL_FOLLOW_TICK_MS"
+echo "POOL_FOLLOW_PID_FILE=$POOL_FOLLOW_PID_FILE"
+echo "POOL_FOLLOW_LOG=$POOL_FOLLOW_LOG"
+echo "POOL_EARLY_GATE=$POOL_EARLY_GATE_EFFECTIVE"
+echo "POOL_EARLY_GATE_MODE=$POOL_EARLY_GATE"
+echo "POOL_EARLY_GATE_REASON=$POOL_EARLY_GATE_REASON"
+echo "POOL_EARLY_GATE_ACTION=$POOL_EARLY_GATE_ACTION"
+echo "POOL_EARLY_GATE_TICK_SEC=$POOL_EARLY_GATE_TICK_SEC"
+echo "POOL_EARLY_ABORT_FILE=$POOL_EARLY_ABORT_FILE"
+echo "POOL_EARLY_ABORT_REASON_FILE=$POOL_EARLY_ABORT_REASON_FILE"
+echo "POOL_EARLY_ABORT_IDS_FILE=$POOL_EARLY_ABORT_IDS_FILE"
+echo "POOL_EARLY_ABORT_META_JSON=$POOL_EARLY_ABORT_META_JSON"
+echo "POOL_EARLY_ABORT_SNAPSHOT=$POOL_EARLY_ABORT_SNAPSHOT"
+echo "POOL_EARLY_ABORT_TRIGGERED=$POOL_EARLY_ABORT_TRIGGERED"
+echo "POOL_EARLY_ABORT_REASON=$POOL_EARLY_ABORT_REASON"
+echo "POOL_EARLY_ABORT_IDS_COUNT=$POOL_EARLY_ABORT_IDS_COUNT"
 echo "POOL_WATCHDOG_LOG=$POOL_WATCHDOG_LOG"
 echo "POOL_ABORT=$POOL_ABORT"
 echo "POOL_ABORT_SIGNAL=${POOL_ABORT_SIGNAL:-none}"

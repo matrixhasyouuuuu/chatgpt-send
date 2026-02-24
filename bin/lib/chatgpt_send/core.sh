@@ -12,6 +12,9 @@ Usage:
   chatgpt_send --open-browser [--chatgpt-url URL]
   chatgpt_send --sync-chatgpt-url
   chatgpt_send --list-chats
+  chatgpt_send --status [--json]
+  chatgpt_send --explain <latest|RUN_ID|RUN_DIR|E_CODE> [--json]
+  chatgpt_send step <read|send|auto> [--message TEXT] [--json] [--max-steps N]
   chatgpt_send --doctor
   chatgpt_send --doctor --json
   chatgpt_send --cleanup
@@ -32,6 +35,7 @@ Options:
   --prompt-file PATH
   --model MODEL                 (default: gpt-5.2-pro)
   --model-strategy MODE         select|current|ignore (default: current)
+  --transport MODE              cdp|mock (default from CHATGPT_SEND_TRANSPORT or cdp)
   --keep-browser / --no-keep-browser
   --manual-login / --no-manual-login (default: manual-login)
   --chrome-path PATH            (default: bin/chrome_no_sandbox)
@@ -48,8 +52,14 @@ Options:
   --sync-chatgpt-url            detect current chat URL from open tabs and persist it
   --print-chatgpt-url           print resolved URL to stderr on each run
   --list-chats                  list saved Specialist chats (name -> url)
+  --status                      operator-friendly status (can_send/blockers/next)
+  --explain TARGET              explain an error code or a run (`latest`, RUN_ID, or path)
+  step <MODE>                   UX facade step (read/send/auto) over existing safe core
   --doctor                      print a quick health report (CDP, pinned chat, sessions)
-  --json                        with --doctor: output one JSON line snapshot
+  --json                        with --doctor/--status/--explain: output JSON
+  --message TEXT                with `step send/auto`: message to send via existing pipeline
+  --max-steps N                 with `step auto`: max transitions (MVP default 1)
+  --until STAGE                 with `step auto`: target stage hint (reserved/MVP passthrough)
   --cleanup                     cleanup stale pid artifacts for this profile/cdp port
   --graceful-restart-browser    restart automation Chrome safely + post-check contract/precheck
   --ack                         mark the latest tracked reply in current chat as consumed
@@ -1165,6 +1175,24 @@ print(assistant)
 PY
 }
 
+fetch_last_reuse_text_if_after_anchor() {
+  # Usage: fetch_last_reuse_text_if_after_anchor <fetch_json_path>
+  # Prints assistant_text when assistant_after_last_user=true and assistant_text exists.
+  local fetch_json="$1"
+  python3 - "$fetch_json" <<'PY'
+import json,sys
+path=sys.argv[1]
+with open(path,"r",encoding="utf-8") as f:
+    d=json.load(f)
+assistant=(d.get("assistant_text") or "").strip()
+if not assistant:
+    raise SystemExit(1)
+if not bool(d.get("assistant_after_last_user")):
+    raise SystemExit(1)
+print(assistant)
+PY
+}
+
 sanitize_file_inplace() {
   local path="$1"
   [[ "${SANITIZE_LOGS}" == "1" ]] || return 0
@@ -2182,8 +2210,12 @@ cdp_activate_or_open_url() {
     return 1
   fi
   # Try to find an existing tab and activate it; otherwise open a new one.
-  local tab_id
-  tab_id="$(curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
+  local tab_id match_count list_ok attempt meta
+  tab_id=""
+  match_count="0"
+  list_ok="0"
+  for attempt in 1 2; do
+    meta="$(curl -fsS "http://127.0.0.1:${CDP_PORT}/json/list" | python3 -c '
 import json,re,sys
 target=sys.argv[1]
 target=target.split("#",1)[0].strip()
@@ -2194,12 +2226,14 @@ if m:
 try:
     tabs=json.load(sys.stdin)
 except Exception:
+    print("\\t0\\t0")
     sys.exit(0)
 
 def chat_id(u:str):
     m=re.match(r"^https://chatgpt\\.com/c/([0-9a-fA-F-]{16,})", u or "")
     return m.group(1) if m else None
 
+hits=[]
 for t in tabs:
     u=(t.get("url") or "").split("#",1)[0].strip()
     tid=(t.get("id") or "").strip()
@@ -2207,15 +2241,31 @@ for t in tabs:
         continue
     if target_id:
         if chat_id(u)==target_id:
-            print(tid)
-            break
+            hits.append(tid)
     else:
         if u==target:
-            print(tid)
-            break
+            hits.append(tid)
+tab_id = hits[0] if hits else ""
+print(f"{tab_id}\\t{len(hits)}\\t1")
 ' "$target" | head -n 1 || true)"
+    IFS=$'\t' read -r tab_id match_count list_ok <<<"${meta:-}"
+    [[ "$match_count" =~ ^[0-9]+$ ]] || match_count="0"
+    [[ "$list_ok" =~ ^[01]$ ]] || list_ok="0"
+    if [[ "${list_ok}" == "1" ]]; then
+      break
+    fi
+    sleep 0.15
+  done
+
+  if [[ "${list_ok}" != "1" ]]; then
+    echo "W_CDP_TAB_LIST_UNSTABLE skip_open=1 target=${target} run_id=${RUN_ID}" >&2
+    return 0
+  fi
 
   if [[ -n "${tab_id:-}" ]]; then
+    if [[ "${match_count:-0}" -gt 1 ]]; then
+      echo "W_DUPLICATE_CHAT_TABS target=${target} matches=${match_count} action=activate_existing run_id=${RUN_ID}" >&2
+    fi
     curl -fsS "http://127.0.0.1:${CDP_PORT}/json/activate/${tab_id}" >/dev/null 2>&1 || true
   else
     cdp_open_tab "$target" || true

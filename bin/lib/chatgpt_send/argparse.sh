@@ -3,6 +3,14 @@
 chatgpt_send_parse_args() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    step)
+      DO_STEP=1
+      if [[ $# -ge 2 ]] && [[ "${2:-}" != --* ]]; then
+        STEP_ACTION="$2"; shift 2
+      else
+        STEP_ACTION="auto"; shift
+      fi
+      ;;
     --prompt) PROMPT="$2"; shift 2;;
     --prompt-file) PROMPT_FILE="$2"; shift 2;;
     --model) MODEL="$2"; shift 2;;
@@ -14,6 +22,7 @@ while [[ $# -gt 0 ]]; do
     --chrome-path) CHROME_PATH="$2"; shift 2;;
     --chatgpt-url) CHATGPT_URL="$2"; CHATGPT_URL_EXPLICIT=1; shift 2;;
     --chat-id) CHATGPT_URL="https://chatgpt.com/c/$2"; CHATGPT_URL_EXPLICIT=1; shift 2;;
+    --transport) CHATGPT_SEND_TRANSPORT="$2"; shift 2;;
     --probe-chat-url) PROBE_CHAT_URL="$2"; shift 2;;
     --no-state-write) SKIP_STATE_WRITE=1; shift;;
     --init-specialist) INIT_SPECIALIST=1; shift;;
@@ -24,8 +33,22 @@ while [[ $# -gt 0 ]]; do
     --print-chatgpt-url) PRINT_URL=1; shift;;
     --cdp-port) CDP_PORT="$2"; shift 2;;
     --list-chats) LIST_CHATS=1; shift;;
+    --status) DO_STATUS=1; shift;;
+    --explain)
+      DO_EXPLAIN=1
+      if [[ $# -ge 2 ]] && [[ "${2:-}" != --* ]]; then
+        EXPLAIN_TARGET="$2"; shift 2
+      else
+        EXPLAIN_TARGET="latest"; shift
+      fi
+      ;;
+    --step) DO_STEP=1; shift;;
+    --action) STEP_ACTION="$2"; shift 2;;
+    --message) STEP_MESSAGE="$2"; shift 2;;
+    --max-steps) STEP_MAX_STEPS="$2"; shift 2;;
+    --until) STEP_UNTIL="$2"; shift 2;;
     --doctor) DOCTOR=1; shift;;
-    --json) DOCTOR_JSON=1; shift;;
+    --json) OUTPUT_JSON=1; DOCTOR_JSON=1; shift;;
     --cleanup) DO_CLEANUP=1; shift;;
     --graceful-restart-browser) DO_GRACEFUL_RESTART=1; shift;;
     --ack) DO_ACK=1; shift;;

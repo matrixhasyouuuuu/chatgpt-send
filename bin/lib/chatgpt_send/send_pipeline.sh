@@ -384,6 +384,9 @@ FETCH_LAST_LAST_USER_TEXT_SIG=""
 FETCH_LAST_LAST_ASSISTANT_TEXT_SIG=""
 FETCH_LAST_UI_STATE=""
 FETCH_LAST_NORM_VERSION=""
+SEND_BASELINE_LAST_USER_HASH=""
+SEND_BASELINE_LAST_USER_TEXT_SIG=""
+SEND_BASELINE_LAST_ASSISTANT_TAIL_HASH=""
 
 
 RUN_SUMMARY_ENABLED=1
@@ -610,7 +613,89 @@ if [[ -n "${ACK_CHAT_ID:-}" ]] && [[ -n "${PROMPT_HASH:-}" ]]; then
   ack_db_mark_prompt "$ACK_CHAT_ID" "$PROMPT_HASH"
 fi
 
-echo "SEND_BASELINE last_user_hash=${FETCH_LAST_LAST_USER_HASH:-none} last_user_sig=${FETCH_LAST_LAST_USER_TEXT_SIG:-none} run_id=${RUN_ID}" >&2
+# Final dedupe veto before SEND_START. This is the last choke point that must
+# prevent duplicate sends when a previous attempt delivered the prompt but the
+# run/protocol failed before recording normal SEND/REPLY events.
+final_dedupe_prompt_present=0
+if [[ "${NO_BLIND_RESEND}" == "1" ]]; then
+  if fetch_last_via_cdp; then
+    if [[ -n "${PROMPT_HASH:-}" ]] && [[ -n "${FETCH_LAST_LAST_USER_HASH:-}" ]] \
+      && [[ "${FETCH_LAST_LAST_USER_HASH}" == "${PROMPT_HASH}" ]]; then
+      final_dedupe_prompt_present=1
+    fi
+    if [[ $final_dedupe_prompt_present -eq 0 ]] \
+      && [[ -n "${PROMPT_SIG:-}" ]] && [[ -n "${FETCH_LAST_LAST_USER_TEXT_SIG:-}" ]] \
+      && [[ "${FETCH_LAST_LAST_USER_TEXT_SIG}" == "${PROMPT_SIG}" ]]; then
+      final_dedupe_prompt_present=1
+    fi
+  else
+    final_dedupe_fetch_status=$?
+    echo "E_FETCH_LAST_FAILED required=1 stage=final_dedupe_veto status=${final_dedupe_fetch_status} run_id=${RUN_ID}" >&2
+    protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=final_dedupe_fetch_last_failed status=${final_dedupe_fetch_status}"
+    RUN_OUTCOME="final_dedupe_fetch_last_failed"
+    exit 79
+  fi
+
+  if [[ $final_dedupe_prompt_present -eq 1 ]]; then
+    echo "SEND_VETO_DUPLICATE reason=prompt_present_before_send stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} asst_after=${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0} prompt_hash=${PROMPT_HASH:-none} prompt_sig=${PROMPT_SIG:-none} last_user_hash=${FETCH_LAST_LAST_USER_HASH:-none} last_user_sig=${FETCH_LAST_LAST_USER_TEXT_SIG:-none} run_id=${RUN_ID}" >&2
+    protocol_append_event "SEND_VETO_DUPLICATE" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} asst_after=${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0} last_user_sig=${FETCH_LAST_LAST_USER_TEXT_SIG:-none}"
+    if [[ -n "${FETCH_LAST_JSON:-}" ]] && fetch_last_reuse_text_for_prompt "$FETCH_LAST_JSON" "${PROMPT_HASH:-}" >"$out"; then
+      echo "REUSE_EXISTING reason=final_dedupe_prompt_present run_id=${RUN_ID}" >&2
+      protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=final_dedupe_prompt_present"
+      protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=final_dedupe_prompt_present"
+      record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+      RUN_OUTCOME="reuse_existing_final_dedupe_prompt_present"
+      cat "$out"
+      exit 0
+    fi
+    if [[ -n "${FETCH_LAST_JSON:-}" ]] && [[ "${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0}" == "1" ]] \
+      && fetch_last_reuse_text_if_after_anchor "$FETCH_LAST_JSON" >"$out"; then
+      echo "REUSE_EXISTING reason=final_dedupe_prompt_present_after_anchor run_id=${RUN_ID}" >&2
+      protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=final_dedupe_prompt_present_after_anchor"
+      protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=final_dedupe_prompt_present_after_anchor"
+      record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+      RUN_OUTCOME="reuse_existing_final_dedupe_prompt_present_after_anchor"
+      cat "$out"
+      exit 0
+    fi
+    if [[ "${REPLY_POLLING}" == "1" ]]; then
+      set +e
+      reply_wait_collect_via_probe
+      reply_status=$?
+      set -e
+      if [[ $reply_status -eq 0 ]]; then
+        echo "REUSE_EXISTING reason=final_dedupe_prompt_present_wait run_id=${RUN_ID}" >&2
+        protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=final_dedupe_prompt_present_wait"
+        protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=final_dedupe_prompt_present_wait"
+        record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+        RUN_OUTCOME="reuse_existing_final_dedupe_prompt_present_wait"
+        cat "$out"
+        exit 0
+      fi
+      if [[ $reply_status -eq 2 ]]; then
+        protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=final_dedupe_prompt_present_wait route_mismatch"
+        RUN_OUTCOME="final_dedupe_prompt_present_wait_route_mismatch"
+        echo "chatgpt_send failed (final-dedupe wait route mismatch)." >&2
+        exit 2
+      fi
+      if [[ $reply_status -eq 76 ]]; then
+        protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=final_dedupe_prompt_present_wait timeout"
+        RUN_OUTCOME="final_dedupe_prompt_present_wait_timeout"
+        exit 76
+      fi
+    fi
+    echo "E_NO_BLIND_RESEND ledger_state=${LEDGER_PROMPT_STATE:-none} reason=final_dedupe_prompt_present run_id=${RUN_ID}" >&2
+    protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=final_dedupe_prompt_present"
+    capture_evidence_snapshot "E_NO_BLIND_RESEND_FINAL_DEDUPE_PROMPT_PRESENT" || true
+    RUN_OUTCOME="no_blind_resend_final_dedupe_prompt_present"
+    exit 14
+  fi
+fi
+
+SEND_BASELINE_LAST_USER_HASH="${FETCH_LAST_LAST_USER_HASH:-}"
+SEND_BASELINE_LAST_USER_TEXT_SIG="${FETCH_LAST_LAST_USER_TEXT_SIG:-}"
+SEND_BASELINE_LAST_ASSISTANT_TAIL_HASH="${FETCH_LAST_ASSISTANT_TAIL_HASH:-}"
+echo "SEND_BASELINE last_user_hash=${SEND_BASELINE_LAST_USER_HASH:-none} last_user_sig=${SEND_BASELINE_LAST_USER_TEXT_SIG:-none} asst_tail_hash=${SEND_BASELINE_LAST_ASSISTANT_TAIL_HASH:-none} run_id=${RUN_ID}" >&2
 echo "SEND_START prompt_sig=${PROMPT_SIG:-none} prompt_hash=${PROMPT_HASH:-none} ledger_key=${LEDGER_LOOKUP_KEY:-none} norm_version=${NORM_VERSION:-v1} run_id=${RUN_ID}" >&2
 dispatch_preferred="${CHATGPT_SEND_DISPATCH_PREFERRED:-enter}"
 if [[ "${dispatch_preferred}" != "enter" ]] && [[ "${dispatch_preferred}" != "click" ]] && [[ "${dispatch_preferred}" != "button" ]]; then
@@ -701,7 +786,20 @@ if [[ $status -eq 1 ]] && [[ $tab_recover_attempted -eq 1 ]]; then
 fi
 
 if [[ $status -eq 4 ]]; then
+  status4_retry_prompt_present=0
+  status4_retry_fetch_status=0
+  status4_retry_reply_status=0
+  status4_confirm_retry_max="${CHATGPT_SEND_CONFIRM_ONLY_RETRY_ATTEMPTS:-2}"
+  status4_confirm_retry_ms="${CHATGPT_SEND_CONFIRM_ONLY_RETRY_MS:-500}"
+  status4_confirm_retry_i=0
+  status4_confirm_retry_s="0.500"
+  status4_confirm_needs_retry=0
   budget_handled_st=0
+  [[ "${status4_confirm_retry_max}" =~ ^[0-9]+$ ]] || status4_confirm_retry_max=2
+  [[ "${status4_confirm_retry_ms}" =~ ^[0-9]+$ ]] || status4_confirm_retry_ms=500
+  (( status4_confirm_retry_max < 0 )) && status4_confirm_retry_max=0
+  (( status4_confirm_retry_ms < 100 )) && status4_confirm_retry_ms=100
+  status4_confirm_retry_s="$(awk -v ms="${status4_confirm_retry_ms}" 'BEGIN { printf "%.3f", ms/1000 }')"
   if ! timeout_budget_record_event "status4_timeout"; then
     set +e
     timeout_budget_handle_exceeded
@@ -724,12 +822,183 @@ if [[ $status -eq 4 ]]; then
       maybe_cdp_recover "status4_timeout_home_target" "${CHATGPT_URL:-https://chatgpt.com/}" || exit 1
     fi
   fi
-  echo "E_CDP_TIMEOUT_RETRY attempt=1" >&2
+  echo "E_CDP_TIMEOUT_RETRY attempt=1 decision=confirm_only no_resend=1 run_id=${RUN_ID}" >&2
   sleep 0.2
-  set +e
-  run_send_checked "retry_status4_timeout"
-  status=$?
-  set -e
+  if ! fetch_last_via_cdp; then
+    status4_retry_fetch_status=$?
+    echo "E_SEND_RETRY_VETO_INTRA_RUN reason=confirm_fetch_last_failed status=${status4_retry_fetch_status} run_id=${RUN_ID}" >&2
+    protocol_append_event "SEND_RETRY_VETO_INTRA_RUN" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=confirm_fetch_last_failed status=${status4_retry_fetch_status}"
+    protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=retry_status4_timeout confirm_fetch_last_failed status=${status4_retry_fetch_status}"
+    RUN_OUTCOME="send_retry_veto_intra_run_fetch_last_failed"
+    exit 79
+  fi
+  if [[ -n "${PROMPT_HASH:-}" ]] && [[ -n "${FETCH_LAST_LAST_USER_HASH:-}" ]] \
+    && [[ "${FETCH_LAST_LAST_USER_HASH}" == "${PROMPT_HASH}" ]]; then
+    status4_retry_prompt_present=1
+  fi
+  if [[ $status4_retry_prompt_present -eq 0 ]] \
+    && [[ -n "${PROMPT_SIG:-}" ]] && [[ -n "${FETCH_LAST_LAST_USER_TEXT_SIG:-}" ]] \
+    && [[ "${FETCH_LAST_LAST_USER_TEXT_SIG}" == "${PROMPT_SIG}" ]]; then
+    status4_retry_prompt_present=1
+  fi
+  status4_confirm_needs_retry=0
+  if [[ $status4_retry_prompt_present -eq 0 ]]; then
+    if [[ "${FETCH_LAST_TOTAL_MESSAGES:-0}" == "0" ]] || [[ -n "${FETCH_LAST_UI_STATE:-}" && "${FETCH_LAST_UI_STATE:-ok}" != "ok" ]]; then
+      status4_confirm_needs_retry=1
+    fi
+  fi
+  if [[ $status4_retry_prompt_present -eq 1 ]]; then
+    echo "SEND_RETRY_VETO_INTRA_RUN reason=intra_run_retry_after_dispatch prompt_present=1 stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} asst_after=${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0} run_id=${RUN_ID}" >&2
+    protocol_append_event "SEND_RETRY_VETO_INTRA_RUN" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=intra_run_retry_after_dispatch prompt_present=1 stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} asst_after=${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0}"
+    echo "SEND_VETO_DUPLICATE reason=intra_run_retry_after_dispatch stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} asst_after=${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0} prompt_hash=${PROMPT_HASH:-none} prompt_sig=${PROMPT_SIG:-none} last_user_hash=${FETCH_LAST_LAST_USER_HASH:-none} last_user_sig=${FETCH_LAST_LAST_USER_TEXT_SIG:-none} run_id=${RUN_ID}" >&2
+    protocol_append_event "SEND_VETO_DUPLICATE" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=intra_run_retry_after_dispatch stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} asst_after=${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0} last_user_sig=${FETCH_LAST_LAST_USER_TEXT_SIG:-none}"
+    if [[ -n "${FETCH_LAST_JSON:-}" ]] && fetch_last_reuse_text_for_prompt "$FETCH_LAST_JSON" "${PROMPT_HASH:-}" >"$out"; then
+      echo "REUSE_EXISTING reason=intra_run_retry_after_dispatch run_id=${RUN_ID}" >&2
+      protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch"
+      protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch"
+      record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+      RUN_OUTCOME="reuse_existing_intra_run_retry_after_dispatch"
+      cat "$out"
+      exit 0
+    fi
+    if [[ -n "${FETCH_LAST_JSON:-}" ]] && [[ "${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0}" == "1" ]] \
+      && fetch_last_reuse_text_if_after_anchor "$FETCH_LAST_JSON" >"$out"; then
+      echo "REUSE_EXISTING reason=intra_run_retry_after_dispatch_after_anchor run_id=${RUN_ID}" >&2
+      protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch_after_anchor"
+      protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch_after_anchor"
+      record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+      RUN_OUTCOME="reuse_existing_intra_run_retry_after_dispatch_after_anchor"
+      cat "$out"
+      exit 0
+    fi
+    if [[ "${REPLY_POLLING}" == "1" ]]; then
+      set +e
+      reply_wait_collect_via_probe
+      status4_retry_reply_status=$?
+      set -e
+      if [[ $status4_retry_reply_status -eq 0 ]]; then
+        echo "REUSE_EXISTING reason=intra_run_retry_after_dispatch_wait run_id=${RUN_ID}" >&2
+        protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch_wait"
+        protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch_wait"
+        record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+        RUN_OUTCOME="reuse_existing_intra_run_retry_after_dispatch_wait"
+        cat "$out"
+        exit 0
+      fi
+      if [[ $status4_retry_reply_status -eq 2 ]]; then
+        protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=intra_run_retry_after_dispatch_wait route_mismatch"
+        RUN_OUTCOME="intra_run_retry_after_dispatch_wait_route_mismatch"
+        echo "chatgpt_send failed (intra-run retry wait route mismatch)." >&2
+        exit 2
+      fi
+      if [[ $status4_retry_reply_status -eq 76 ]]; then
+        protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=intra_run_retry_after_dispatch_wait timeout"
+        RUN_OUTCOME="intra_run_retry_after_dispatch_wait_timeout"
+        exit 76
+      fi
+    fi
+    echo "E_NO_BLIND_RESEND ledger_state=${LEDGER_PROMPT_STATE:-none} reason=intra_run_retry_after_dispatch run_id=${RUN_ID}" >&2
+    protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=intra_run_retry_after_dispatch"
+    capture_evidence_snapshot "E_NO_BLIND_RESEND_INTRA_RUN_RETRY_AFTER_DISPATCH" || true
+    RUN_OUTCOME="no_blind_resend_intra_run_retry_after_dispatch"
+    exit 14
+  fi
+  while [[ $status4_retry_prompt_present -eq 0 ]] && [[ $status4_confirm_needs_retry -eq 1 ]] && [[ $status4_confirm_retry_i -lt $status4_confirm_retry_max ]]; do
+    status4_confirm_retry_i=$((status4_confirm_retry_i + 1))
+    echo "CONFIRM_LOOP attempt=${status4_confirm_retry_i}/${status4_confirm_retry_max} result=unstable messages=${FETCH_LAST_TOTAL_MESSAGES:-0} ui_state=${FETCH_LAST_UI_STATE:-none} run_id=${RUN_ID}" >&2
+    sleep "${status4_confirm_retry_s}"
+    if ! fetch_last_via_cdp; then
+      status4_retry_fetch_status=$?
+      echo "E_SEND_RETRY_VETO_INTRA_RUN reason=confirm_fetch_last_failed status=${status4_retry_fetch_status} attempt=${status4_confirm_retry_i}/${status4_confirm_retry_max} run_id=${RUN_ID}" >&2
+      protocol_append_event "SEND_RETRY_VETO_INTRA_RUN" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=confirm_fetch_last_failed status=${status4_retry_fetch_status} attempt=${status4_confirm_retry_i}/${status4_confirm_retry_max}"
+      protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=retry_status4_timeout confirm_fetch_last_failed status=${status4_retry_fetch_status}"
+      RUN_OUTCOME="send_retry_veto_intra_run_fetch_last_failed"
+      exit 79
+    fi
+    status4_retry_prompt_present=0
+    if [[ -n "${PROMPT_HASH:-}" ]] && [[ -n "${FETCH_LAST_LAST_USER_HASH:-}" ]] \
+      && [[ "${FETCH_LAST_LAST_USER_HASH}" == "${PROMPT_HASH}" ]]; then
+      status4_retry_prompt_present=1
+    fi
+    if [[ $status4_retry_prompt_present -eq 0 ]] \
+      && [[ -n "${PROMPT_SIG:-}" ]] && [[ -n "${FETCH_LAST_LAST_USER_TEXT_SIG:-}" ]] \
+      && [[ "${FETCH_LAST_LAST_USER_TEXT_SIG}" == "${PROMPT_SIG}" ]]; then
+      status4_retry_prompt_present=1
+    fi
+    if [[ $status4_retry_prompt_present -eq 1 ]]; then
+      echo "CONFIRM_LOOP attempt=${status4_confirm_retry_i}/${status4_confirm_retry_max} result=prompt_present run_id=${RUN_ID}" >&2
+      break
+    fi
+    status4_confirm_needs_retry=0
+    if [[ "${FETCH_LAST_TOTAL_MESSAGES:-0}" == "0" ]] || [[ -n "${FETCH_LAST_UI_STATE:-}" && "${FETCH_LAST_UI_STATE:-ok}" != "ok" ]]; then
+      status4_confirm_needs_retry=1
+      echo "CONFIRM_LOOP attempt=${status4_confirm_retry_i}/${status4_confirm_retry_max} result=still_unstable messages=${FETCH_LAST_TOTAL_MESSAGES:-0} ui_state=${FETCH_LAST_UI_STATE:-none} run_id=${RUN_ID}" >&2
+    else
+      echo "CONFIRM_LOOP attempt=${status4_confirm_retry_i}/${status4_confirm_retry_max} result=stable_prompt_absent messages=${FETCH_LAST_TOTAL_MESSAGES:-0} ui_state=${FETCH_LAST_UI_STATE:-none} run_id=${RUN_ID}" >&2
+    fi
+  done
+  if [[ $status4_retry_prompt_present -eq 1 ]]; then
+    echo "SEND_RETRY_VETO_INTRA_RUN reason=intra_run_retry_after_dispatch prompt_present=1 stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} asst_after=${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0} source=confirm_loop run_id=${RUN_ID}" >&2
+    protocol_append_event "SEND_RETRY_VETO_INTRA_RUN" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=intra_run_retry_after_dispatch prompt_present=1 stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} asst_after=${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0} source=confirm_loop"
+    echo "SEND_VETO_DUPLICATE reason=intra_run_retry_after_dispatch stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} asst_after=${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0} prompt_hash=${PROMPT_HASH:-none} prompt_sig=${PROMPT_SIG:-none} last_user_hash=${FETCH_LAST_LAST_USER_HASH:-none} last_user_sig=${FETCH_LAST_LAST_USER_TEXT_SIG:-none} run_id=${RUN_ID}" >&2
+    protocol_append_event "SEND_VETO_DUPLICATE" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=intra_run_retry_after_dispatch stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} asst_after=${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0} last_user_sig=${FETCH_LAST_LAST_USER_TEXT_SIG:-none}"
+    if [[ -n "${FETCH_LAST_JSON:-}" ]] && fetch_last_reuse_text_for_prompt "$FETCH_LAST_JSON" "${PROMPT_HASH:-}" >"$out"; then
+      echo "REUSE_EXISTING reason=intra_run_retry_after_dispatch run_id=${RUN_ID}" >&2
+      protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch"
+      protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch"
+      record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+      RUN_OUTCOME="reuse_existing_intra_run_retry_after_dispatch"
+      cat "$out"
+      exit 0
+    fi
+    if [[ -n "${FETCH_LAST_JSON:-}" ]] && [[ "${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0}" == "1" ]] \
+      && fetch_last_reuse_text_if_after_anchor "$FETCH_LAST_JSON" >"$out"; then
+      echo "REUSE_EXISTING reason=intra_run_retry_after_dispatch_after_anchor run_id=${RUN_ID}" >&2
+      protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch_after_anchor"
+      protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch_after_anchor"
+      record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+      RUN_OUTCOME="reuse_existing_intra_run_retry_after_dispatch_after_anchor"
+      cat "$out"
+      exit 0
+    fi
+    if [[ "${REPLY_POLLING}" == "1" ]]; then
+      set +e
+      reply_wait_collect_via_probe
+      status4_retry_reply_status=$?
+      set -e
+      if [[ $status4_retry_reply_status -eq 0 ]]; then
+        echo "REUSE_EXISTING reason=intra_run_retry_after_dispatch_wait run_id=${RUN_ID}" >&2
+        protocol_append_event "REUSE_EXISTING" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch_wait"
+        protocol_append_event "REPLY_READY" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "source=intra_run_retry_after_dispatch_wait"
+        record_reply_state_from_output "${ACK_CHAT_ID:-}" "${PROMPT_HASH:-}" "$out"
+        RUN_OUTCOME="reuse_existing_intra_run_retry_after_dispatch_wait"
+        cat "$out"
+        exit 0
+      fi
+      if [[ $status4_retry_reply_status -eq 2 ]]; then
+        protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=intra_run_retry_after_dispatch_wait route_mismatch"
+        RUN_OUTCOME="intra_run_retry_after_dispatch_wait_route_mismatch"
+        echo "chatgpt_send failed (intra-run retry wait route mismatch)." >&2
+        exit 2
+      fi
+      if [[ $status4_retry_reply_status -eq 76 ]]; then
+        protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=intra_run_retry_after_dispatch_wait timeout"
+        RUN_OUTCOME="intra_run_retry_after_dispatch_wait_timeout"
+        exit 76
+      fi
+    fi
+    echo "E_NO_BLIND_RESEND ledger_state=${LEDGER_PROMPT_STATE:-none} reason=intra_run_retry_after_dispatch run_id=${RUN_ID}" >&2
+    protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=intra_run_retry_after_dispatch"
+    capture_evidence_snapshot "E_NO_BLIND_RESEND_INTRA_RUN_RETRY_AFTER_DISPATCH" || true
+    RUN_OUTCOME="no_blind_resend_intra_run_retry_after_dispatch"
+    exit 14
+  fi
+  echo "SEND_RETRY_VETO_INTRA_RUN reason=intra_run_retry_after_dispatch prompt_present=0 decision=confirm_only_no_resend run_id=${RUN_ID}" >&2
+  protocol_append_event "SEND_RETRY_VETO_INTRA_RUN" "ok" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "reason=intra_run_retry_after_dispatch prompt_present=0 decision=confirm_only_no_resend"
+  echo "E_SEND_RETRY_VETO_INTRA_RUN reason=prompt_not_confirmed_no_resend run_id=${RUN_ID}" >&2
+  protocol_append_event "FAIL" "fail" "$PROMPT_HASH" "${FETCH_LAST_CHECKPOINT_ID:-}" "stage=retry_status4_timeout prompt_not_confirmed_no_resend"
+  RUN_OUTCOME="send_retry_veto_intra_run_unconfirmed"
+  exit 81
 fi
 
 if [[ $status -ne 0 ]]; then

@@ -297,8 +297,9 @@ late_reply_recover_via_fetch_last() {
   local elapsed_ms="${2:-0}"
   local trigger="${3:-unknown}"
   local grace_sec max_sec poll_ms stable_need poll_s start_ms now_ms max_ms hard_max_ms soft_deadline_ms
-  local tmp st fields f_url f_user_tail f_asst_tail f_ckpt f_user_hash f_after_anchor
-  local candidate stable_ticks prev_hash checkpoint_id_write
+  local tmp st fields diag_fields f_url f_user_tail f_asst_tail f_ckpt f_user_hash f_after_anchor
+  local f_total f_stop f_last_user_sig f_last_asst_sig f_chat_id f_ui_contract f_fingerprint f_last_user_text_sig f_last_asst_text_sig f_ui_state f_norm_version
+  local candidate stable_ticks prev_hash checkpoint_id_write candidate_reason strict_user_match fallback_user_changed
 
   grace_sec="${LATE_REPLY_GRACE_SEC:-30}"
   max_sec="${LATE_REPLY_MAX_SEC:-120}"
@@ -358,10 +359,39 @@ late_reply_recover_via_fetch_last() {
       continue
     fi
     IFS=$'\x1f' read -r f_url f_user_tail f_asst_tail f_ckpt f_user_hash f_after_anchor <<<"$fields"
+    diag_fields="$(fetch_last_extract_diag_fields "$tmp" || true)"
+    if [[ -n "${diag_fields:-}" ]]; then
+      IFS=$'\x1f' read -r f_total f_stop f_last_user_sig f_last_asst_sig f_chat_id f_ui_contract f_fingerprint f_last_user_text_sig f_last_asst_text_sig f_ui_state f_norm_version <<<"$diag_fields"
+    else
+      f_last_user_text_sig=""
+    fi
 
     candidate=0
-    if [[ "${f_after_anchor}" == "1" ]] && [[ -n "${f_asst_tail:-}" ]] && [[ "${f_user_hash:-}" == "${PROMPT_HASH:-}" ]]; then
+    candidate_reason="none"
+    strict_user_match=0
+    fallback_user_changed=0
+    if [[ -n "${PROMPT_HASH:-}" ]] && [[ "${f_user_hash:-}" == "${PROMPT_HASH:-}" ]]; then
+      strict_user_match=1
+    fi
+    # Fallback for markdown/rendered user text drift: DOM-rendered user text may
+    # differ from raw prompt bytes (e.g., inline code/backticks stripped in UI text),
+    # so strict prompt hash can fail even when the send definitely succeeded.
+    # Only allow this in late-recovery when we can prove a new user message exists
+    # relative to the pre-send baseline captured before dispatch.
+    if [[ $strict_user_match -eq 0 ]] \
+      && [[ -n "${f_user_hash:-}" ]] \
+      && { [[ -n "${SEND_BASELINE_LAST_USER_HASH:-}" ]] || [[ -n "${SEND_BASELINE_LAST_USER_TEXT_SIG:-}" ]]; } \
+      && { [[ "${f_user_hash:-}" != "${SEND_BASELINE_LAST_USER_HASH:-}" ]] || [[ "${f_last_user_text_sig:-}" != "${SEND_BASELINE_LAST_USER_TEXT_SIG:-}" ]]; }; then
+      fallback_user_changed=1
+    fi
+
+    if [[ "${f_after_anchor}" == "1" ]] && [[ -n "${f_asst_tail:-}" ]] && [[ $strict_user_match -eq 1 || $fallback_user_changed -eq 1 ]]; then
       candidate=1
+      if [[ $strict_user_match -eq 1 ]]; then
+        candidate_reason="prompt_hash"
+      else
+        candidate_reason="baseline_user_changed"
+      fi
       if [[ "${f_asst_tail}" == "${prev_hash}" ]]; then
         stable_ticks=$((stable_ticks + 1))
       else
@@ -376,16 +406,24 @@ late_reply_recover_via_fetch_last() {
       prev_hash=""
     fi
 
-    echo "REPLY_LATE_RECOVERY tick candidate=${candidate} stable_ticks=${stable_ticks} hash=${f_asst_tail:-none} run_id=${RUN_ID}" >&2
+    echo "REPLY_LATE_RECOVERY tick candidate=${candidate} reason=${candidate_reason} stable_ticks=${stable_ticks} hash=${f_asst_tail:-none} user_hash=${f_user_hash:-none} user_sig=${f_last_user_text_sig:-none} run_id=${RUN_ID}" >&2
     if (( candidate == 1 )) && (( stable_ticks >= stable_need )); then
-      if fetch_last_reuse_text_for_prompt "$tmp" "${PROMPT_HASH:-}" >"$out"; then
+      if [[ "$candidate_reason" == "prompt_hash" ]]; then
+        fetch_last_reuse_text_for_prompt "$tmp" "${PROMPT_HASH:-}" >"$out"
+      else
+        fetch_last_reuse_text_if_after_anchor "$tmp" >"$out"
+      fi
+      if [[ $? -eq 0 ]]; then
         checkpoint_id_write="$(write_last_specialist_checkpoint_from_fetch "$tmp" 2>/dev/null | head -n 1 || true)"
         if [[ -n "${checkpoint_id_write:-}" ]]; then
           FETCH_LAST_CHECKPOINT_ID="$checkpoint_id_write"
         elif [[ -n "${f_ckpt:-}" ]]; then
           FETCH_LAST_CHECKPOINT_ID="$f_ckpt"
         fi
-        echo "REPLY_CAPTURE reuse_existing=1 source=late_recovery class=${timeout_class} run_id=${RUN_ID}" >&2
+        if [[ "$candidate_reason" != "prompt_hash" ]]; then
+          echo "W_REPLY_LATE_RECOVERY_FALLBACK_MATCH reason=${candidate_reason} baseline_user_hash=${SEND_BASELINE_LAST_USER_HASH:-none} current_user_hash=${f_user_hash:-none} baseline_user_sig=${SEND_BASELINE_LAST_USER_TEXT_SIG:-none} current_user_sig=${f_last_user_text_sig:-none} run_id=${RUN_ID}" >&2
+        fi
+        echo "REPLY_CAPTURE reuse_existing=1 source=late_recovery class=${timeout_class} match=${candidate_reason} run_id=${RUN_ID}" >&2
         echo "W_REPLY_LATE_ARRIVAL class=${timeout_class} elapsed_ms=${elapsed_ms} trigger=${trigger} run_id=${RUN_ID}" >&2
         rm -f "$tmp"
         return 0
@@ -414,6 +452,7 @@ contract_probe_via_cdp() {
 
 precheck_auto_wait_loop() {
   local max_sec poll_ms poll_s start_ms now elapsed_ms max_ms precheck_status
+  local auto_wait_fetch_status auto_wait_prompt_present auto_wait_reuse_ok
   max_sec="$AUTO_WAIT_MAX_SEC"
   poll_ms="$AUTO_WAIT_POLL_MS"
   [[ "$max_sec" =~ ^[0-9]+$ ]] || max_sec=60
@@ -447,6 +486,38 @@ precheck_auto_wait_loop() {
       return 0
     fi
     if [[ $precheck_status -eq 10 ]]; then
+      auto_wait_prompt_present=0
+      auto_wait_reuse_ok=0
+      if fetch_last_via_cdp; then
+        if [[ -n "${PROMPT_HASH:-}" ]] && [[ -n "${FETCH_LAST_LAST_USER_HASH:-}" ]] \
+          && [[ "${FETCH_LAST_LAST_USER_HASH}" == "${PROMPT_HASH}" ]]; then
+          auto_wait_prompt_present=1
+        fi
+        if [[ $auto_wait_prompt_present -eq 0 ]] \
+          && [[ -n "${PROMPT_SIG:-}" ]] && [[ -n "${FETCH_LAST_LAST_USER_TEXT_SIG:-}" ]] \
+          && [[ "${FETCH_LAST_LAST_USER_TEXT_SIG}" == "${PROMPT_SIG}" ]]; then
+          auto_wait_prompt_present=1
+        fi
+        if [[ $auto_wait_prompt_present -eq 1 ]]; then
+          if [[ -n "${FETCH_LAST_JSON:-}" ]]; then
+            if fetch_last_reuse_text_for_prompt "$FETCH_LAST_JSON" "${PROMPT_HASH:-}" >"$out"; then
+              auto_wait_reuse_ok=1
+            elif [[ "${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0}" == "1" ]] \
+              && fetch_last_reuse_text_if_after_anchor "$FETCH_LAST_JSON" >"$out"; then
+              auto_wait_reuse_ok=1
+            fi
+          fi
+          if [[ $auto_wait_reuse_ok -eq 1 ]]; then
+            echo "AUTO_WAIT done outcome=reuse_prompt_present elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+            return 0
+          fi
+          echo "AUTO_WAIT veto outcome=wait reason=prompt_present stop_visible=${FETCH_LAST_STOP_VISIBLE:-0} asst_after=${FETCH_LAST_ASSISTANT_AFTER_LAST_USER:-0} elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+          continue
+        fi
+      else
+        auto_wait_fetch_status=$?
+        echo "AUTO_WAIT warn fetch_last_status=${auto_wait_fetch_status} phase=pre_send_dedupe elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
+      fi
       echo "AUTO_WAIT done outcome=send elapsed_ms=${elapsed_ms} run_id=${RUN_ID}" >&2
       return 10
     fi
@@ -757,6 +828,15 @@ with open(out, "w", encoding="utf-8") as f:
     json.dump(obj, f, ensure_ascii=False, sort_keys=True)
 PY
 
+  if [[ "$cdp_ok" == "1" ]]; then
+    python3 "$ROOT/bin/cdp_chatgpt.py" \
+      --cdp-port "$CDP_PORT" \
+      --chatgpt-url "${CHATGPT_URL:-https://chatgpt.com/}" \
+      --timeout "20" \
+      --prompt "$PROMPT" \
+      --fetch-last --fetch-last-n 8 >"$ev_dir/fetch_last.json" 2>"$ev_dir/fetch_last.log" || true
+  fi
+
   chrome_pid=""
   if [[ -f "$ROOT/state/chrome_${CDP_PORT}.pid" ]]; then
     chrome_pid="$(cat "$ROOT/state/chrome_${CDP_PORT}.pid" 2>/dev/null | tr -d '\n' || true)"
@@ -839,6 +919,8 @@ PY
   sanitize_file_inplace "$version_json"
   sanitize_file_inplace "$ev_dir/contract.json"
   sanitize_file_inplace "$ev_dir/probe_last.json"
+  sanitize_file_inplace "$ev_dir/fetch_last.json"
+  sanitize_file_inplace "$ev_dir/fetch_last.log"
   sanitize_file_inplace "$ev_dir/process.json"
   sanitize_file_inplace "$ev_dir/doctor.jsonl"
   sanitize_file_inplace "$ops_json"

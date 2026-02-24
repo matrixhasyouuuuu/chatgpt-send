@@ -126,6 +126,15 @@ def short_text(s: str, limit: int = 180) -> str:
     return t[:limit]
 
 
+def read_text(path: pathlib.Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
 def md_escape(s: str) -> str:
     return (s or "").replace("|", "\\|")
 
@@ -173,6 +182,34 @@ max_last_lines = as_int(sys.argv[6], 80)
 include_logs = sys.argv[7] == "1"
 gate_status = (sys.argv[8] or "").strip()
 gate_reason = (sys.argv[9] or "").strip()
+early_abort_flag_path = pool_run_dir / ".early_abort"
+early_abort_reason_path = pool_run_dir / ".early_abort.reason"
+early_abort_ids_path = pool_run_dir / ".early_abort.ids"
+early_abort_meta_path = pool_run_dir / "early_abort.meta.json"
+early_abort_reason = short_text(read_text(early_abort_reason_path), 400)
+early_abort_meta = read_json(early_abort_meta_path, {})
+early_abort_ids: List[Dict[str, str]] = []
+if early_abort_ids_path.exists():
+    for raw in read_text(early_abort_ids_path).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        agent_id = parts[0].strip() if len(parts) >= 1 else ""
+        run_id = parts[1].strip() if len(parts) >= 2 else ""
+        state_class = parts[2].strip() if len(parts) >= 3 else ""
+        early_abort_ids.append(
+            {"agent_id": agent_id, "run_id": run_id, "state_class": state_class}
+        )
+early_abort_blame_agents = {
+    row["agent_id"] for row in early_abort_ids if row.get("agent_id", "")
+}
+early_abort_triggered = int(
+    early_abort_flag_path.exists()
+    or bool(early_abort_reason)
+    or bool(early_abort_ids)
+    or bool(early_abort_meta)
+)
 
 fleet = read_json(fleet_summary_path, {})
 fleet_agents = fleet.get("agents") if isinstance(fleet, dict) else []
@@ -220,6 +257,7 @@ for idx, agent in enumerate(fleet_agents, start=1):
         "last_file": str(last_file),
         "log_file": str(agent.get("log_file", "") or ""),
         "result_json": str(result_json),
+        "early_abort_blame": 1 if str(agent.get("agent_id", "") or "") in early_abort_blame_agents else 0,
     }
     rows.append(row)
 
@@ -260,6 +298,19 @@ report_obj = {
     "totals": totals,
     "rows": rows,
     "failures": fail_rows,
+    "early_abort": {
+        "triggered": early_abort_triggered,
+        "reason": early_abort_reason,
+        "ids_count": len(early_abort_ids),
+        "ids": early_abort_ids,
+        "meta": early_abort_meta if isinstance(early_abort_meta, dict) else {},
+        "files": {
+            "flag": str(early_abort_flag_path),
+            "reason": str(early_abort_reason_path),
+            "ids": str(early_abort_ids_path),
+            "meta_json": str(early_abort_meta_path),
+        },
+    },
     "sources": {
         "fleet_summary_json": str(fleet_summary_path),
         "summary_jsonl": str(summary_jsonl_path),
@@ -289,10 +340,44 @@ md_lines.append(f"- `chat_unknown`: `{totals['chat_unknown_total']}`")
 md_lines.append(f"- `disk_status`: `{totals['disk_status']}`")
 md_lines.append(f"- `disk_free_pct`: `{totals['disk_free_pct']}`")
 md_lines.append("")
+md_lines.append("## Early Abort")
+md_lines.append("")
+md_lines.append(f"- `triggered`: `{report_obj['early_abort']['triggered']}`")
+md_lines.append(f"- `reason`: `{report_obj['early_abort']['reason'] or 'none'}`")
+md_lines.append(f"- `ids_count`: `{report_obj['early_abort']['ids_count']}`")
+if isinstance(report_obj["early_abort"]["meta"], dict) and report_obj["early_abort"]["meta"]:
+    meta = report_obj["early_abort"]["meta"]
+    meta_line = ", ".join(
+        [
+            f"reason={meta.get('reason', 'none')}",
+            f"stuck={meta.get('stuck', 0)}",
+            f"orphaned={meta.get('orphaned', 0)}",
+            f"confirm_ticks={meta.get('confirm_ticks', 0)}",
+            f"bad_ticks={meta.get('bad_ticks', 0)}",
+        ]
+    )
+    md_lines.append(f"- `meta`: `{meta_line}`")
+if report_obj["early_abort"]["ids"]:
+    md_lines.append("")
+    md_lines.append("| blame_agent_id | run_id | state_class |")
+    md_lines.append("| --- | --- | --- |")
+    for blame in report_obj["early_abort"]["ids"]:
+        md_lines.append(
+            "| "
+            + " | ".join(
+                [
+                    md_escape(str(blame.get("agent_id", ""))),
+                    md_escape(str(blame.get("run_id", ""))),
+                    md_escape(str(blame.get("state_class", ""))),
+                ]
+            )
+            + " |"
+        )
+md_lines.append("")
 md_lines.append("## Agents")
 md_lines.append("")
-md_lines.append("| idx | run_id | attempt | state | exit_code | duration_sec | chat_proof | assigned_chat | observed_chat | result_preview |")
-md_lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+md_lines.append("| idx | run_id | attempt | state | exit_code | duration_sec | chat_proof | early_abort_blame | assigned_chat | observed_chat | result_preview |")
+md_lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
 for row in rows:
     md_lines.append(
         "| "
@@ -305,6 +390,7 @@ for row in rows:
                 md_escape(str(row.get("exit_code", ""))),
                 md_escape(str(row.get("duration_sec", ""))),
                 md_escape(str(row.get("chat_proof", ""))),
+                md_escape(str(row.get("early_abort_blame", 0))),
                 md_escape(str(row.get("assigned_chat_url_norm", ""))),
                 md_escape(str(row.get("observed_chat_url_norm", ""))),
                 md_escape(str(row.get("preview", ""))),
@@ -324,6 +410,8 @@ if fail_rows:
             f"chat_proof={row.get('chat_proof')}",
             f"reason={row.get('reason')}",
         ]
+        if row.get("early_abort_blame") == 1:
+            parts.append("early_abort_blame=1")
         if row.get("assigned_chat_url_norm"):
             parts.append(f"assigned={row.get('assigned_chat_url_norm')}")
         if row.get("observed_chat_url_norm"):

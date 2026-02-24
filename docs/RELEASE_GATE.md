@@ -52,7 +52,19 @@ bash test/test_child_fleet_monitor_chat_proof_mismatch.sh
 bash test/test_chat_pool_manager_check.sh
 bash test/test_chat_pool_manage_validate.sh
 bash test/test_chat_pool_manage_extract_from_state.sh
+bash test/test_chat_pool_precheck_mock_all_ok.sh
+bash test/test_chat_pool_precheck_mock_one_fail.sh
+bash test/test_live_preflight_requires_precheck_for_scale.sh
+bash test/test_fleet_follow_once_renders_counts.sh
+bash test/test_fleet_follow_waits_for_summary.sh
+bash test/test_agent_pool_follow_streams_progress_to_cli.sh
+bash test/test_agent_pool_early_gate_triggers_on_stuck.sh
+bash test/test_agent_pool_early_gate_no_flap_on_transient_unknown.sh
+bash test/test_agent_pool_early_gate_confirm_ticks_prevents_single_tick_abort.sh
+bash test/test_agent_pool_early_gate_confirm_ticks_triggers_on_two_ticks.sh
+bash test/test_agent_pool_early_abort_then_retry_retryables.sh
 bash test/test_agent_pool_mock_5_agents.sh
+bash test/test_agent_pool_follow_mock_5_agents.sh
 bash test/test_agent_pool_auto_monitor_watchdog.sh
 bash test/test_agent_pool_single_flight_lock.sh
 bash test/test_agent_pool_interrupt_cleanup.sh
@@ -60,6 +72,7 @@ bash test/test_fleet_gc_prunes_old_runs.sh
 bash test/test_agent_pool_gc_auto_forced.sh
 bash test/test_pool_report_md_from_mock_pool.sh
 bash test/test_pool_report_includes_failures_section.sh
+bash test/test_pool_report_includes_early_abort_section.sh
 bash test/test_agent_pool_roster_survives_registry_skip.sh
 bash test/test_agent_pool_fleet_gate_incomplete_roster.sh
 bash test/test_agent_pool_gate_chat_mismatch_fails_strict.sh
@@ -101,6 +114,7 @@ bash test/test_chat_pool_manager_probe_live_2.sh
 # собрать и проверить pool из state/chats.json (пример)
 bash scripts/chat_pool_manage.sh extract --out state/chat_pool_e2e_10.txt --count 10
 bash scripts/chat_pool_manage.sh validate --chat-pool-file state/chat_pool_e2e_10.txt --min 10
+bash scripts/live_chat_pool_precheck.sh --chat-pool-file state/chat_pool_e2e_10.txt --concurrency 10
 
 # единый демонстрационный прогон preflight + bootstrap-once + smoke + parallel
 bash scripts/run_live_multi_agent_demo.sh
@@ -111,9 +125,11 @@ bash scripts/run_live_multi_agent_demo.sh
 `scripts/live_preflight.sh` теперь дополнительно печатает:
 - `OK_E2E_CHAT_URL`, `E2E_CHAT_URL`,
 - `OK_CHAT_POOL`, `CHAT_POOL_COUNT`,
+- `OK_CHAT_POOL_PRECHECK`, `CHAT_POOL_PRECHECK_STATUS`, `CHAT_POOL_PRECHECK_SUMMARY_JSON`,
 - `LIVE_CHAT_SOURCE`, `LIVE_CHAT_URL`,
 - и завершает `exit 14`, если не найден ни e2e/work/pool chat.
 - и завершает `exit 15`, если `LIVE_CONCURRENCY>=5` и не задан `LIVE_CHAT_POOL_FILE`.
+- и завершает `exit 16`, если per-chat precheck пула не прошёл (`E_CHAT_POOL_PRECHECK_FAILED`).
 
 `scripts/live_specialist_bootstrap_once.sh` отправляет bootstrap в live чат не чаще TTL (по умолчанию 24h) и пишет маркеры:
 - `BOOTSTRAP_ONCE send ...`

@@ -86,6 +86,26 @@ In practice this means:
 
 If you want the longer pitch + examples (for sharing), see: `docs/WHY.md`.
 
+## AI Agent Integration (JSON-first)
+
+If another CLI/AI agent needs to use this tool, the easiest path is the UX facade + JSON outputs:
+
+```bash
+chatgpt_send --status --json
+chatgpt_send --explain latest --json
+chatgpt_send step read --json
+chatgpt_send step send --message "..."
+chatgpt_send --ack
+```
+
+Docs for integrations:
+
+- `AGENTS.md` (quick rules / safety model / loop)
+- `docs/AI_AGENT_INTEGRATION.md` (practical integration flow)
+- `docs/JSON_CONTRACTS.md` (`status.v1`, `explain.v1`, `step.v1`)
+- `docs/ERRORS.md` (common `E_*` and handling)
+- `docs/ENV_FLAGS.md` (runtime/planner flags)
+
 ## Requirements
 
 - Linux + Chrome/Chromium (other OS can work but you'll likely need a custom `--chrome-path`)
@@ -287,6 +307,14 @@ Then run live demo directly in pool mode:
 RUN_LIVE_CDP_E2E=1 LIVE_CONCURRENCY=10 LIVE_CHAT_POOL_FILE=state/chat_pool_e2e_10.txt \
   ./scripts/run_live_multi_agent_demo.sh
 ```
+
+Optional but recommended before large live runs:
+
+```bash
+./scripts/live_chat_pool_precheck.sh --chat-pool-file state/chat_pool_e2e_10.txt --concurrency 10
+```
+
+This uses read-only chat probes (`chatgpt_send --probe-chat-url ... --no-state-write`) and fails fast if at least one chat is not ready.
 
 </details>
 

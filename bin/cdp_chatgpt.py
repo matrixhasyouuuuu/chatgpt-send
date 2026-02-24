@@ -18,6 +18,9 @@ ACTIVITY_TIMEOUT_SEC = float(os.environ.get("CHATGPT_SEND_ACTIVITY_TIMEOUT_SEC",
 STALE_STOP_SEC = float(os.environ.get("CHATGPT_SEND_STALE_STOP_SEC", "8"))
 STALE_STOP_POLL_SEC = float(os.environ.get("CHATGPT_SEND_STALE_STOP_POLL_SEC", "0.4"))
 PRE_SEND_IDLE_STOP_TIMEOUT_SEC = float(os.environ.get("CHATGPT_SEND_PRE_SEND_IDLE_STOP_TIMEOUT_SEC", "10"))
+BUSY_POLICY = (os.environ.get("CHATGPT_SEND_BUSY_POLICY", "auto_stop") or "auto_stop").strip().lower()
+BUSY_TIMEOUT_SEC = float(os.environ.get("CHATGPT_SEND_BUSY_TIMEOUT_SEC", "20"))
+BUSY_STOP_RETRIES = int(os.environ.get("CHATGPT_SEND_BUSY_STOP_RETRIES", "2"))
 REPLY_STUCK_STOP_SEC = float(os.environ.get("CHATGPT_SEND_REPLY_STUCK_STOP_SEC", "10"))
 ASSISTANT_STABILITY_SEC = float(os.environ.get("CHATGPT_SEND_ASSISTANT_STABILITY_SEC", "0.9"))
 ASSISTANT_PROBE_STABILITY_SEC = float(os.environ.get("CHATGPT_SEND_ASSISTANT_PROBE_STABILITY_SEC", "0.4"))
@@ -254,6 +257,21 @@ def js_fetch_last_expr(limit: int) -> str:
     form.querySelector('button[aria-label="Send prompt"]') ||
     form.querySelector('button[aria-label*="Send"]') ||
     form.querySelector('button[type="submit"]');
+  const composerRaw = (composer && (composer.innerText || composer.textContent)) ? (composer.innerText || composer.textContent) : '';
+  const composerNorm = (composerRaw || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+  const activeEl = document.activeElement;
+  const activeInfo = activeEl ? {{
+    tag: activeEl.tagName || '',
+    role: activeEl.getAttribute ? (activeEl.getAttribute('role') || '') : '',
+    ariaLabel: activeEl.getAttribute ? (activeEl.getAttribute('aria-label') || '') : '',
+    id: activeEl.id || '',
+    className: activeEl.className || '',
+  }} : null;
+  const dialog =
+    q('[role=\"dialog\"]') ||
+    q('[aria-modal=\"true\"]') ||
+    q('.modal, .dialog, .overlay');
+  const dialogText = dialog ? text(dialog).slice(0, 200) : '';
   const bodyText = ((document.body && (document.body.innerText || document.body.textContent)) || '').toLowerCase();
   const hasLoginText = /\\b(log in|sign in)\\b/.test(bodyText);
   const hasCaptchaText = /(verify you are human|captcha|cloudflare|checking your browser)/.test(bodyText);
@@ -303,9 +321,21 @@ def js_fetch_last_expr(limit: int) -> str:
   const selected = lim > 0 ? all.slice(-lim) : all;
   return {{
     url: location.href,
+    title: document.title || '',
+    visibilityState: document.visibilityState || '',
+    hasFocus: (document.hasFocus && document.hasFocus()) ? true : false,
+    activeElement: activeInfo,
     stopVisible: !!stop,
     hasComposer: !!composer,
     hasSendButton: !!sendBtn,
+    sendEnabled: !!(sendBtn && !sendBtn.disabled),
+    composerLen: composerNorm.length,
+    dialogPresent: !!dialog,
+    dialogText: dialogText,
+    loginDetected: !!(hasLoginForm || hasLoginText),
+    captchaDetected: !!(hasCaptchaMarker || hasCaptchaText),
+    offlineDetected: !!hasOfflineText,
+    errorBannerDetected: !!hasErrorBanner,
     ui_state_hint: uiState,
     total: all.length,
     limit: lim,
@@ -681,6 +711,39 @@ def wait_for_stop_hidden(cdp: CDP, timeout_s: float) -> bool:
         if not bool(st.get("stopVisible")):
             return True
         time.sleep(0.25)
+    return False
+
+
+def pre_send_busy_policy(cdp: CDP, target_url: str) -> bool:
+    policy = (BUSY_POLICY or "auto_stop").strip().lower()
+    if policy not in ("auto_stop", "wait", "fail"):
+        error_marker("E_BUSY_POLICY_INVALID", f"policy={policy}")
+        policy = "auto_stop"
+    ready_expr = js_send_ready_expr()
+    st = cdp.eval(ready_expr, timeout=10.0) or {}
+    stop_visible = bool(st.get("stopVisible"))
+    if not stop_visible:
+        return True
+    error_marker("BUSY_GENERATING", f"stop_visible=1 policy={policy}")
+    if policy == "fail":
+        error_marker("E_CHAT_BUSY_GENERATING", "policy=fail")
+        return False
+    timeout_s = max(1.0, float(BUSY_TIMEOUT_SEC))
+    if policy == "wait":
+        if wait_for_stop_hidden(cdp, timeout_s=timeout_s):
+            error_marker("BUSY_WAIT_CLEARED", f"wait_sec={timeout_s:.0f}")
+            return True
+        error_marker("E_CHAT_BUSY_GENERATING", f"policy=wait timeout_sec={timeout_s:.0f}")
+        return False
+    retries = max(1, int(BUSY_STOP_RETRIES))
+    for attempt in range(1, retries + 1):
+        click_res = cdp.eval(js_click_stop_expr(), timeout=10.0) or {}
+        if bool(click_res.get("clicked")):
+            error_marker("BUSY_STOP_CLICKED", f"attempt={attempt}")
+        if wait_for_stop_hidden(cdp, timeout_s=timeout_s):
+            error_marker("BUSY_STOP_CLEARED", f"attempt={attempt}")
+            return True
+    error_marker("E_CHAT_BUSY_GENERATING", f"policy=auto_stop retries={retries} timeout_sec={timeout_s:.0f}")
     return False
 
 
@@ -1107,6 +1170,20 @@ def fetch_last_messages(cdp: CDP, target_url: str, limit: int = 6) -> dict:
         raise RuntimeError(f"UI not ready: ui_state={ui_state}")
     has_editor = bool(ready.get("hasEditor"))
     has_send = bool(ready.get("hasSend"))
+    ui_diag = {
+        "title": (st.get("title") or ""),
+        "visibility_state": (st.get("visibilityState") or ""),
+        "has_focus": bool(st.get("hasFocus")) if st.get("hasFocus") is not None else None,
+        "active_element": st.get("activeElement") or {},
+        "composer_len": int(st.get("composerLen") or 0),
+        "send_enabled": bool(st.get("sendEnabled")),
+        "dialog_present": bool(st.get("dialogPresent")),
+        "dialog_text": (st.get("dialogText") or ""),
+        "login_detected": bool(st.get("loginDetected")),
+        "captcha_detected": bool(st.get("captchaDetected")),
+        "offline_detected": bool(st.get("offlineDetected")),
+        "error_banner_detected": bool(st.get("errorBannerDetected")),
+    }
     ui_contract_sig = (
         f"schema={UI_CONTRACT_SCHEMA_VERSION}"
         f"|composer={1 if has_editor else 0}"
@@ -1149,6 +1226,7 @@ def fetch_last_messages(cdp: CDP, target_url: str, limit: int = 6) -> dict:
         "stop_visible": stop_visible,
         "total_messages": total_messages,
         "limit": n,
+        "ui_diag": ui_diag,
         "assistant_after_last_user": bool(assistant_after_last_user),
         "last_user_text": last_user,
         "last_user_text_sig": last_user_text_sig,
@@ -1480,6 +1558,9 @@ def main() -> int:
                 f" assistant_tail_hash={tail_hash or 'none'}"
                 f" stop_visible={1 if stop_visible else 0}",
             )
+            if stop_visible:
+                error_marker("REPLY_READY", "0 reason=stop_visible")
+                return 10
             if not should_skip_duplicate_send(args.prompt, st):
                 error_marker("REPLY_READY", "0 reason=prompt_not_echoed")
                 return 10
@@ -1495,9 +1576,6 @@ def main() -> int:
                     return 0
                 error_marker("REPLY_READY", "0 reason=assistant_unstable")
                 return 10
-            if stop_visible:
-                error_marker("REPLY_READY", "0 reason=stop_visible")
-                return 10
             if existing_answer:
                 error_marker("REPLY_READY", "0 reason=assistant_before_anchor")
                 return 10
@@ -1511,6 +1589,9 @@ def main() -> int:
             return 0 if ok else 22
 
         t_send_start = time.time()
+        # Handle active generation before sending, based on policy.
+        if not pre_send_busy_policy(cdp, args.chatgpt_url):
+            return 11
         # If ChatGPT is still generating previous answer, wait before sending.
         wait_until_send_ready(cdp, timeout_s=min(float(args.timeout), 300.0))
         if not pre_send_idle_gate(cdp, args.chatgpt_url, timeout_s=PRE_SEND_IDLE_STOP_TIMEOUT_SEC):
@@ -1648,8 +1729,16 @@ def main() -> int:
             user_count = int(st.get("userCount") or 0)
             user_sig = (st.get("lastUserSig") or "").strip()
             stop_visible = bool(st.get("stopVisible"))
-            if user_count > b_user or (user_sig and user_sig != b_user_sig) or (stop_visible and not b_stop):
-                error_marker("E_MESSAGE_NOT_ECHOED_SOFT", "using_dispatch_anchor")
+            diag = cdp.eval(js_send_ready_expr(), timeout=10.0) or {}
+            composer_len = int(diag.get("composerLen") or 0)
+            send_cleared = composer_len == 0
+            if user_count > b_user or (user_sig and user_sig != b_user_sig) or (stop_visible and not b_stop) or send_cleared:
+                error_marker(
+                    "E_MESSAGE_NOT_ECHOED_SOFT",
+                    "using_dispatch_anchor"
+                    f" send_cleared={1 if send_cleared else 0}"
+                    f" stop_visible={1 if stop_visible else 0}",
+                )
                 baseline = st if st else baseline
             else:
                 error_marker("E_MESSAGE_NOT_ECHOED", "post-verify-anchor-missing")
