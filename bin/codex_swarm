@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PATCHED_CODEX_BIN="${PATCHED_CODEX_BIN:-/tmp/openai-codex/codex-rs/target/release/codex}"
+SWARM_STATUS_FILE="${CODEX_SWARM_STATUS_FILE:-/tmp/codex-swarm-status.json}"
+SWARM_STATUS_POLL_MS="${CODEX_SWARM_STATUS_POLL_MS:-500}"
+
+if [[ ! -x "$PATCHED_CODEX_BIN" ]]; then
+  echo "patched codex binary not found: $PATCHED_CODEX_BIN" >&2
+  echo "Build it first, then run this wrapper again." >&2
+  exit 127
+fi
+
+export CODEX_SWARM_STATUS_FILE="$SWARM_STATUS_FILE"
+export CODEX_SWARM_STATUS_POLL_MS="$SWARM_STATUS_POLL_MS"
+
+exec "$PATCHED_CODEX_BIN" "$@"

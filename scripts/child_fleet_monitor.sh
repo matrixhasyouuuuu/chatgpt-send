@@ -21,6 +21,9 @@ Options:
   --registry-file FILE (default: <pool-run-dir>/fleet_registry.jsonl)
   --roster-jsonl FILE  (default: <pool-run-dir>/fleet_roster.jsonl)
   --lock-file FILE     (default: <pool-run-dir>/fleet.monitor.lock)
+  Env passthrough:
+    CODEX_SWARM_STATUS_FILE      If set, also writes a Codex TUI swarm status JSON (swarm-status.v1)
+    CODEX_SWARM_STATUS_POLL_MS   Read by patched Codex TUI (not used by this script)
   --stdout             (mirror monitor events to stdout)
   -h, --help
 USAGE
@@ -113,6 +116,7 @@ EVENTS_LOCK_FILE="${FLEET_EVENTS_LOCK_FILE:-$POOL_RUN_DIR/fleet.events.lock}"
 FLEET_DISK_PATH="${FLEET_DISK_PATH:-$POOL_RUN_DIR}"
 FLEET_DISK_FREE_WARN_PCT="${FLEET_DISK_FREE_WARN_PCT:-10}"
 FLEET_DISK_FREE_FAIL_PCT="${FLEET_DISK_FREE_FAIL_PCT:-5}"
+CODEX_SWARM_STATUS_JSON="${FLEET_CODEX_SWARM_STATUS_JSON:-${CODEX_SWARM_STATUS_FILE:-}}"
 
 now_iso() { date -Iseconds; }
 now_epoch() { date +%s; }
@@ -185,6 +189,9 @@ is_alive_pid() {
 mkdir -p "$(dirname "$MONITOR_LOG")"
 mkdir -p "$(dirname "$SUMMARY_JSON")"
 mkdir -p "$(dirname "$SUMMARY_CSV")"
+if [[ -n "${CODEX_SWARM_STATUS_JSON:-}" ]]; then
+  mkdir -p "$(dirname "$CODEX_SWARM_STATUS_JSON")"
+fi
 mkdir -p "$(dirname "$LOCK_FILE")"
 mkdir -p "$(dirname "$OUT_PID_FILE")"
 mkdir -p "$(dirname "$HEARTBEAT_FILE")"
@@ -910,7 +917,8 @@ write_snapshot() {
   python3 - "$tmp_rows" "$SUMMARY_JSON" "$SUMMARY_CSV" "$REGISTRY_FILE" "$ROSTER_JSONL" \
     "$total" "$done_ok" "$done_fail" "$running" "$stuck" "$orphaned" "$unknown" \
     "$disk_status" "$disk_free_pct" "$disk_avail_kb" \
-    "$discovery_registry" "$discovery_roster" "$discovery_merged" "$missing_artifacts_total" <<'PY'
+    "$discovery_registry" "$discovery_roster" "$discovery_merged" "$missing_artifacts_total" \
+    "${CODEX_SWARM_STATUS_JSON:-}" <<'PY'
 import csv
 import json
 import os
@@ -925,6 +933,7 @@ discovery_registry = int(sys.argv[16])
 discovery_roster = int(sys.argv[17])
 discovery_merged = int(sys.argv[18])
 missing_artifacts_total = int(sys.argv[19])
+codex_swarm_json = str(sys.argv[20] or "").strip()
 
 disk_free_pct = int(disk_free_pct_raw) if disk_free_pct_raw.isdigit() else None
 disk_avail_kb = int(disk_avail_kb_raw) if disk_avail_kb_raw.isdigit() else None
@@ -1075,6 +1084,65 @@ with open(csv_tmp, "w", encoding="utf-8", newline="") as out:
     for row in agents:
         w.writerow({k: row.get(k) for k in header})
 os.replace(csv_tmp, csv_out)
+
+if codex_swarm_json:
+    def map_state(row):
+        klass = str((row.get("state_class") or "")).upper()
+        if klass == "DONE_OK":
+            return "done"
+        if klass in ("DONE_FAIL", "ORPHANED"):
+            return "failed"
+        if klass in ("RUNNING", "STUCK"):
+            return "running"
+        return "waiting"
+
+    codex_agents = []
+    for row in agents:
+        state = map_state(row)
+        task = row.get("last_step") or row.get("reason") or row.get("last_tail")
+        task = (task or "").strip() or None
+        result = row.get("result_status") or None
+        codex_agents.append(
+            {
+                "id": row.get("agent_id") or row.get("key") or "agent",
+                "name": row.get("agent_id") or row.get("key") or "agent",
+                "state": state,
+                "task": task,
+                "result": result,
+                "run_id": row.get("run_id"),
+                "updated_at": row.get("snapshot_ts"),
+            }
+        )
+
+    codex_payload = {
+        "version": "swarm-status.v1",
+        "updated_at": agents[0].get("snapshot_ts") if agents else None,
+        "source": {
+            "type": "child_fleet_monitor",
+            "fleet_summary_json": json_out,
+            "registry_file": registry_file,
+            "roster_jsonl": roster_file,
+        },
+        "summary": {
+            "total": total,
+            "running": running + stuck,
+            "done": done_ok,
+            "failed": done_fail + orphaned,
+            "waiting": unknown,
+            "done_ok": done_ok,
+            "done_fail": done_fail,
+            "stuck": stuck,
+            "orphaned": orphaned,
+            "unknown": unknown,
+        },
+        "agents": codex_agents,
+    }
+
+    codex_tmp = f"{codex_swarm_json}.tmp.{os.getpid()}"
+    with open(codex_tmp, "w", encoding="utf-8") as out:
+        json.dump(codex_payload, out, ensure_ascii=False, indent=2)
+        out.write("\n")
+    os.replace(codex_tmp, codex_swarm_json)
 PY
 
   rm -f "$tmp_rows" >/dev/null 2>&1 || true
@@ -1088,7 +1156,7 @@ if (( HEARTBEAT_SEC > 0 )); then
 fi
 last_progress_sig=""
 
-log_event "event=start poll_sec=${POLL_SEC} heartbeat_sec=${HEARTBEAT_SEC} timeout_sec=${TIMEOUT_SEC} stuck_after_sec=${STUCK_AFTER_SEC} registry_file=${REGISTRY_FILE} roster_jsonl=${ROSTER_JSONL} heartbeat_file=${HEARTBEAT_FILE} events_jsonl=${EVENTS_JSONL} disk_path=${FLEET_DISK_PATH} disk_warn_pct=${FLEET_DISK_FREE_WARN_PCT} disk_fail_pct=${FLEET_DISK_FREE_FAIL_PCT}"
+log_event "event=start poll_sec=${POLL_SEC} heartbeat_sec=${HEARTBEAT_SEC} timeout_sec=${TIMEOUT_SEC} stuck_after_sec=${STUCK_AFTER_SEC} registry_file=${REGISTRY_FILE} roster_jsonl=${ROSTER_JSONL} heartbeat_file=${HEARTBEAT_FILE} events_jsonl=${EVENTS_JSONL} disk_path=${FLEET_DISK_PATH} disk_warn_pct=${FLEET_DISK_FREE_WARN_PCT} disk_fail_pct=${FLEET_DISK_FREE_FAIL_PCT} codex_swarm_status_json=${CODEX_SWARM_STATUS_JSON:-none}"
 
 while true; do
   now_ts="$(now_epoch)"
