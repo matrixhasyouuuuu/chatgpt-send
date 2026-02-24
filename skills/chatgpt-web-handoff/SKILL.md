@@ -1,6 +1,6 @@
 ---
 name: chatgpt-web-handoff
-description: "Connect Codex CLI with ChatGPT Web ('Specialist') via chatgpt_send: keep one persistent chat, send messages, read replies back. UX: user speaks in natural language (no shell commands). Supports saved sessions, resume/new, and an N-iteration loop counter."
+description: "Понятный мост между Codex CLI и ChatGPT Web ('Specialist') через chatgpt_send: работа без shell-команд, один постоянный чат со Specialist, и координация мультиагентов как мягкий рой (главный агент = координатор/мозг, child-агенты = параллельные исполнители без жёстких запретов)."
 ---
 
 # ChatGPT Web Handoff ("Specialist")
@@ -38,6 +38,10 @@ Rules:
   - send all findings, questions, plans, diffs, and test results to the Specialist
   - in the terminal, only show short status updates (what you sent/received, what you do next)
 - The Specialist browser window must be **visible** and stay open.
+- If the user explicitly says "decide yourself", "autonomous", "не спрашивай", or equivalent:
+  - switch to **autonomous coordinator mode**
+  - do not ask setup questions about agent count/mode/browser policy/iterations unless a real blocker remains
+  - choose reasonable defaults yourself, state the chosen plan briefly, and proceed
 
 ## One Question At A Time (Important)
 
@@ -76,22 +80,26 @@ Step 2: Project path
   - "Give me the full path to the project folder."
 
 Step 3: Agent mode
-- Ask:
-  - "Single-agent mode or child agents too? (single/2/3/5/custom)"
+- Default behavior:
+  - If the user already asked for multi-agent/swarm work (or said to decide autonomously), choose child-agent mode yourself.
+  - Otherwise use `single`.
+- Ask only if this is still ambiguous and the choice materially changes the workflow.
 
 Step 4: Main browser mode
-- Ask:
-  - "Use Specialist browser for the main agent too? (yes/no)"
-- Defaults:
-  - single-agent mode: `yes`
-  - multi-agent mode: `no`
+- In autonomous coordinator mode, choose main browser usage yourself from task needs and current context (Specialist needed vs local-only work).
+- Ask only if this choice is genuinely ambiguous and affects the workflow.
 
 Step 5: Specialist iterations (only if main browser mode = `yes`)
-- If the user didn't specify N, ask:
-  - "How many Specialist iterations? (2/3/5/10/20/30)"
+- If the user didn't specify N:
+  - in autonomous coordinator mode, choose iteration budget yourself from task complexity and expected loop depth
+  - otherwise ask one question.
 
 Step 6: Child-agent plan (only if child mode was selected)
-- Ask one-by-one:
+- In autonomous coordinator mode:
+  - choose child count, shared/separate path strategy, and initial task split yourself from the user's goal/context
+  - when one project path was provided, usually start from shared path unless there is a clear reason to separate
+  - restate the chosen plan briefly and proceed unless a real blocker exists
+- Otherwise ask one-by-one:
   - "How many child agents exactly?"
   - "One shared project path for all children, or separate path per child?"
   - If shared: "Confirm shared path."
@@ -102,7 +110,11 @@ Step 6: Child-agent plan (only if child mode was selected)
   - Ask permission to list top-level folders in the given project path(s).
   - After permission, inspect only top-level folders and suggest task split.
   - Ask confirmation for each child task, one child at a time.
-- Ask:
+- In autonomous coordinator mode:
+  - choose iterations strategy (`shared` vs `per-child`) and budget yourself from task shape
+  - choose browser policy per child from task needs (local-only analysis vs Specialist/web dependency)
+  - choose browser brief only when a child actually needs Specialist/browser context
+- Otherwise ask:
   - "Iterations for children: one value for all or per-child? (shared/per-child)"
   - If shared: "How many iterations budget per child? (3/5/10/20)"
   - If per-child: ask one-by-one "Iterations for agent #1?", "Iterations for agent #2?", ...
@@ -156,14 +168,32 @@ Step 12: Child launches (if child mode selected)
 
 Use this mode when user asks to run several child agents.
 
+Important swarm model (explicit):
+- This is a **soft swarm**, not a hard-coded routing/locking system.
+- The main agent is the coordinator/"brain" (think: the "queen"/core intelligence of the swarm workflow, not a rigid dispatcher).
+- The coordinator is not limited to a fixed number of agents in the skill text:
+  - for a small task it may use zero or one child,
+  - for a larger task it may use several waves and many children,
+  - the number/roles are chosen dynamically per task.
+- The coordinator decides dynamically:
+  - how many child agents to launch,
+  - how to split/re-split work,
+  - when to re-ask the same child,
+  - when to add another child for verification/arbitration,
+  - when to continue talking to Specialist vs when to send work to the swarm,
+  - when to stop, summarize, or launch another wave.
+- If results conflict, are incomplete, or look risky, the coordinator must run another swarm step:
+  - re-ask the same child, or
+  - launch an additional verifier/arbitration child, or
+  - re-split and launch another wave with updated context.
+- Child agents get shared context (goal + peers), may overlap, and must report overlap.
+- The coordinator is responsible for checking child results, reconciling differences, and deciding the next move.
+
 Planning rules:
 - Keep one question at a time.
-- Prefer simple defaults:
-  - child count: `1`
-  - child browser mode: shared
-  - child iterations hint: `3`
-  - main browser mode: `no`
-- Before launch, restate the final plan in one compact checklist and ask for `confirm`.
+- In autonomous coordinator mode, ask no planning questions unless blocked; choose and state defaults briefly.
+- Do not hard-code fixed swarm sizes/budgets in the skill text; the coordinator chooses these per task.
+- Before launch, restate the chosen plan briefly (and ask for `confirm` only when the user wants confirmation or the plan changes risk materially).
 
 Launch protocol:
 - Start each child with `spawn_second_agent`.

@@ -24,10 +24,12 @@ Practical model:
 - Main agent decides how many child agents are useful (`2/3/5/...`) and splits the work.
 - Child agents execute work in parallel (code changes, checks, tests, review tasks).
 - Main agent verifies results, checks conflicts/overlap, runs final verification, and reports back to Specialist/user.
+- If results conflict, are incomplete, or look risky, the main agent adaptively decides what to do next: re-ask the same child, launch an additional child (verification/arbitration), or run another wave.
 
 Important:
 
 - This is a **soft swarm protocol**, not hard file locking.
+- No hard-coded task-routing rules are required: the coordinator (main agent) is the "brain" and decides dynamically which child to task next based on the current results/errors.
 - Child agents may overlap, but they must know what other agents are doing and report overlap explicitly.
 - The coordinator is responsible for final reconciliation and verification.
 

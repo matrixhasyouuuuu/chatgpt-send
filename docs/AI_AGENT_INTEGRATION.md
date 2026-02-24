@@ -21,8 +21,10 @@ The coordinator is the "mechanism" that decides:
 - who does what
 - how to reconcile overlaps/conflicts
 - what to verify before reporting completion
+- when to run another wave (re-ask a child, add a verifier/arbitration child, or redistribute work)
 
 This is a **soft swarm** approach (shared context + coordination), not hard code partitioning.
+There are no hard-coded routing/locking rules in this workflow: the coordinator agent is expected to think and choose the next child task adaptively from the current errors/results.
 
 ## Use the UX facade (not low-level scripts)
 
@@ -119,6 +121,14 @@ The child prompt should communicate:
 - this child's exact task
 - who else is doing what
 - rule: if overlap is detected, do not blindly duplicate; switch to validation/integration/fixups and report overlap
+
+Coordinator reconciliation rule (explicit):
+
+- if child outputs conflict, look incomplete, or fail verification, do not force a brittle rule;
+- instead, the coordinator should decide adaptively whether to:
+  - ask the same child for a correction/retest,
+  - assign another child as verifier/arbitrator,
+  - or launch a new wave with refined task split/context.
 
 For coordinator-friendly aggregation, require child outputs to include:
 
