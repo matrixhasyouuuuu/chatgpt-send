@@ -300,6 +300,7 @@ late_reply_recover_via_fetch_last() {
   local tmp st fields diag_fields f_url f_user_tail f_asst_tail f_ckpt f_user_hash f_after_anchor
   local f_total f_stop f_last_user_sig f_last_asst_sig f_chat_id f_ui_contract f_fingerprint f_last_user_text_sig f_last_asst_text_sig f_ui_state f_norm_version
   local candidate stable_ticks prev_hash checkpoint_id_write candidate_reason strict_user_match fallback_user_changed
+  local pending_streaming pending_streaming_ticks pending_streaming_reason
 
   grace_sec="${LATE_REPLY_GRACE_SEC:-30}"
   max_sec="${LATE_REPLY_MAX_SEC:-120}"
@@ -327,6 +328,7 @@ late_reply_recover_via_fetch_last() {
   soft_deadline_ms=$((start_ms + max_ms))
   stable_ticks=0
   prev_hash=""
+  pending_streaming_ticks=0
 
   echo "REPLY_LATE_RECOVERY start class=${timeout_class} grace_sec=${grace_sec} max_sec=${max_sec} poll_ms=${poll_ms} stable_need=${stable_need} run_id=${RUN_ID}" >&2
   while true; do
@@ -370,6 +372,8 @@ late_reply_recover_via_fetch_last() {
     candidate_reason="none"
     strict_user_match=0
     fallback_user_changed=0
+    pending_streaming=0
+    pending_streaming_reason=""
     if [[ -n "${PROMPT_HASH:-}" ]] && [[ "${f_user_hash:-}" == "${PROMPT_HASH:-}" ]]; then
       strict_user_match=1
     fi
@@ -383,6 +387,23 @@ late_reply_recover_via_fetch_last() {
       && { [[ -n "${SEND_BASELINE_LAST_USER_HASH:-}" ]] || [[ -n "${SEND_BASELINE_LAST_USER_TEXT_SIG:-}" ]]; } \
       && { [[ "${f_user_hash:-}" != "${SEND_BASELINE_LAST_USER_HASH:-}" ]] || [[ "${f_last_user_text_sig:-}" != "${SEND_BASELINE_LAST_USER_TEXT_SIG:-}" ]]; }; then
       fallback_user_changed=1
+    fi
+
+    if [[ "${f_stop:-0}" == "1" ]] && [[ "${f_after_anchor}" != "1" ]] && [[ $strict_user_match -eq 1 || $fallback_user_changed -eq 1 ]]; then
+      pending_streaming=1
+      if [[ $strict_user_match -eq 1 ]]; then
+        pending_streaming_reason="prompt_hash"
+      else
+        pending_streaming_reason="baseline_user_changed"
+      fi
+      pending_streaming_ticks=$((pending_streaming_ticks + 1))
+      if (( max_ms > 0 )); then
+        soft_deadline_ms=$((now_ms + max_ms))
+      fi
+      echo "REPLY_PENDING_STREAMING state=1 phase=late_recovery reason=${pending_streaming_reason} stop_visible=${f_stop:-0} assistant_after_last_user=${f_after_anchor:-0} tick=${pending_streaming_ticks} user_hash=${f_user_hash:-none} user_sig=${f_last_user_text_sig:-none} run_id=${RUN_ID}" >&2
+    elif [[ $pending_streaming_ticks -gt 0 ]]; then
+      echo "REPLY_PENDING_STREAMING state=0 phase=late_recovery reason=cleared stop_visible=${f_stop:-0} assistant_after_last_user=${f_after_anchor:-0} ticks_seen=${pending_streaming_ticks} run_id=${RUN_ID}" >&2
+      pending_streaming_ticks=0
     fi
 
     if [[ "${f_after_anchor}" == "1" ]] && [[ -n "${f_asst_tail:-}" ]] && [[ $strict_user_match -eq 1 || $fallback_user_changed -eq 1 ]]; then
@@ -406,7 +427,7 @@ late_reply_recover_via_fetch_last() {
       prev_hash=""
     fi
 
-    echo "REPLY_LATE_RECOVERY tick candidate=${candidate} reason=${candidate_reason} stable_ticks=${stable_ticks} hash=${f_asst_tail:-none} user_hash=${f_user_hash:-none} user_sig=${f_last_user_text_sig:-none} run_id=${RUN_ID}" >&2
+    echo "REPLY_LATE_RECOVERY tick candidate=${candidate} reason=${candidate_reason} stable_ticks=${stable_ticks} pending_streaming=${pending_streaming} hash=${f_asst_tail:-none} user_hash=${f_user_hash:-none} user_sig=${f_last_user_text_sig:-none} run_id=${RUN_ID}" >&2
     if (( candidate == 1 )) && (( stable_ticks >= stable_need )); then
       if [[ "$candidate_reason" == "prompt_hash" ]]; then
         fetch_last_reuse_text_for_prompt "$tmp" "${PROMPT_HASH:-}" >"$out"
@@ -434,6 +455,9 @@ late_reply_recover_via_fetch_last() {
     sleep "$poll_s"
   done
 
+  if [[ $pending_streaming_ticks -gt 0 ]]; then
+    echo "REPLY_PENDING_STREAMING state=0 phase=late_recovery reason=timeout stop_visible=1 assistant_after_last_user=0 ticks_seen=${pending_streaming_ticks} run_id=${RUN_ID}" >&2
+  fi
   echo "REPLY_LATE_RECOVERY done outcome=not_ready class=${timeout_class} run_id=${RUN_ID}" >&2
   return 1
 }

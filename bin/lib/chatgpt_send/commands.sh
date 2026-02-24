@@ -31,6 +31,171 @@ def read_json(path):
     except Exception:
         return {}
 
+def read_text(path):
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+def path_mtime(path):
+    try:
+        return int(path.stat().st_mtime)
+    except Exception:
+        return None
+
+def detect_swarm_snapshot(root_path: pathlib.Path, now_ts: int):
+    runs_root = root_path / "state" / "runs"
+    if not runs_root.exists():
+        return {
+            "present": False,
+            "reason": "runs_root_missing",
+        }
+    candidates = []
+    for d in runs_root.iterdir():
+        if not d.is_dir():
+            continue
+        if not d.name.startswith("pool-"):
+            continue
+        summary_path = d / "fleet.summary.json"
+        if not summary_path.exists():
+            continue
+        active_marker = d / ".pool.active"
+        candidates.append({
+            "dir": d,
+            "summary_path": summary_path,
+            "active": active_marker.exists(),
+            "mtime": path_mtime(summary_path) or 0,
+        })
+    if not candidates:
+        return {
+            "present": False,
+            "reason": "no_pool_runs",
+        }
+
+    active_candidates = [c for c in candidates if c["active"]]
+    if active_candidates:
+        active_candidates.sort(key=lambda x: x["mtime"], reverse=True)
+        chosen = active_candidates[0]
+        mode = "active"
+        extra_active = max(0, len(active_candidates) - 1)
+    else:
+        candidates.sort(key=lambda x: x["mtime"], reverse=True)
+        chosen = candidates[0]
+        mode = "latest"
+        extra_active = 0
+
+    d = chosen["dir"]
+    summary_path = chosen["summary_path"]
+    heartbeat_path = d / "fleet.heartbeat"
+    monitor_log_path = d / "fleet.monitor.log"
+    summary = read_json(summary_path)
+    if not isinstance(summary, dict) or not summary:
+        return {
+            "present": False,
+            "reason": "fleet_summary_unreadable",
+            "pool_run_dir": str(d),
+            "fleet_summary_json": str(summary_path),
+        }
+
+    hb_text = read_text(heartbeat_path)
+    hb_ts_ms = None
+    m = re.search(r"ts_ms=(\d+)", hb_text or "")
+    if m:
+        try:
+            hb_ts_ms = int(m.group(1))
+        except Exception:
+            hb_ts_ms = None
+    heartbeat_age_sec = None
+    if hb_ts_ms is not None:
+        heartbeat_age_sec = max(0, now_ts - (hb_ts_ms // 1000))
+    heartbeat_file_age_sec = None
+    hb_mtime = path_mtime(heartbeat_path)
+    if hb_mtime is not None:
+        heartbeat_file_age_sec = max(0, now_ts - hb_mtime)
+
+    summary_age_sec = None
+    sm_mtime = path_mtime(summary_path)
+    if sm_mtime is not None:
+        summary_age_sec = max(0, now_ts - sm_mtime)
+
+    monitor_log_age_sec = None
+    ml_mtime = path_mtime(monitor_log_path)
+    if ml_mtime is not None:
+        monitor_log_age_sec = max(0, now_ts - ml_mtime)
+
+    running = int(summary.get("running") or 0)
+    pending = int(summary.get("pending") or 0)
+    done = int(summary.get("done") or 0)
+    failed = int(summary.get("failed") or 0)
+
+    freshness_state = "unknown"
+    freshness_reason = "no_heartbeat"
+    if running > 0 or pending > 0:
+        age_for_live = heartbeat_age_sec if heartbeat_age_sec is not None else heartbeat_file_age_sec
+        if age_for_live is None:
+            freshness_state = "unknown"
+            freshness_reason = "heartbeat_missing"
+        elif age_for_live <= 30:
+            freshness_state = "fresh"
+            freshness_reason = "heartbeat_recent"
+        else:
+            freshness_state = "stale"
+            freshness_reason = "heartbeat_old"
+    else:
+        freshness_state = "fresh"
+        freshness_reason = "completed_snapshot"
+
+    agents = summary.get("agents") if isinstance(summary.get("agents"), list) else []
+    agent_rows = []
+    for row in agents:
+        if not isinstance(row, dict):
+            continue
+        agent_rows.append({
+            "agent_id": str(row.get("agent_id") or row.get("key") or "agent"),
+            "state_class": str(row.get("state_class") or row.get("state") or "UNKNOWN"),
+            "reason": str(row.get("reason") or ""),
+            "last_step": str(row.get("last_step") or ""),
+            "age_sec": row.get("age_sec"),
+            "chat_proof": str(row.get("chat_proof") or "unknown"),
+        })
+    interesting = [r for r in agent_rows if r["state_class"] not in ("DONE_OK",)]
+    if not interesting:
+        interesting = agent_rows[:]
+    interesting.sort(key=lambda r: (r["state_class"], str(r.get("agent_id"))))
+
+    return {
+        "present": True,
+        "mode": mode,
+        "pool_run_dir": str(d),
+        "pool_run_id": d.name,
+        "active_marker": bool(chosen["active"]),
+        "multiple_active_markers": int(extra_active),
+        "fleet_summary_json": str(summary_path),
+        "fleet_heartbeat_file": str(heartbeat_path),
+        "fleet_monitor_log": str(monitor_log_path),
+        "summary": {
+            "total": int(summary.get("total") or 0),
+            "running": running,
+            "pending": pending,
+            "done": done,
+            "failed": failed,
+            "done_ok": int(summary.get("done_ok") or 0),
+            "done_fail": int(summary.get("done_fail") or 0),
+            "stuck": int(summary.get("stuck") or 0),
+            "orphaned": int(summary.get("orphaned") or 0),
+            "unknown": int(summary.get("unknown") or 0),
+        },
+        "freshness": {
+            "state": freshness_state,
+            "reason": freshness_reason,
+            "heartbeat_age_sec": heartbeat_age_sec,
+            "heartbeat_file_age_sec": heartbeat_file_age_sec,
+            "summary_age_sec": summary_age_sec,
+            "monitor_log_age_sec": monitor_log_age_sec,
+        },
+        "agents_preview": interesting[:12],
+    }
+
 ops = read_json(ops_path)
 state = root / "state"
 checkpoint = read_json(state / "last_specialist_checkpoint.json")
@@ -55,6 +220,7 @@ if latest_run and latest_run.exists():
     summ = read_json(latest_run / "summary.json")
     contract = read_json(latest_run / "evidence" / "contract.json")
     probe = read_json(latest_run / "evidence" / "probe_last.json")
+    fetch_last = read_json(latest_run / "evidence" / "fetch_last.json")
     latest["manifest_exists"] = int(bool(man))
     latest["summary_exists"] = int(bool(summ))
     latest["evidence_dir"] = str(latest_run / "evidence") if (latest_run / "evidence").exists() else ""
@@ -80,6 +246,12 @@ if latest_run and latest_run.exists():
         if s.startswith("E_"):
             break
     latest["reason"] = reason
+    latest["reply_pending_streaming"] = int(
+        bool(fetch_last)
+        and bool(fetch_last.get("stop_visible"))
+        and not bool(fetch_last.get("assistant_after_last_user"))
+        and str(reason or "").startswith("E_REPLY_WAIT_TIMEOUT_STOP_VISIBLE")
+    )
 
 blockers = []
 warnings = []
@@ -118,6 +290,9 @@ if ledger_state == "pending" and pending_unacked == 0:
 
 if latest["exists"] and latest.get("reason", "").startswith("E_"):
     warnings.append("latest_run_failed")
+if int(latest.get("reply_pending_streaming") or 0) == 1:
+    warnings.append("reply_pending_streaming")
+    next_actions.append("Specialist еще печатает ответ: дождаться завершения и сделать read-only fetch/status без resend.")
 
 seen = set()
 dedup_next = []
@@ -171,6 +346,7 @@ obj = {
     "ops": ops,
     "checkpoint": checkpoint if isinstance(checkpoint, dict) else {},
     "latest_run": latest,
+    "swarm": detect_swarm_snapshot(root, int(time.time())),
 }
 
 operator_state = "READY"
@@ -213,6 +389,12 @@ elif "ledger_pending" in warnings:
     operator_next = "STEP_WAIT_FINISHED"
     operator_note = "Предыдущий цикл SEND->REPLY еще не завершен; дождитесь/дочитайте ответ."
     operator_confidence = "med"
+elif "reply_pending_streaming" in warnings:
+    operator_state = "WAITING"
+    operator_why = "reply_pending_streaming"
+    operator_next = "STEP_WAIT_FINISHED"
+    operator_note = "UI показывает активную генерацию ответа Specialist; дождитесь завершения и читайте read-only без resend."
+    operator_confidence = "high"
 elif "latest_run_failed" in warnings:
     operator_state = "RECOVERABLE"
     operator_why = "latest_run_failed"
@@ -234,6 +416,17 @@ obj["operator_summary"] = {
     "confidence": operator_confidence,
 }
 
+swarm = obj.get("swarm") or {}
+if isinstance(swarm, dict) and swarm.get("present"):
+    swarm_fresh = ((swarm.get("freshness") or {}).get("state") or "").strip()
+    swarm_summary = (swarm.get("summary") or {}) if isinstance(swarm.get("summary"), dict) else {}
+    if swarm_fresh == "stale" and int(swarm_summary.get("running") or 0) > 0:
+        if "swarm_status_stale" not in warnings:
+            warnings.append("swarm_status_stale")
+        next_actions.append("Сводка роя устарела (heartbeat старый): проверить monitor/fleet follow перед решениями по рою.")
+        if status == "ready":
+            status = "degraded"
+
 if json_mode == 1:
     print(json.dumps(obj, ensure_ascii=False, sort_keys=True))
     raise SystemExit(0)
@@ -248,10 +441,38 @@ ckpt_ts = str((checkpoint or {}).get('ts') or '').strip()
 print(f"  checkpoint: {ckpt_id or 'none'}  ts={ckpt_ts or 'none'}")
 if latest["exists"]:
     print(f"  latest_run: {latest['run_id']} reason={latest.get('reason') or 'none'} outcome={latest.get('outcome') or 'none'}")
+swarm = obj.get("swarm") or {}
+if isinstance(swarm, dict) and swarm.get("present"):
+    ssum = (swarm.get("summary") or {}) if isinstance(swarm.get("summary"), dict) else {}
+    sf = (swarm.get("freshness") or {}) if isinstance(swarm.get("freshness"), dict) else {}
+    print(
+        "  swarm: "
+        f"{swarm.get('pool_run_id') or 'pool'} "
+        f"mode={swarm.get('mode') or 'unknown'} "
+        f"freshness={sf.get('state') or 'unknown'} "
+        f"(hb_age={sf.get('heartbeat_age_sec') if sf.get('heartbeat_age_sec') is not None else 'none'}s, "
+        f"summary_age={sf.get('summary_age_sec') if sf.get('summary_age_sec') is not None else 'none'}s) "
+        f"total={ssum.get('total', 0)} run={ssum.get('running', 0)} done={ssum.get('done', 0)} fail={ssum.get('failed', 0)} pending={ssum.get('pending', 0)}"
+    )
+    for row in (swarm.get("agents_preview") or []):
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get("agent_id") or "agent")
+        cls = str(row.get("state_class") or "UNKNOWN")
+        age = row.get("age_sec")
+        age_s = f"{age}s" if isinstance(age, int) else "?"
+        reason = str(row.get("last_step") or row.get("reason") or "").strip()
+        if len(reason) > 100:
+            reason = reason[:97] + "..."
+        print(f"  swarm_agent: {rid} {cls} age={age_s} proof={row.get('chat_proof') or 'unknown'} {reason}")
+elif isinstance(swarm, dict) and swarm.get("reason"):
+    print(f"  swarm: none ({swarm.get('reason')})")
 for b in blockers:
     print(f"BLOCKER {b}")
 for w in warnings:
     print(f"WARN {w}")
+if int(latest.get("reply_pending_streaming") or 0) == 1:
+    print("INFO reply_pending_streaming=1 stop_visible=1 assistant_after_last_user=0")
 for step in next_actions:
     print(f"NEXT {step}")
 PY
@@ -329,6 +550,7 @@ def map_error(code, ctx=None):
     ui = ctx.get("fetch_last") or {}
     ui_diag = (ui.get("ui_diag") or {}) if isinstance(ui, dict) else {}
     stop_visible = bool(ui.get("stop_visible"))
+    assistant_after_last_user = bool(ui.get("assistant_after_last_user"))
     total_messages = int(ui.get("total_messages") or 0) if isinstance(ui, dict) else 0
     login = bool(ui_diag.get("login_detected"))
     captcha = bool(ui_diag.get("captcha_detected"))
@@ -420,6 +642,14 @@ def map_error(code, ctx=None):
         nxt.insert(0, "Проверить сеть/доступ к chatgpt.com (обнаружен offline UI).")
     if stop_visible and total_messages == 0 and code_norm.startswith("E_"):
         auto.append("По evidence UI мог быть в промежуточном состоянии: `stop_visible` при пустом списке сообщений.")
+    if code_norm == "E_REPLY_WAIT_TIMEOUT_STOP_VISIBLE" and stop_visible and not assistant_after_last_user:
+        what = "Ответ Specialist еще допечатывается (`reply_pending_streaming`): UI показывает активную генерацию, но готовый ответ после последнего user еще не зафиксирован."
+        auto.insert(0, "Система попала в промежуточное состояние streaming; это не означает потерю контекста.")
+        nxt = [
+            "Подождать завершения генерации и повторить read-only fetch/status без resend.",
+            "Не отправлять новый prompt, пока не появится ответ после последнего user.",
+            "При регулярных кейсах увеличить `CHATGPT_SEND_REPLY_MAX_SEC`/late-recovery grace."
+        ] + list(nxt)
     if code_norm == "E_PROMPT_NOT_CONFIRMED_NO_RESEND" and total_messages == 0:
         auto.append("В момент confirm-fetch UI мог вернуть `messages=0` (transient UI/CDP состояние).")
     if code_norm == "E_SEND_RETRY_VETO_INTRA_RUN" and "prompt_present=1" in last_ev_meta:
@@ -657,6 +887,14 @@ def _operator_next_from_explain(obj):
     return "RUN_EXPLAIN"
 
 explain_state = _operator_state_from_explain(obj.get("block_reason"), obj.get("error_class"), bool(obj.get("error_code")))
+fetch_last_obj = (obj.get("details") or {}).get("fetch_last") or {}
+if (
+    str(obj.get("error_code") or "") == "E_REPLY_WAIT_TIMEOUT_STOP_VISIBLE"
+    and isinstance(fetch_last_obj, dict)
+    and bool(fetch_last_obj.get("stop_visible"))
+    and not bool(fetch_last_obj.get("assistant_after_last_user"))
+):
+    explain_state = "WAITING"
 explain_why = str(obj.get("error_code") or "").strip()
 if explain_why:
     explain_why = explain_why.lower()
@@ -669,7 +907,16 @@ if explain_why == "e_prefight_stale":
     explain_why = "stale_preflight"
 if explain_why == "e_preflight_stale":
     explain_why = "stale_preflight"
+if (
+    str(obj.get("error_code") or "") == "E_REPLY_WAIT_TIMEOUT_STOP_VISIBLE"
+    and isinstance(fetch_last_obj, dict)
+    and bool(fetch_last_obj.get("stop_visible"))
+    and not bool(fetch_last_obj.get("assistant_after_last_user"))
+):
+    explain_why = "reply_pending_streaming"
 explain_next = _operator_next_from_explain(obj)
+if explain_why == "reply_pending_streaming":
+    explain_next = "STEP_WAIT_FINISHED"
 explain_note = str(obj.get("what") or "").strip() or "Нет данных для explain."
 explain_confidence = "high" if obj.get("error_spec") else ("med" if obj.get("error_code") else "low")
 if str(obj.get("error_code") or "") == "E_EXPLAIN_TARGET_NOT_FOUND":
