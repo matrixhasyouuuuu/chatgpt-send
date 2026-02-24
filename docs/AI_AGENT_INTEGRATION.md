@@ -6,6 +6,24 @@ This guide is for another CLI/AI agent that wants to control `chatgpt_send` safe
 
 Use ChatGPT Web as a visible “Specialist” while your agent stays in the terminal and avoids duplicate sends, wrong-tab sends, and stale-UI decisions.
 
+## Coordinator + Swarm workflow (this team's preferred mode)
+
+In this repository, a strong pattern is:
+
+- main agent = coordinator / control point
+- child agents = parallel executors (patches, tests, review, verification)
+- Specialist = external thinking/checkpoint via browser
+
+The coordinator is the "mechanism" that decides:
+
+- how many child agents to launch
+- how to split the task
+- who does what
+- how to reconcile overlaps/conflicts
+- what to verify before reporting completion
+
+This is a **soft swarm** approach (shared context + coordination), not hard code partitioning.
+
 ## Use the UX facade (not low-level scripts)
 
 Preferred commands:
@@ -85,6 +103,29 @@ Use `operator_summary` as the primary control surface.
    - `ABORT_SAFE` -> stop and request human intervention
 5. If `state=BLOCKED|ERROR`, run `explain` before any mutating action.
 6. Do not bypass `operator_summary`/`decision.next` with internal flags or raw logs.
+
+## Swarm child tasking (soft coordination)
+
+When using `bin/spawn_second_agent`, pass swarm context so children can coordinate without hard locks:
+
+- `--agent-id <id>`
+- `--agent-name <name>`
+- `--team-goal "<shared goal>"`
+- `--peer "<agent-x: what they are doing>"` (repeatable)
+
+The child prompt should communicate:
+
+- shared goal
+- this child's exact task
+- who else is doing what
+- rule: if overlap is detected, do not blindly duplicate; switch to validation/integration/fixups and report overlap
+
+For coordinator-friendly aggregation, require child outputs to include:
+
+- `CHILD_FILES_TOUCHED: ...`
+- `CHILD_OVERLAP: ...`
+- `CHILD_CHECKS: ...`
+- `CHILD_RESULT: ...`
 
 ## Important semantics
 

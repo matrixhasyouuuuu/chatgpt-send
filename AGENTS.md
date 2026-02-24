@@ -14,6 +14,37 @@ Use the UX facade commands instead of calling low-level shell scripts:
 
 Treat `step read --json` as the planner/preflight command. The planner may return action ids like `STEP_PREFLIGHT`; this maps to running `chatgpt_send step read --json` again.
 
+## Coordinator + Swarm mode (recommended for this repo workflow)
+
+For this project, the main Codex agent acts as the coordinator (control point), not as the only coder.
+
+Practical model:
+
+- Main agent talks to Specialist and receives the next task/patch direction.
+- Main agent decides how many child agents are useful (`2/3/5/...`) and splits the work.
+- Child agents execute work in parallel (code changes, checks, tests, review tasks).
+- Main agent verifies results, checks conflicts/overlap, runs final verification, and reports back to Specialist/user.
+
+Important:
+
+- This is a **soft swarm protocol**, not hard file locking.
+- Child agents may overlap, but they must know what other agents are doing and report overlap explicitly.
+- The coordinator is responsible for final reconciliation and verification.
+
+Use `bin/spawn_second_agent` with swarm context flags:
+
+- `--agent-id`
+- `--agent-name`
+- `--team-goal`
+- `--peer` (repeatable; describe what each other child is doing)
+
+Child final response contract (for coordinator review) should include:
+
+- `CHILD_FILES_TOUCHED: ...`
+- `CHILD_OVERLAP: ...`
+- `CHILD_CHECKS: ...`
+- `CHILD_RESULT: ...`
+
 ## Safety model (important)
 
 - Never blind-resend after timeout just because a send command returned non-zero.

@@ -44,6 +44,10 @@ Options:
   --model MODEL               Optional model for child codex exec
   --codex-bin PATH            Codex binary (default: codex)
   --chatgpt-send-path PATH    chatgpt_send path (default: /home/matrix/projects/chatgpt-send/bin/chatgpt_send)
+  --agent-id ID               Child identity label for coordinator/swarm context
+  --agent-name NAME           Human-friendly child name for coordinator/swarm context
+  --team-goal TEXT            Shared goal for all child agents (shown in child prompt)
+  --peer TEXT                 Peer assignment line (repeatable), e.g. "agent-2: tests and verification"
   --auto-monitor              Enable background child monitor (default)
   --no-auto-monitor           Disable background child monitor
   --auto-monitor-stdout       Mirror monitor events to stdout
@@ -78,6 +82,10 @@ CDP_PORT_SET=0
 MODEL=""
 CODEX_BIN="codex"
 CHATGPT_SEND_PATH="/home/matrix/projects/chatgpt-send/bin/chatgpt_send"
+AGENT_ID=""
+AGENT_NAME=""
+TEAM_GOAL=""
+declare -a TEAM_PEERS=()
 BROWSER_POLICY="optional"
 SKIP_GIT_REPO_CHECK=1
 INIT_SPECIALIST_CHAT=1
@@ -119,6 +127,10 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL="${2:-}"; shift 2;;
     --codex-bin) CODEX_BIN="${2:-}"; shift 2;;
     --chatgpt-send-path) CHATGPT_SEND_PATH="${2:-}"; shift 2;;
+    --agent-id) AGENT_ID="${2:-}"; shift 2;;
+    --agent-name) AGENT_NAME="${2:-}"; shift 2;;
+    --team-goal) TEAM_GOAL="${2:-}"; shift 2;;
+    --peer) TEAM_PEERS+=("${2:-}"); shift 2;;
     --auto-monitor) AUTO_MONITOR=1; shift;;
     --no-auto-monitor) AUTO_MONITOR=0; shift;;
     --auto-monitor-stdout) AUTO_MONITOR_STDOUT=1; shift;;
@@ -328,11 +340,37 @@ runner_file="$RUN_DIR/${run_id}.runner.sh"
 status_file="$RUN_DIR/${run_id}.status.log"
 child_result_file="$RUN_DIR/child_result.json"
 
+child_identity_label=""
+if [[ -n "${AGENT_ID:-}" ]] && [[ -n "${AGENT_NAME:-}" ]]; then
+  child_identity_label="${AGENT_ID} (${AGENT_NAME})"
+elif [[ -n "${AGENT_ID:-}" ]]; then
+  child_identity_label="${AGENT_ID}"
+elif [[ -n "${AGENT_NAME:-}" ]]; then
+  child_identity_label="${AGENT_NAME}"
+else
+  child_identity_label="${run_id}"
+fi
+team_goal_effective="${TEAM_GOAL:-${TASK_TEXT}}"
+peer_lines_block="none"
+if (( ${#TEAM_PEERS[@]} > 0 )); then
+  peer_lines_block=""
+  for peer_line in "${TEAM_PEERS[@]}"; do
+    [[ -n "${peer_line//[[:space:]]/}" ]] || continue
+    peer_lines_block+="- ${peer_line}"$'\n'
+  done
+  peer_lines_block="${peer_lines_block%$'\n'}"
+  [[ -n "${peer_lines_block//[[:space:]]/}" ]] || peer_lines_block="none"
+fi
+
 cat >"$prompt_file" <<EOF
 Ты второй агент (child agent), запущенный главным агентом.
 
 Контекст:
 - Project path: ${PROJECT_PATH}
+- Child identity: ${child_identity_label}
+- Team goal (shared): ${team_goal_effective}
+- Peer assignments (swarm context):
+${peer_lines_block}
 - User task: ${TASK_TEXT}
 - Target iterations hint: ${ITERATIONS}
 - Browser policy: ${BROWSER_POLICY}
@@ -351,8 +389,17 @@ cat >"$prompt_file" <<EOF
    - используй Specialist как "внешний мозг": актуальные документы/интернет, проверка рисков, проверяемые шаги.
 8) Если Browser policy=disabled, не используй Specialist/browser вообще.
 9) Не выдумывай новый scope и не подменяй задачу.
-10) Сделай задачу и в финале дай короткий результат для главного агента.
-11) Последняя строка ответа должна начинаться так: CHILD_RESULT:
+10) Работайте как "рой": учитывай, что другие child-агенты делают свои части. Жестких запретов нет.
+11) Если видишь, что соседний агент уже закрыл часть работы:
+   - не дублируй вслепую;
+   - переключись на свою часть, проверку, тесты, интеграцию или фиксацию рисков;
+   - коротко отметь это в отчёте как overlap/coordination.
+12) Для контроля главного агента перед финалом обязательно дай строки:
+   - CHILD_FILES_TOUCHED: <comma-separated paths | none>
+   - CHILD_OVERLAP: <none | что пересеклось и что сделал>
+   - CHILD_CHECKS: <какие проверки/тесты запускал | none>
+13) Сделай задачу и в финале дай короткий результат для главного агента.
+14) Последняя строка ответа должна начинаться так: CHILD_RESULT:
 EOF
 
 cat >"$runner_file" <<EOF
@@ -1058,6 +1105,10 @@ echo "BROWSER_MODE=${BROWSER_MODE}"
 echo "BROWSER_POLICY=${BROWSER_POLICY}"
 echo "OPEN_BROWSER_EFFECTIVE=${OPEN_BROWSER}"
 echo "INIT_SPECIALIST_CHAT=${INIT_SPECIALIST_CHAT}"
+echo "AGENT_ID=${AGENT_ID:-}"
+echo "AGENT_NAME=${AGENT_NAME:-}"
+echo "TEAM_GOAL=${TEAM_GOAL:-}"
+echo "TEAM_PEERS_COUNT=${#TEAM_PEERS[@]}"
 echo "PROJECT_PATH=${PROJECT_PATH}"
 echo "STATE_ROOT=${STATE_ROOT}"
 echo "CODEX_CHATGPT_SEND_ROOT=${CODEX_CHATGPT_SEND_ROOT}"
