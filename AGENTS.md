@@ -1,10 +1,37 @@
 # AGENTS.md (chatgpt-send)
 
-This repository exposes a CLI bridge (`bin/chatgpt_send`) for interacting with a visible ChatGPT Web chat through UI automation (CDP), with safety guards and machine-readable JSON outputs.
+Этот репозиторий — стек мультиагентной координации для работы вокруг Codex. Он включает безопасный CLI-мост (`bin/chatgpt_send`) к видимому чату ChatGPT Web через UI-автоматизацию (CDP) для глубоких/автономных циклов Specialist, с защитными ограничителями и машиночитаемыми JSON-выходами.
 
-## Primary integration mode (recommended for AI agents)
+## Что это за проект (первое впечатление)
 
-Use the UX facade commands instead of calling low-level shell scripts:
+В первую очередь воспринимайте этот проект как гибкую мультиагентную систему, а не только как браузерный мост:
+
+- Основной агент Codex — координатор/"мозг" и сам решает, когда работать в одиночку, а когда запускать child-агентов.
+- Child-агенты нужны и для обычной разработки (реализация, проверки, тесты, review, верификация), а не только для задач с браузером.
+- Handoff в ChatGPT Web / браузер — это мощная возможность для глубокого исследования/автономных циклов, когда взаимодействие со Specialist реально добавляет ценность.
+- Модель роя мягкая и адаптивная: без хардкодного роутинга, фиксированного числа агентов и жестких требований к оркестрации.
+
+## Триггеры на естественном языке (важно)
+
+Считайте эти фразы прямым запросом на использование skill `multi-agent-soft-swarm` (даже если пользователь не назвал skill точно):
+
+- "режим пчелы"
+- "режим пчёл"
+- "режим роя"
+- "рой"
+- "пчелы"/"пчёлы"
+- "swarm"
+- "soft swarm"
+- "multi-agent"
+- "мультиагенты"/"мультиагентный режим"
+
+Когда используется такая фраза, сначала активируйте поведение swarm/координатора, а затем запросите только минимально недостающие входные данные (обычно путь к проекту и первую конкретную задачу).
+Для нетривиальных декомпозируемых задач это должно означать реальный запуск child-агентов (а не только внутренний план с "parallel branches").
+Для нетривиальных декомпозируемых задач это должно означать реальный запуск child-агентов (а не только внутренний план с "parallel branches").
+
+## Основной режим интеграции (рекомендуется для AI-агентов)
+
+Используйте UX facade-команды вместо прямых вызовов низкоуровневых shell-скриптов:
 
 - `chatgpt_send --status --json`
 - `chatgpt_send --explain latest --json`
@@ -12,83 +39,134 @@ Use the UX facade commands instead of calling low-level shell scripts:
 - `chatgpt_send step send --message "..." --json`
 - `chatgpt_send --ack`
 
-Treat `step read --json` as the planner/preflight command. The planner may return action ids like `STEP_PREFLIGHT`; this maps to running `chatgpt_send step read --json` again.
+Считайте `step read --json` командой планировщика/preflight. Планировщик может вернуть action id вроде `STEP_PREFLIGHT`; это соответствует повторному запуску `chatgpt_send step read --json`.
 
-## Coordinator + Swarm mode (recommended for this repo workflow)
+## Режим координатора + роя (рекомендуется для workflow этого репозитория)
 
-For this project, the main Codex agent acts as the coordinator (control point), not as the only coder.
+Для этого проекта основной агент Codex выступает координатором (точкой управления), а не единственным кодером.
 
-Practical model:
+## Роевая задача (Swarm task)
 
-- Main agent talks to Specialist and receives the next task/patch direction.
-- Main agent decides how many child agents are useful (`2/3/5/...`) and splits the work.
-- Child agents execute work in parallel (code changes, checks, tests, review tasks).
-- Main agent verifies results, checks conflicts/overlap, runs final verification, and reports back to Specialist/user.
-- If results conflict, are incomplete, or look risky, the main agent adaptively decides what to do next: re-ask the same child, launch an additional child (verification/arbitration), or run another wave.
+Роевая задача — это режим soft swarm (мягкого роя), где несколько child-агентов работают параллельно над одной общей целью, а главный агент выступает координатором (мозгом роя), который распределяет фокус, отслеживает пересечения, сверяет результаты и принимает следующие решения.
 
-Important:
+Важно:
+- Рой — это не жесткая маршрутизация и не жесткие блокировки по файлам.
+- Все агенты работают на одну общую задачу, но каждый может идти своим планом в рамках своего текущего фокуса.
+- Пересечение (overlap) между агентами допустимо и иногда полезно, но оно должно быть осознанным и явно отражено в отчете.
 
-- This is a **soft swarm protocol**, not hard file locking.
-- No hard-coded task-routing rules are required: the coordinator (main agent) is the "brain" and decides dynamically which child to task next based on the current results/errors.
-- Child agents may overlap, but they must know what other agents are doing and report overlap explicitly.
-- The coordinator is responsible for final reconciliation and verification.
+Критерий “это действительно рой”, а не просто параллельный запуск:
+- Запуск нескольких child-агентов без общего swarm-контекста (`--team-goal`, `--agent-name`, `--peer`) — это только параллельное выполнение, а не настоящий режим роя.
 
-Use `bin/spawn_second_agent` with swarm context flags:
+Что обязательно получает каждый child-агент в режиме роя:
+- общую цель роя (`--team-goal`)
+- свою роль/фокус (что именно он сейчас исследует/делает)
+- информацию о других агентах и их задачах (`--peer`, repeatable)
+- правило на overlap: если обнаружено пересечение, не дублировать работу вслепую, а переключиться на проверку/валидацию/интеграцию и явно сообщить о пересечении
+
+Что должен понимать каждый child-агент:
+- кто он в этом рое (идентичность/роль)
+- какую часть задачи он ведет сейчас
+- кто еще участвует в связке
+- что делают другие агенты
+- что делать при пересечении с чужой задачей
+
+Роль координатора:
+- запускать child-агентов с полным swarm-контекстом
+- следить за прогрессом и пересечениями
+- сверять конфликтующие результаты
+- при необходимости запускать дополнительную волну (verification/arbitration)
+- делать финальную сверку и итоговый отчет пользователю
+
+Операционное правило (обязательно для запуска child-агента в рое):
+- Перед запуском каждого child-агента координатор передает "снимок роя" (swarm snapshot) в `--task` и через swarm context flags.
+- Снимок роя описывает состояние роя на текущий момент: общая цель, текущая фаза, состав роя (N агентов, включая child), кто этот агент, кто остальные и что каждый делает.
+- Минимальный набор для запуска в рое: `--agent-id`, `--agent-name`, `--team-goal`, `--peer` (repeatable), `--swarm-context-required` + явное правило overlap в тексте задачи.
+- `--agent-name` рекомендуется делать семантическим (по роли/срезу задачи), а не placeholder вида `agent-1` / `child-2`. Имена задает координатор до запуска.
+- `--agent-id` может быть техническим (`agent-1`); при желании координатор может делать его более читаемым (`logs-search`, `watcher-metrics`, `server-root-cause`).
+- Если child не получил снимок роя, такой запуск считается параллельным исполнением, а не полноценным роем.
+
+Практическая модель:
+
+- Основной агент общается со Specialist и получает следующую задачу/направление патча.
+- Основной агент решает, сколько child-агентов полезно (`2/3/5/...`) и как разделить работу.
+- Child-агенты выполняют работу параллельно (изменения кода, проверки, тесты, review-задачи).
+- Основной агент проверяет результаты, проверяет конфликты/overlap, запускает финальную верификацию и отчитывается Specialist/пользователю.
+- Если результаты конфликтуют, неполные или выглядят рискованными, основной агент адаптивно решает, что делать дальше: переспросить того же child-а, запустить дополнительного child-а (verification/arbitration) или сделать еще одну волну.
+
+Важно:
+
+- Это **soft swarm protocol**, а не жесткая блокировка файлов.
+- Хардкодные правила роутинга задач не требуются: координатор (основной агент) — это "мозг", и он динамически решает, какому child-агенту дать следующую задачу на основе текущих результатов/ошибок.
+- Child-агенты могут пересекаться, но они должны знать, что делают другие агенты, и явно репортить overlap.
+- Запуск нескольких child-агентов без общего swarm-контекста (`--team-goal`, `--agent-name`, `--peer`) — это только параллельное выполнение, а не настоящий режим роя.
+- В режиме роя каждый child должен получить общую цель, свою текущую роль/фокус, назначения peer-агентов и правило overlap (если найдено пересечение — перейти в validation/integration и сообщить об этом).
+- Координатор отвечает за финальную сверку и верификацию.
+
+Используйте `bin/spawn_second_agent` с swarm context flags:
 
 - `--agent-id`
 - `--agent-name`
 - `--team-goal`
-- `--peer` (repeatable; describe what each other child is doing)
+- `--peer` (repeatable; описывает, что делает каждый другой child)
 
-Child final response contract (for coordinator review) should include:
+Контракт финального ответа child-а (для review у координатора) должен включать:
 
 - `CHILD_FILES_TOUCHED: ...`
 - `CHILD_OVERLAP: ...`
 - `CHILD_CHECKS: ...`
 - `CHILD_RESULT: ...`
 
-## Safety model (important)
+## Гигиена коммитов (рекомендуется)
 
-- Never blind-resend after timeout just because a send command returned non-zero.
-- Always check `--status --json` and/or `step read --json` before deciding to send again.
-- If there is an unread reply, acknowledge it first: `chatgpt_send --ack`.
-- The tool intentionally prefers safety over availability in ambiguous UI states.
+Считайте историю версий частью workflow, особенно в мультиагентной работе:
 
-Common outcomes:
+- Если есть полезные и проверенные изменения, предпочтительно сделать commit, чтобы сохранить понятную версию/чекпоинт проекта.
+- Используйте осмысленные commit message, которые описывают изменение (и желательно намерение), а не случайный текст/цифры.
+- В swarm-работе child-агенты могут подготовить изменения, но координатор обычно должен сверить/проверить их и создать финальный commit (или commit-ы).
+- Не форсируйте commit, если работа исследовательская/незавершенная или если пользователь явно не хочет commit на этом этапе.
 
-- `exit 0`: success (or delegated send completed)
-- `exit 73`: `step` blocked (follow planner next action)
-- `exit 74`: `step` no-op (planner says send not allowed yet)
-- `exit 79`: fail-closed environment/confirm issue (read `--explain latest`)
-- `exit 81`: safety stop after timeout (`confirm-only/no-resend`)
+## Модель безопасности (важно)
 
-## JSON-first contract
+- Никогда не делайте blind-resend после timeout только потому, что команда отправки вернула non-zero.
+- Всегда проверяйте `--status --json` и/или `step read --json` перед решением отправлять повторно.
+- Если есть непрочитанный ответ, сначала подтвердите его: `chatgpt_send --ack`.
+- Инструмент намеренно предпочитает безопасность доступности в неоднозначных состояниях UI.
 
-The stable machine-facing outputs are:
+Типичные исходы:
 
-- `status.v1` from `--status --json`
-- `explain.v1` from `--explain ... --json`
-- `step.v1` from `step read/send/auto --json`
+- `exit 0`: успех (или завершенная delegated send-операция)
+- `exit 73`: `step` заблокирован (следовать следующему действию от планировщика)
+- `exit 74`: `step` no-op (планировщик говорит, что отправка пока не разрешена)
+- `exit 79`: fail-closed ошибка окружения/confirm (смотреть `--explain latest`)
+- `exit 81`: safety stop после timeout (`confirm-only/no-resend`)
 
-See:
+## JSON-first контракт
+
+Стабильные машино-ориентированные выходы:
+
+- `status.v1` из `--status --json`
+- `explain.v1` из `--explain ... --json`
+- `step.v1` из `step read/send/auto --json`
+
+См.:
 
 - `docs/JSON_CONTRACTS.md`
 - `docs/ERRORS.md`
 - `docs/AI_AGENT_INTEGRATION.md`
 
-## Practical loop for another AI agent
+## Практический цикл для другого AI-агента
 
 1. `chatgpt_send --status --json`
 2. `chatgpt_send step read --json`
-3. Inspect `decision.next.action_id` and `decision.next.gates`
-4. If allowed and message is ready: `chatgpt_send step send --message "..."`
-5. If blocked/error: `chatgpt_send --explain latest --json`
-6. If unread reply exists: `chatgpt_send --ack`
+3. Проверить `decision.next.action_id` и `decision.next.gates`
+4. Если разрешено и сообщение готово: `chatgpt_send step send --message "..."`
+5. Если блокировка/ошибка: `chatgpt_send --explain latest --json`
+6. Если есть непрочитанный ответ: `chatgpt_send --ack`
 
-## Do not rely on
+## Не полагайтесь на
 
-- Raw internal shell functions in `bin/lib/chatgpt_send/*.sh` as an external API
-- Transient logs as the only source of truth
-- Browser UI timing assumptions without checking fresh `status/step`
+- Сырые внутренние shell-функции в `bin/lib/chatgpt_send/*.sh` как на внешний API
+- Временные логи как на единственный источник истины
+- Предположения о таймингах браузерного UI без проверки свежего `status/step`
 
-Use JSON outputs + evidence files for deterministic behavior.
+Используйте JSON-выходы + evidence files для детерминированного поведения.

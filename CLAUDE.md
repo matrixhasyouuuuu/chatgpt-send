@@ -27,7 +27,7 @@
 - `docs/WHY.md`
 - `docs/specialist_bootstrap.txt`
 - `docs/specialist_bootstrap.ru.txt`
-- `skills/chatgpt-web-handoff/SKILL.md`
+- `skills/multi-agent-soft-swarm/SKILL.md`
 
 Главная идея проекта:
 - CLI-мост между терминалом и ChatGPT Web через CDP, без API-ключей (`README.md:3`, `README.md:5`, `README.md:237`).

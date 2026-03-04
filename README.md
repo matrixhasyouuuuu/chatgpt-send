@@ -325,13 +325,13 @@ This repo ships a Codex skill that makes the UX "speak in natural language" and 
 
 Skill file:
 
-- `skills/chatgpt-web-handoff/SKILL.md`
+- `skills/multi-agent-soft-swarm/SKILL.md`
 
 Install it:
 
 ```bash
-mkdir -p ~/.codex/skills/local/chatgpt-web-handoff
-cp skills/chatgpt-web-handoff/SKILL.md ~/.codex/skills/local/chatgpt-web-handoff/SKILL.md
+mkdir -p ~/.codex/skills/local/multi-agent-soft-swarm
+cp skills/multi-agent-soft-swarm/SKILL.md ~/.codex/skills/local/multi-agent-soft-swarm/SKILL.md
 ```
 
 Make sure `chatgpt_send` is on your `PATH` (one option):
